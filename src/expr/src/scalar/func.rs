@@ -50,8 +50,13 @@ use mz_repr::{
 use crate::scalar::func::format::DateTimeFormat;
 use crate::{like_pattern, EvalError, MirScalarExpr};
 
+use allium_materialize::{
+    EventExecute as AlliumEventExecute, Uuid as AlliumUuid, Yaml as AlliumYaml,
+};
+
 #[macro_use]
 mod macros;
+
 mod encoding;
 mod format;
 mod impls;
@@ -123,6 +128,106 @@ impl fmt::Display for UnmaterializableFunc {
             UnmaterializableFunc::Version => f.write_str("version"),
         }
     }
+}
+
+fn allium_jsonb_to_yaml<'a>(
+    a: Datum<'a>,
+    temp_storage: &'a RowArena,
+) -> Result<Datum<'a>, EvalError> {
+    let mut buf = String::new();
+    strconv::format_jsonb(&mut buf, JsonbRef::from_datum(a));
+
+    let yaml = AlliumYaml::from_json(buf.as_str())
+        .map_err(|err| EvalError::Undefined(format!("from json: {}", err)))?;
+
+    Ok(Datum::String(temp_storage.push_string(yaml)))
+}
+
+fn allium_relationship_uuid<'a>(
+    datums: &[Datum<'a>],
+    temp_storage: &'a RowArena,
+) -> Result<Datum<'a>, EvalError> {
+    let (id_datum, parent_id_datums) = datums
+        .split_first()
+        .ok_or_else(|| EvalError::InvalidParameterValue("params invalid".into()))?;
+
+    let parents_id: Vec<&str> = parent_id_datums.iter().map(|d| d.unwrap_str()).collect();
+    let uuid = AlliumUuid::gen_relationship_uuid(id_datum.unwrap_str(), &parents_id);
+
+    Ok(Datum::String(temp_storage.push_string(uuid)))
+}
+
+fn allium_recursive_filter_event_executes<'a>(
+    datums: &[Datum<'a>],
+    temp_storage: &'a RowArena,
+) -> Result<Datum<'a>, EvalError> {
+    let predicates_datums = match datums[0] {
+        Datum::Array(_) => datums[0].unwrap_array().elements(),
+        Datum::List(_) => datums[0].unwrap_list(),
+        Datum::Null => return Ok(Datum::Null),
+        _ => return Err(EvalError::Internal(datums[0].unwrap_str().to_string())),
+    };
+    let mut predicates = Vec::new();
+    for predicate in predicates_datums.iter() {
+        if predicate.is_null() {
+            continue;
+        } else {
+            predicates.push(predicate.unwrap_str());
+        }
+    }
+
+    let nodes_datums = match datums[1] {
+        Datum::Array(_) => datums[1].unwrap_array().elements(),
+        Datum::List(_) => datums[1].unwrap_list(),
+        Datum::Null => return Ok(Datum::Null),
+        _ => return Err(EvalError::Internal(datums[1].unwrap_str().to_string())),
+    };
+    let mut nodes = Vec::new();
+    for node in nodes_datums.iter() {
+        if node.is_null() {
+            continue;
+        } else {
+            let mut buf = String::new();
+            strconv::format_jsonb(&mut buf, JsonbRef::from_datum(node));
+            nodes.push(buf);
+        }
+    }
+    let nodes: Vec<&str> = nodes
+        .iter()
+        .map(|tree_with_id| tree_with_id.as_str())
+        .collect();
+
+    let executes = AlliumEventExecute::recursive_filter(&predicates, &nodes)
+        .map_err(|err| EvalError::Undefined(format!("recursive_filter_event_executes: {}", err)))?;
+    let datums: Vec<Datum> = executes
+        .into_iter()
+        .map(|execute| Datum::String(temp_storage.push_string(execute)))
+        .collect();
+
+    Ok(list_create(&datums, temp_storage))
+}
+
+fn allium_uuid<'a>(
+    datums: &[Datum<'a>],
+    temp_storage: &'a RowArena,
+) -> Result<Datum<'a>, EvalError> {
+    let mut iter = datums.iter();
+    let id = iter
+        .next()
+        .ok_or_else(|| EvalError::InvalidParameterValue("id".into()))?
+        .unwrap_str();
+    let parent_id = iter
+        .next()
+        .ok_or_else(|| EvalError::InvalidParameterValue("parent_id".into()))?
+        .unwrap_str();
+    let counter = if let Some(d) = iter.next() {
+        d.unwrap_int32()
+    } else {
+        0
+    };
+    let uuid = AlliumUuid::gen_uuid(id, parent_id, counter);
+
+    Ok(Datum::String(temp_storage.push_string(uuid)))
 }
 
 pub fn and<'a>(
@@ -3258,6 +3363,14 @@ impl<T: for<'a> EagerUnaryFunc<'a>> LazyUnaryFunc for T {
 
 #[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
 pub enum UnaryFunc {
+    CaseCamel(CaseCamel),
+    CaseKebab(CaseKebab),
+    CasePascal(CasePascal),
+    CaseSnake(CaseSnake),
+    CaseTitle(CaseTitle),
+    JsonbToYaml,
+    Pluralize(Pluralize),
+    Singularize(Singularize),
     Not(Not),
     IsNull(IsNull),
     IsTrue(IsTrue),
@@ -3494,6 +3607,13 @@ pub enum UnaryFunc {
 }
 
 derive_unary!(
+    CaseCamel,
+    CaseKebab,
+    CasePascal,
+    CaseSnake,
+    CaseTitle,
+    Pluralize,
+    Singularize,
     Not,
     NegFloat32,
     NegFloat64,
@@ -3897,6 +4017,9 @@ impl UnaryFunc {
             Upper => Ok(upper(a, temp_storage)),
             Lower => Ok(lower(a, temp_storage)),
             RescaleNumeric(scale) => rescale_numeric(a, *scale),
+            JsonbToYaml => allium_jsonb_to_yaml(a, temp_storage),
+            CaseCamel(_) | CaseKebab(_) | CasePascal(_) | CaseSnake(_) | CaseTitle(_)
+            | Pluralize(_) | Singularize(_) => unreachable!(),
         }
     }
 
@@ -4153,6 +4276,9 @@ impl UnaryFunc {
                 max_scale: Some(*scale),
             })
             .nullable(nullable),
+
+            CaseCamel(_) | CaseKebab(_) | CasePascal(_) | CaseSnake(_) | CaseTitle(_)
+            | JsonbToYaml | Pluralize(_) | Singularize(_) => ScalarType::String.nullable(nullable),
         }
     }
 
@@ -4374,6 +4500,9 @@ impl UnaryFunc {
             | DatePartTimestampTz(_) => false,
             DateTruncTimestamp(_) | DateTruncTimestampTz(_) => false,
             RescaleNumeric(_) => false,
+            JsonbToYaml => false,
+            CaseCamel(_) | CaseKebab(_) | CasePascal(_) | CaseSnake(_) | CaseTitle(_)
+            | Pluralize(_) | Singularize(_) => unreachable!(),
         }
     }
 
@@ -4447,6 +4576,10 @@ impl UnaryFunc {
             | JustifyHours(_)
             | JustifyInterval(_)
             | CastVarCharToString(_) => unreachable!(),
+            CaseCamel(_) | CaseKebab(_) | CasePascal(_) | CaseSnake(_) | CaseTitle(_)
+            | Pluralize(_) | Singularize(_) => {
+                unreachable!()
+            }
             _ => false,
         }
     }
@@ -4668,6 +4801,11 @@ impl UnaryFunc {
             Upper => f.write_str("upper"),
             Lower => f.write_str("lower"),
             RescaleNumeric(..) => f.write_str("rescale_numeric"),
+            JsonbToYaml => f.write_str("jsonb_to_yaml"),
+            CaseCamel(_) | CaseKebab(_) | CasePascal(_) | CaseTitle(_) | CaseSnake(_)
+            | Pluralize(_) | Singularize(_) => {
+                unreachable!()
+            }
         }
     }
 }
@@ -5876,6 +6014,11 @@ fn mz_render_typmod<'a>(
 
 #[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
 pub enum VariadicFunc {
+    Uuid,
+    RelationshipUuid,
+    RecursiveFilterEventExecutes {
+        elem_type: ScalarType,
+    },
     Coalesce,
     Greatest,
     Least,
@@ -5936,6 +6079,12 @@ impl VariadicFunc {
         }
 
         match self {
+            VariadicFunc::Uuid => eager!(allium_uuid, temp_storage),
+            VariadicFunc::RelationshipUuid => eager!(allium_relationship_uuid, temp_storage),
+            VariadicFunc::RecursiveFilterEventExecutes { .. } => {
+                eager!(allium_recursive_filter_event_executes, temp_storage)
+            }
+
             VariadicFunc::Coalesce => coalesce(datums, temp_storage, exprs),
             VariadicFunc::Greatest => greatest(datums, temp_storage, exprs),
             VariadicFunc::Least => least(datums, temp_storage, exprs),
@@ -5982,6 +6131,13 @@ impl VariadicFunc {
         use VariadicFunc::*;
         let in_nullable = input_types.iter().any(|t| t.nullable);
         match self {
+            Uuid => ScalarType::String.nullable(true),
+            RelationshipUuid => ScalarType::String.nullable(true),
+            RecursiveFilterEventExecutes { elem_type } => ScalarType::List {
+                element_type: Box::new(elem_type.clone()),
+                custom_oid: None,
+            }
+            .nullable(false),
             Coalesce | Greatest | Least => {
                 assert!(input_types.len() > 0);
                 debug_assert!(
@@ -6078,6 +6234,11 @@ impl VariadicFunc {
 impl fmt::Display for VariadicFunc {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            VariadicFunc::Uuid => f.write_str("uuid"),
+            VariadicFunc::RelationshipUuid => f.write_str("relationship_uuid"),
+            VariadicFunc::RecursiveFilterEventExecutes { .. } => {
+                f.write_str("recursive_filter_event_executes")
+            }
             VariadicFunc::Coalesce => f.write_str("coalesce"),
             VariadicFunc::Greatest => f.write_str("greatest"),
             VariadicFunc::Least => f.write_str("least"),

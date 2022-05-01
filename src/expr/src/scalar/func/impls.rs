@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+mod allium;
 mod array;
 mod boolean;
 mod byte;
@@ -33,6 +34,7 @@ mod varchar;
 pub use self::array::*;
 pub use self::char::*;
 pub use self::uuid::*;
+pub use allium::*;
 pub use boolean::*;
 pub use byte::*;
 pub use date::*;

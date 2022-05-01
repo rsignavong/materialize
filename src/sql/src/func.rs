@@ -1743,6 +1743,70 @@ lazy_static! {
                 params!(String) => UnaryFunc::TrimWhitespace, 885;
                 params!(String, String) => BinaryFunc::Trim, 884;
             },
+            "case_camel" => Scalar {
+                params!(String) => UnaryFunc::CaseCamel(func::CaseCamel), oid::FUNC_AL_CASE_CAMEL_OID;
+            },
+            "case_kebab" => Scalar {
+                params!(String) => UnaryFunc::CaseKebab(func::CaseKebab), oid::FUNC_AL_CASE_KEBAB_OID;
+            },
+            "case_pascal" => Scalar {
+                params!(String) => UnaryFunc::CasePascal(func::CasePascal), oid::FUNC_AL_CASE_PASCAL_OID;
+            },
+            "case_snake" => Scalar {
+                params!(String) => UnaryFunc::CaseSnake(func::CaseSnake), oid::FUNC_AL_CASE_SNAKE_OID;
+            },
+            "case_title" => Scalar {
+                params!(String) => UnaryFunc::CaseTitle(func::CaseTitle), oid::FUNC_AL_CASE_TITLE_OID;
+            },
+            "jsonb_to_yaml" => Scalar {
+                params!(Jsonb) => UnaryFunc::JsonbToYaml, oid::FUNC_AL_JSONB_TO_YAML;
+
+            },
+            "pluralize" => Scalar {
+                params!(String) => UnaryFunc::Pluralize(func::Pluralize), oid::FUNC_AL_PLURAL_OID;
+            },
+            "singularize" => Scalar {
+                params!(String) => UnaryFunc::Singularize(func::Singularize), oid::FUNC_AL_SINGULAR_OID;
+            },
+            "recursive_filter_event_executes" => Scalar {
+                params!(Any...) => Operation::variadic(|ecx, exprs| {
+                    if exprs.len() != 2 {
+                        sql_bail!("recursive_filter_event_executes only accept 2 parameters");
+                    }
+
+                    let elem_type =
+                        match (ecx.scalar_type(&exprs[0]), ecx.scalar_type(&exprs[1])) {
+                            (ScalarType::Array(element_type) | ScalarType::List {element_type, ..}, ScalarType::Array(_) | ScalarType::List{..}) => *element_type,
+                            _ => sql_bail!("recursive_filter_event_executes is guaranteed to receive only array or list argument"),
+                        };
+
+                    Ok(HirScalarExpr::CallVariadic { func: VariadicFunc::RecursiveFilterEventExecutes { elem_type }, exprs })
+                }) => ListAnyCompatible, oid::FUNC_AL_REC_FILTER_EVENT_EXEC_OID;
+            },
+            "relationship_uuid" => Scalar {
+                params!(Any...) => Operation::variadic(|ecx, cexprs| {
+                    if cexprs.len() < 2 {
+                        sql_bail!("argument list must have at least two elements")
+                    }
+                    let mut exprs = vec![];
+                    for expr in cexprs {
+                        exprs.push(match ecx.scalar_type(&expr) {
+                            // concat uses nonstandard bool -> string casts
+                            // to match historical baggage in PostgreSQL.
+                            ScalarType::Bool => expr.call_unary(UnaryFunc::CastBoolToStringNonstandard(func::CastBoolToStringNonstandard)),
+                            // TODO(#7572): remove call to PadChar
+                            ScalarType::Char { length } => expr.call_unary(UnaryFunc::PadChar(func::PadChar { length })),
+                            _ => typeconv::to_string(ecx, expr)
+                        });
+                    }
+
+                    Ok(HirScalarExpr::CallVariadic { func: VariadicFunc::RelationshipUuid, exprs })
+                }) => String, oid::FUNC_AL_REL_UUID_OID;
+            },
+            "uuid" => Scalar {
+                params!(String, String) => VariadicFunc::Uuid, oid::FUNC_AL_UUID_1_OID;
+                params!(String, String, Int32) => VariadicFunc::Uuid, oid::FUNC_AL_UUID_2_OID;
+            },
             "cbrt" => Scalar {
                 params!(Float64) => UnaryFunc::CbrtFloat64(func::CbrtFloat64), 1345;
             },
