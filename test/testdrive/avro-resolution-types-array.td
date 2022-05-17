@@ -28,7 +28,4 @@ $ kafka-ingest format=avro topic=resolution-arrays schema=${array-double} publis
 {"f1": [ 234.345 ] }
 
 ! SELECT f1[0] FROM resolution_arrays
-contains:Writer schema has type `Double`, but reader schema has type `Int` for field `schema_array.f1`
-
-! SELECT f1[0] FROM resolution_arrays
-contains:failed to resolve Avro schema (id =
+Schemas don't match: Double, Int

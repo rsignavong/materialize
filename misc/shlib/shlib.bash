@@ -114,15 +114,15 @@ ci_init() {
 }
 
 ci_collapsed_heading() {
-    echo "---" "$@" >&2
+    echo "---" "$@"
 }
 
 ci_uncollapsed_heading() {
-    echo "+++" "$@" >&2
+    echo "+++" "$@"
 }
 
 ci_uncollapse_current_section() {
-    echo "^^^ +++" >&2
+    echo "^^^ +++"
 }
 
 ci_try_passed=0

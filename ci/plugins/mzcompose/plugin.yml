@@ -19,5 +19,5 @@ configuration:
       type: string
     composition:
       type: string
-  required: ["composition"]
+  required: ["composition", "run"]
   additionalProperties: false

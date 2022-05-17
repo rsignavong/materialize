@@ -89,8 +89,6 @@ macro_rules! sql_bail {
     }
 }
 
-pub const DEFAULT_SCHEMA: &str = "public";
-
 pub mod ast;
 pub mod catalog;
 pub mod func;

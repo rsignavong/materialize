@@ -14,7 +14,6 @@
 $ set-regex match=\d{13} replacement=<TIMESTAMP>
 
 > CREATE TABLE t1 (f1 INTEGER);
-> CREATE DEFAULT INDEX ON t1
 
 > INSERT INTO t1 VALUES (123);
 
@@ -23,7 +22,7 @@ $ set-regex match=\d{13} replacement=<TIMESTAMP>
 > DECLARE c CURSOR FOR TAIL t1 AS OF -1;
 
 ! FETCH 1 c;
-contains:out of range integral type conversion attempted
+out of range integral type conversion attempted
 
 > COMMIT
 
@@ -32,14 +31,14 @@ contains:out of range integral type conversion attempted
 # (which will happen after t has been compacted) and then we should be
 # able to see the same failure with FETCH.
 ! SELECT * FROM t1 AS OF 0
-contains:Timestamp (0) is not valid for all inputs
+Timestamp (0) is not valid for all inputs
 
 > BEGIN
 
 > DECLARE c CURSOR FOR TAIL t1 AS OF 0;
 
 ! FETCH 1 c;
-contains:Timestamp (0) is not valid for all inputs
+Timestamp (0) is not valid for all inputs
 
 > COMMIT
 

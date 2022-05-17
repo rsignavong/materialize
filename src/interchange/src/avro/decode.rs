@@ -7,14 +7,14 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use anyhow::Context;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::fmt;
 use std::io::Read;
 use std::rc::Rc;
 
 use ordered_float::OrderedFloat;
-use tracing::trace;
 use uuid::Uuid;
 
 use mz_avro::error::{DecodeError, Error as AvroError};
@@ -23,47 +23,102 @@ use mz_avro::{
     AvroRead, AvroRecordAccess, GeneralDeserializer, StatefulAvroDecodable, ValueDecoder,
     ValueOrReader,
 };
-use mz_ore::result::ResultExt;
-use mz_repr::adt::jsonb::JsonbPacker;
-use mz_repr::adt::numeric;
-use mz_repr::{Datum, Row, RowPacker};
+use ore::result::ResultExt;
+use repr::adt::jsonb::JsonbPacker;
+use repr::adt::numeric;
+use repr::{Datum, Row};
 
-use crate::avro::ConfluentAvroResolver;
+use super::envelope_debezium::DebeziumSourceCoordinates;
+use super::{AvroDebeziumDecoder, ConfluentAvroResolver, EnvelopeType, RowCoordinates};
 
 /// Manages decoding of Avro-encoded bytes.
-#[derive(Debug)]
 pub struct Decoder {
     csr_avro: ConfluentAvroResolver,
+    envelope: EnvelopeType,
     debug_name: String,
     buf1: Vec<u8>,
-    row_buf: Row,
+    buf2: Vec<u8>,
+    packer: Row,
+    reject_non_inserts: bool,
+    filenames_to_indices: HashMap<Vec<u8>, usize>,
+    warned_on_unknown: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use futures::executor::block_on;
+impl fmt::Debug for Decoder {
+    // TODO - rethink the usefulness of this debug impl. The Decoder
+    // has become much more complicated since it was written
+    // (though, maybe _that_ is the root problem we should solve...)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Decoder")
+            .field("csr_avro", &self.csr_avro)
+            .finish()
+    }
+}
 
-    use crate::avro::Decoder;
-    use mz_repr::{Datum, Row};
-
-    #[test]
-    fn test_error_followed_by_success() {
-        let schema = r#"{
-"type": "record",
-"name": "test",
-"fields": [{"name": "f1", "type": "int"}, {"name": "f2", "type": "int"}]
-}"#;
-        let mut decoder = Decoder::new(&schema, None, "Test".to_string(), false).unwrap();
-        // This is not a valid Avro blob for the given schema
-        let mut bad_bytes: &[u8] = &[0];
-        assert!(block_on(decoder.decode(&mut bad_bytes)).is_err());
-        // This is the blob that will make both ints in the value zero.
-        let mut good_bytes: &[u8] = &[0, 0];
-        // The decode should succeed with the correct value.
-        assert_eq!(
-            block_on(decoder.decode(&mut good_bytes)).unwrap(),
-            Row::pack([Datum::Int32(0), Datum::Int32(0)])
-        );
+/// Push `coords` onto `packer`, in a format understood by our downstream Debezium deduplication logic.
+fn push_coords(coords: Option<DebeziumSourceCoordinates>, packer: &mut Row) -> Result<(), ()> {
+    let mut is_unknown = false;
+    match coords {
+        Some(coords) => {
+            if coords.snapshot {
+                packer.push(Datum::Null)
+            } else {
+                // Downstream in the deduplication logic, we pack these into rows,
+                // and aren't too careful to avoid cloning them. Thus
+                // it's important not to go over the 24-byte smallvec inline capacity.
+                let data = match coords.row {
+                    RowCoordinates::Postgres {
+                        last_commit_lsn,
+                        lsn,
+                        total_order,
+                    } => Some(vec![
+                        Datum::Int64(last_commit_lsn.unwrap_or(0) as i64),
+                        Datum::Int64(lsn as i64),
+                        Datum::Int64(total_order.unwrap_or(0) as i64),
+                    ]),
+                    RowCoordinates::MySql { file_idx, pos, row } => Some(vec![
+                        Datum::Int32(file_idx as i32),
+                        Datum::Int64(pos as i64),
+                        Datum::Int64(row as i64),
+                    ]),
+                    RowCoordinates::MSSql {
+                        change_lsn,
+                        event_serial_no,
+                    } => {
+                        // Consider everything but the file ID to be the offset within the file.
+                        let offset_in_file = ((change_lsn.log_block_offset as usize) << 16)
+                            | (change_lsn.slot_num as usize);
+                        Some(vec![
+                            Datum::Int32(change_lsn.file_seq_num as i32),
+                            Datum::Int64(offset_in_file as i64),
+                            Datum::Int64(event_serial_no as i64),
+                        ])
+                    }
+                    RowCoordinates::Unknown => {
+                        is_unknown = true;
+                        None
+                    }
+                };
+                match data {
+                    Some(data) => {
+                        packer.push_list_with(|packer| {
+                            for datum in data {
+                                packer.push(datum);
+                            }
+                        });
+                    }
+                    None => {
+                        packer.push(Datum::Null);
+                    }
+                }
+            }
+        }
+        None => packer.push(Datum::Null),
+    }
+    if is_unknown {
+        Err(())
+    } else {
+        Ok(())
     }
 }
 
@@ -76,58 +131,106 @@ impl Decoder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         reader_schema: &str,
-        schema_registry: Option<mz_ccsr::ClientConfig>,
+        schema_registry: Option<ccsr::ClientConfig>,
+        envelope: EnvelopeType,
         debug_name: String,
         confluent_wire_format: bool,
+        reject_non_inserts: bool,
     ) -> anyhow::Result<Decoder> {
         let csr_avro =
             ConfluentAvroResolver::new(reader_schema, schema_registry, confluent_wire_format)?;
 
         Ok(Decoder {
             csr_avro,
+            envelope,
             debug_name,
             buf1: vec![],
-            row_buf: Row::default(),
+            buf2: vec![],
+            packer: Default::default(),
+            reject_non_inserts,
+            filenames_to_indices: Default::default(),
+            warned_on_unknown: false,
         })
     }
 
     /// Decodes Avro-encoded `bytes` into a `Row`.
-    pub async fn decode(&mut self, bytes: &mut &[u8]) -> anyhow::Result<Row> {
-        // Clear out any bytes that might be left over from
-        // an earlier run. This can happen if the
-        // `dsr.deserialize` call returns an error,
-        // causing us to return early.
-        let mut packer = self.row_buf.packer();
-        let (bytes2, resolved_schema, csr_schema_id) = self.csr_avro.resolve(bytes).await?;
+    // The `Row` has two possible shapes:
+    // * For Debezium-encoded data it will be:
+    //   `Row(List[before-row], List[after-row], List[offsets]?, upstream_time_millis)`
+    // * For plain avro data it will just be `Row(after-row)`
+    pub async fn decode(
+        &mut self,
+        bytes: &mut &[u8],
+        upstream_time_millis: Option<i64>,
+    ) -> anyhow::Result<Row> {
+        let (bytes2, resolved_schema) = self.csr_avro.resolve(bytes).await?;
         *bytes = bytes2;
-        let dec = AvroFlatDecoder {
-            packer: &mut packer,
-            buf: &mut self.buf1,
-            is_top: true,
-        };
-        let dsr = GeneralDeserializer {
-            schema: resolved_schema.top_node(),
-        };
-        dsr.deserialize(bytes, dec).with_context(|| {
-            format!(
-                "unable to decode row {}",
-                match csr_schema_id {
-                    Some(id) => format!("(Avro schema id = {:?})", id),
-                    None => "".to_string(),
+        let result = if self.envelope == EnvelopeType::Debezium {
+            let dec = AvroDebeziumDecoder {
+                packer: &mut self.packer,
+                buf: &mut self.buf1,
+                file_buf: &mut self.buf2,
+                filenames_to_indices: &mut self.filenames_to_indices,
+            };
+            let dsr = GeneralDeserializer {
+                schema: resolved_schema.top_node(),
+            };
+            let coords = dsr.deserialize(bytes, dec)?;
+            if let Err(()) = push_coords(coords, &mut self.packer) {
+                if !self.warned_on_unknown {
+                    self.warned_on_unknown = true;
+                    log::warn!(
+                        "Record with unrecognized source coordinates in {}. \
+                         You might be using an unsupported upstream database.",
+                        self.debug_name
+                    );
                 }
-            )
-        })?;
-        trace!(
+            }
+            let upstream_time_millis = match upstream_time_millis {
+                Some(value) => Datum::Int64(value),
+                None => Datum::Null,
+            };
+            self.packer.push(upstream_time_millis);
+            let row = self.packer.finish_and_reuse();
+            if self.reject_non_inserts && !matches!(row.iter().next(), None | Some(Datum::Null)) {
+                anyhow::bail!(
+                    "[customer-data] Updates and deletes are not allowed for this source! \
+                     This probably means it was started with `start_offset` \
+                     and without `UPSERT` semantics. Got row: {:?}",
+                    row
+                )
+            }
+
+            row
+        } else {
+            let dec = AvroFlatDecoder {
+                packer: &mut self.packer,
+                buf: &mut self.buf1,
+                is_top: true,
+            };
+            let dsr = GeneralDeserializer {
+                schema: resolved_schema.top_node(),
+            };
+            dsr.deserialize(bytes, dec)?;
+            self.packer.finish_and_reuse()
+        };
+        log::trace!(
             "[customer-data] Decoded row {:?} in {}",
-            self.row_buf,
+            result,
             self.debug_name
         );
-        Ok(self.row_buf.clone())
+        Ok(result)
     }
 }
 
 pub struct AvroStringDecoder<'a> {
     pub buf: &'a mut Vec<u8>,
+}
+
+impl<'a> AvroStringDecoder<'a> {
+    pub fn with_buf(buf: &'a mut Vec<u8>) -> Self {
+        Self { buf }
+    }
 }
 
 impl<'a> AvroDecode for AvroStringDecoder<'a> {
@@ -153,12 +256,12 @@ impl<'a> AvroDecode for AvroStringDecoder<'a> {
     }
 }
 
-pub(super) struct OptionalRecordDecoder<'a, 'row> {
-    pub packer: &'a mut RowPacker<'row>,
+pub(super) struct OptionalRecordDecoder<'a> {
+    pub packer: &'a mut Row,
     pub buf: &'a mut Vec<u8>,
 }
 
-impl<'a, 'row> AvroDecode for OptionalRecordDecoder<'a, 'row> {
+impl<'a> AvroDecode for OptionalRecordDecoder<'a> {
     type Out = bool;
     fn union_branch<'b, R: AvroRead, D: AvroDeserializer>(
         self,
@@ -196,16 +299,16 @@ impl AvroDecode for RowDecoder {
         self,
         a: &mut A,
     ) -> Result<Self::Out, AvroError> {
-        let mut row_borrow = self.state.0.borrow_mut();
+        let mut packer_borrow = self.state.0.borrow_mut();
         let mut buf_borrow = self.state.1.borrow_mut();
-        let mut packer = row_borrow.packer();
         let inner = AvroFlatDecoder {
-            packer: &mut packer,
+            packer: &mut packer_borrow,
             buf: &mut buf_borrow,
             is_top: true,
         };
         inner.record(a)?;
-        Ok(RowWrapper(row_borrow.clone()))
+        let row = packer_borrow.finish_and_reuse();
+        Ok(RowWrapper(row))
     }
     define_unexpected! {
         union_branch, array, map, enum_variant, scalar, decimal, bytes, string, json, uuid, fixed
@@ -228,13 +331,13 @@ impl StatefulAvroDecodable for RowWrapper {
 }
 
 #[derive(Debug)]
-pub struct AvroFlatDecoder<'a, 'row> {
-    pub packer: &'a mut RowPacker<'row>,
+pub struct AvroFlatDecoder<'a> {
+    pub packer: &'a mut Row,
     pub buf: &'a mut Vec<u8>,
     pub is_top: bool,
 }
 
-impl<'a, 'row> AvroDecode for AvroFlatDecoder<'a, 'row> {
+impl<'a> AvroDecode for AvroFlatDecoder<'a> {
     type Out = ();
     #[inline]
     fn record<R: AvroRead, A: AvroRecordAccess<R>>(
@@ -242,7 +345,7 @@ impl<'a, 'row> AvroDecode for AvroFlatDecoder<'a, 'row> {
         a: &mut A,
     ) -> Result<Self::Out, AvroError> {
         let mut str_buf = std::mem::take(self.buf);
-        let mut pack_record = |rp: &mut RowPacker| -> Result<(), AvroError> {
+        let mut pack_record = |rp: &mut Row| -> Result<(), AvroError> {
             let mut expected = 0;
             let mut stash = vec![];
             // The idea here is that if the deserializer gives us fields in the order we're expecting,
@@ -255,15 +358,17 @@ impl<'a, 'row> AvroDecode for AvroFlatDecoder<'a, 'row> {
             // Maybe instead, we should decode to separate sub-Rows and then add an API
             // to Row that just copies in the bytes from another one.
             while let Some((_name, idx, f)) = a.next_field()? {
+                let dec = AvroFlatDecoder {
+                    packer: rp,
+                    buf: &mut str_buf,
+                    is_top: false,
+                };
                 if idx == expected {
                     expected += 1;
-                    f.decode_field(AvroFlatDecoder {
-                        packer: rp,
-                        buf: &mut str_buf,
-                        is_top: false,
-                    })?;
+                    f.decode_field(dec)?;
                 } else {
-                    let val = f.decode_field(ValueDecoder)?;
+                    let next = ValueDecoder;
+                    let val = f.decode_field(next)?;
                     stash.push((idx, val));
                 }
             }
@@ -380,7 +485,7 @@ impl<'a, 'row> AvroDecode for AvroFlatDecoder<'a, 'row> {
             .map_err(DecodeError::Custom)?;
 
         if n.is_special()
-            || numeric::get_precision(&n) > u32::from(numeric::NUMERIC_DATUM_MAX_PRECISION)
+            || numeric::get_precision(&n) > numeric::NUMERIC_DATUM_MAX_PRECISION as u32
         {
             return Err(AvroError::Decode(DecodeError::Custom(format!(
                 "Error decoding numeric: exceeds maximum precision {}",
@@ -436,7 +541,7 @@ impl<'a, 'row> AvroDecode for AvroFlatDecoder<'a, 'row> {
     ) -> Result<Self::Out, AvroError> {
         match r {
             ValueOrReader::Value(val) => {
-                JsonbPacker::new(self.packer)
+                *self.packer = JsonbPacker::new(std::mem::take(self.packer))
                     .pack_serde_json(val.clone())
                     .map_err_to_string()
                     .map_err(DecodeError::Custom)?;
@@ -444,7 +549,7 @@ impl<'a, 'row> AvroDecode for AvroFlatDecoder<'a, 'row> {
             ValueOrReader::Reader { len, r } => {
                 self.buf.resize_with(len, Default::default);
                 r.read_exact(self.buf)?;
-                JsonbPacker::new(self.packer)
+                *self.packer = JsonbPacker::new(std::mem::take(self.packer))
                     .pack_slice(&self.buf)
                     .map_err_to_string()
                     .map_err(DecodeError::Custom)?;

@@ -11,13 +11,12 @@
 
 #![warn(missing_debug_implementations)]
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 
-use mz_repr::{ColumnType, ScalarType};
+use repr::{ColumnType, ScalarType};
 
 mod id;
 mod linear;
@@ -25,7 +24,6 @@ mod relation;
 mod scalar;
 
 pub mod explain;
-pub mod proto;
 
 pub use relation::canonicalize;
 
@@ -33,17 +31,17 @@ pub use id::{GlobalId, Id, LocalId, PartitionId, SourceInstanceId};
 pub use linear::{
     memoize_expr,
     plan::{MfpPlan, SafeMfpPlan},
-    util::{join_permutations, permutation_for_arrangement},
+    util::permutation_to_map_and_new_arity,
     MapFilterProject,
 };
 pub use relation::func::{AggregateFunc, TableFunc};
 pub use relation::func::{AnalyzedRegex, CaptureGroupDesc};
 pub use relation::join_input_mapper::JoinInputMapper;
 pub use relation::{
-    compare_columns, AggregateExpr, CollectionPlan, ColumnOrder, JoinImplementation,
-    MirRelationExpr, RowSetFinishing, RECURSION_LIMIT,
+    compare_columns, AggregateExpr, ColumnOrder, JoinImplementation, MirRelationExpr,
+    RowSetFinishing, RECURSION_LIMIT,
 };
-pub use scalar::func::{self, BinaryFunc, UnaryFunc, UnmaterializableFunc, VariadicFunc};
+pub use scalar::func::{self, BinaryFunc, NullaryFunc, UnaryFunc, VariadicFunc};
 pub use scalar::{like_pattern, EvalError, MirScalarExpr};
 
 /// A [`MirRelationExpr`] that claims to have been optimized, e.g., by an
@@ -78,12 +76,6 @@ impl Deref for OptimizedMirRelationExpr {
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-impl CollectionPlan for OptimizedMirRelationExpr {
-    fn depends_on_into(&self, out: &mut BTreeSet<GlobalId>) {
-        self.0.depends_on_into(out)
     }
 }
 

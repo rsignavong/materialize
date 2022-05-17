@@ -15,6 +15,7 @@
 
 //! Command-line parsing utilities.
 
+use clap::AppSettings;
 use clap::Parser;
 
 /// A help template for use with clap that does not include the name of the
@@ -32,9 +33,8 @@ pub fn parse_args<O>() -> O
 where
     O: Parser,
 {
-    let clap = O::command()
-        .disable_version_flag(true)
-        .args_override_self(true)
+    let clap = O::into_app()
+        .global_setting(AppSettings::DisableVersionFlag)
         .help_template(NO_VERSION_HELP_TEMPLATE);
     O::from_arg_matches(&clap.get_matches()).unwrap()
 }

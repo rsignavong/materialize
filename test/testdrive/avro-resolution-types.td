@@ -29,7 +29,4 @@ $ kafka-ingest format=avro topic=resolution-int2double schema=${double-col} publ
 {"f1": 234.456}
 
 ! SELECT * FROM resolution_int2double
-contains:Writer schema has type `Double`, but reader schema has type `Int` for field `schema_int_double.f1`
-
-! SELECT * FROM resolution_int2double
-contains:failed to resolve Avro schema (id =
+Schema resolution error: Schemas don't match: Double, Int

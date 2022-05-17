@@ -2175,11 +2175,10 @@ SELECT array_to_string(ARRAY['a', 'b,', 'c'], NULL), array_to_string(ARRAY['a', 
 ----
 NULL  afoob,foozerpfooc
 
-query error could not determine polymorphic type because input has type unknown
-SELECT array_to_string(NULL, ',')
-
-query error could not determine polymorphic type because input has type unknown
-SELECT array_to_string(NULL, 'foo', 'zerp')
+query TT
+SELECT array_to_string(NULL, ','), array_to_string(NULL, 'foo', 'zerp')
+----
+NULL  NULL
 
 subtest pg_is_in_recovery
 

@@ -16,13 +16,13 @@ $ set-sql-timeout duration=1s
 
 # Verify that invalid options are rejected.
 ! CREATE ROLE foo
-contains:non-login users not yet supported
+non-login users not yet supported
 ! CREATE ROLE foo LOGIN
-contains:non-superusers not yet supported
+non-superusers not yet supported
 ! CREATE ROLE foo LOGIN LOGIN SUPERUSER
-contains:conflicting or redundant options
+conflicting or redundant options
 ! CREATE ROLE foo LOGIN NOLOGIN SUPERUSER
-contains:conflicting or redundant options
+conflicting or redundant options
 
 # Create roles using both syntaxes and verify their existence.
 > CREATE ROLE rj LOGIN SUPERUSER
@@ -36,7 +36,7 @@ contains:conflicting or redundant options
 # Dropping multiple roles should not have any effect if one of the role names
 # is bad...
 ! DROP ROLE rj, fms, bad
-contains:unknown role 'bad'
+unknown role 'bad'
 > SELECT id, name FROM mz_roles
 -1 mz_system
  1 materialize
@@ -63,14 +63,14 @@ contains:unknown role 'bad'
 
 # No dropping the current role.
 ! DROP ROLE ${testdrive.materialized-user}
-contains:current user cannot be dropped
+current user cannot be dropped
 
 # No creating roles that already exist.
 ! CREATE ROLE materialize LOGIN SUPERUSER
-contains:role 'materialize' already exists
+role 'materialize' already exists
 
 # No creating roles that look like system roles.
 ! CREATE ROLE mz_system LOGIN SUPERUSER
-contains:role name "mz_system" is reserved
+role name "mz_system" is reserved
 ! CREATE ROLE mz_foo LOGIN SUPERUSER
-contains:role name "mz_foo" is reserved
+role name "mz_foo" is reserved

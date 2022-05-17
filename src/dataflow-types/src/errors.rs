@@ -9,9 +9,8 @@
 
 use std::fmt::Display;
 
-use bytes::BufMut;
-use mz_expr::{EvalError, SourceInstanceId};
-use mz_persist_types::Codec;
+use expr::EvalError;
+use persist_types::Codec;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,14 +26,12 @@ impl Codec for DecodeError {
         "DecodeError".into()
     }
 
-    fn encode<B: BufMut>(&self, buf: &mut B)
-    where
-        B: BufMut,
-    {
-        match serde_json::to_writer(buf.writer(), self) {
+    fn encode<B: for<'a> Extend<&'a u8>>(&self, buf: &mut B) {
+        let encoded = match serde_json::to_vec(self) {
             Ok(ok) => ok,
             Err(e) => panic!("Encoding error, trying to encode {}: {}", self, e),
         };
+        buf.extend(encoded.iter());
     }
 
     fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
@@ -53,19 +50,19 @@ impl Display for DecodeError {
 
 #[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct SourceError {
-    pub source_id: SourceInstanceId,
+    pub source_name: String,
     pub error: SourceErrorDetails,
 }
 
 impl SourceError {
-    pub fn new(source_id: SourceInstanceId, error: SourceErrorDetails) -> SourceError {
-        SourceError { source_id, error }
+    pub fn new(source_name: String, error: SourceErrorDetails) -> SourceError {
+        SourceError { source_name, error }
     }
 }
 
 impl Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: ", self.source_id)?;
+        write!(f, "{}: ", self.source_name)?;
         self.error.fmt(f)
     }
 }
@@ -129,7 +126,7 @@ impl From<SourceError> for DataflowError {
 
 #[cfg(test)]
 mod tests {
-    use mz_persist_types::Codec;
+    use persist_types::Codec;
 
     use super::DecodeError;
 

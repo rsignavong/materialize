@@ -7,33 +7,40 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use anyhow::{bail, Context};
 use tokio_postgres::config::Host;
 use tokio_postgres::{Client, Config, NoTls};
 use url::Url;
 
-use mz_ore::task;
+use crate::error::{Error, ResultExt};
 
 /// Constructs a URL from PostgreSQL configuration parameters.
 ///
 /// Returns an error if the set of configuration parameters is not representable
 /// as a URL, e.g., if there are multiple hosts.
-pub fn config_url(config: &Config) -> Result<Url, anyhow::Error> {
+pub fn config_url(config: &Config) -> Result<Url, Error> {
     let mut url = Url::parse("postgresql://").unwrap();
 
     let host = match config.get_hosts() {
         [] => "localhost".into(),
         [Host::Tcp(host)] => host.clone(),
         [Host::Unix(path)] => path.display().to_string(),
-        _ => bail!("materialized URL cannot contain multiple hosts"),
+        _ => {
+            return Err(Error::message(
+                "materialized URL cannot contain multiple hosts",
+            ));
+        }
     };
     url.set_host(Some(&host))
-        .context("parsing materialized host")?;
+        .err_ctx("parsing materialized host")?;
 
     url.set_port(Some(match config.get_ports() {
         [] => 5432,
         [port] => *port,
-        _ => bail!("materialized URL cannot contain multiple ports"),
+        _ => {
+            return Err(Error::message(
+                "materialized URL cannot contain multiple ports",
+            ));
+        }
     }))
     .expect("known to be valid to set port");
 
@@ -45,13 +52,13 @@ pub fn config_url(config: &Config) -> Result<Url, anyhow::Error> {
     Ok(url)
 }
 
-pub async fn postgres_client(url: &String) -> Result<Client, anyhow::Error> {
+pub async fn postgres_client(url: &String) -> Result<Client, String> {
     let (client, connection) = tokio_postgres::connect(url, NoTls)
         .await
-        .context("connecting to postgres")?;
+        .map_err(|e| format!("connecting to postgres: {}", e))?;
 
     println!("Connecting to PostgreSQL server at {}...", url);
-    task::spawn(|| "postgres_client_task", connection);
+    tokio::spawn(connection);
 
     Ok(client)
 }

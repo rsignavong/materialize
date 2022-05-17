@@ -35,8 +35,8 @@
 use std::char;
 use std::fmt;
 
-use mz_ore::lex::LexBuf;
-use mz_ore::str::StrExt;
+use ore::lex::LexBuf;
+use ore::str::StrExt;
 
 use crate::keywords::Keyword;
 use crate::parser::ParserError;

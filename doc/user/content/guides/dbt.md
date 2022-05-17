@@ -154,10 +154,10 @@ When you use dbt with Materialize, **your models stay up-to-date** without manua
         (text::jsonb)->>'symbol' AS symbol,
         (text::jsonb)->>'trade_type' AS trade_type,
         to_timestamp(((text::jsonb)->'timestamp')::bigint) AS ts
-    FROM {{ ref('market_orders_raw') }}
+    FROM {{ source('public','market_orders_raw') }}
     ```
 
-    One thing to note here is that the model depends on the source defined in the previous step. To express this dependency and track the **lineage** of your project, you can use the dbt [ref()](https://docs.getdbt.com/reference/dbt-jinja-functions/ref) function {{% gh 8744 %}}.
+    One thing to note here is that the model depends on the source defined in the previous step. To express this dependency and track the **lineage** of your project, you can use the dbt [source()](https://docs.getdbt.com/docs/building-a-dbt-project/using-sources) and [ref()](https://docs.getdbt.com/reference/dbt-jinja-functions/ref) functions.
 
     <h5>Creating a materialized view</h5>
 

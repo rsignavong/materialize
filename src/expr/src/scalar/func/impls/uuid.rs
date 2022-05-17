@@ -9,7 +9,7 @@
 
 use uuid::Uuid;
 
-use mz_repr::strconv;
+use repr::strconv;
 
 sqlfunc!(
     #[sqlname = "timetostr"]

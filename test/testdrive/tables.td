@@ -8,10 +8,10 @@
 # by the Apache License, Version 2.0.
 
 ! INSERT INTO t VALUES (1, 'a');
-contains:unknown catalog item 't'
+unknown catalog item 't'
 
 ! SHOW CREATE TABLE t;
-contains:unknown catalog item 't'
+unknown catalog item 't'
 
 > CREATE TABLE t (a int, b text NOT NULL)
 
@@ -33,13 +33,13 @@ materialize.public.t  "CREATE TABLE \"materialize\".\"public\".\"t\" (\"a\" \"pg
 > DROP TABLE s;
 
 ! CREATE TABLE s (a date DEFAULT 42)
-contains:DEFAULT expression does not support casting from integer to date
+DEFAULT expression does not support casting from integer to date
 
 ! CREATE TABLE s (a int, b int DEFAULT a + 3)
-contains:column "a" does not exist
+column "a" does not exist
 
 ! CREATE TABLE t (a int, b int, a int);
-contains:column "a" specified more than once
+column "a" specified more than once
 
 > SELECT * FROM t;
 
@@ -53,16 +53,13 @@ name
 ----
 
 > SHOW INDEXES FROM t;
+on_name  key_name       seq_in_index  column_name  expression  nullable enabled
+-------------------------------------------------------------------------------
+t        t_primary_idx  1             a            <null>      true     true
+t        t_primary_idx  2             b            <null>      false    true
 
-> CREATE DEFAULT INDEX on t
-
-> SHOW INDEXES FROM t
-cluster on_name  key_name       seq_in_index  column_name  expression  nullable enabled
----------------------------------------------------------------------------------------
-default t        t_primary_idx  1             a            <null>      true     true
-default t        t_primary_idx  2             b            <null>      false    true
-
-> DROP INDEX t_primary_idx
+! DROP INDEX t_primary_idx
+cannot drop 'materialize.public.t_primary_idx' as it is the default index for a table
 
 > SHOW COLUMNS in t;
 name       nullable  type
@@ -148,13 +145,13 @@ a      b
 > INSERT INTO t SELECT * FROM t WHERE a IS NULL;
 
 ! INSERT INTO t VALUES (1);
-contains:null value in column "b" violates not-null constraint
+null value in column "b" violates not-null constraint
 
 ! INSERT INTO t VALUES (1, NULL);
-contains:null value in column "b" violates not-null constraint
+null value in column "b" violates not-null constraint
 
 ! INSERT INTO t VALUES ('d', 4);
-contains:invalid input syntax for type integer: invalid digit found in string: "d"
+invalid input syntax for type integer: invalid digit found in string: "d"
 
 # Test that the INSERT body can be a SELECT query.
 > INSERT INTO t SELECT 3, 'd'
@@ -164,7 +161,7 @@ contains:invalid input syntax for type integer: invalid digit found in string: "
 
 # ...but not in complicated VALUES clauses, per PostgreSQL.
 ! INSERT INTO t VALUES ('5', 'f') LIMIT 0
-contains:column "a" is of type integer but expression is of type text
+column "a" is of type integer but expression is of type text
 
 # Test that assignment casts occur when possible...
 > INSERT INTO t VALUES (5.0, 'f');
@@ -172,16 +169,14 @@ contains:column "a" is of type integer but expression is of type text
 
 # ...but not when impossible.
 ! INSERT INTO t VALUES (DATE '2020-01-01', 'bad')
-contains:column "a" is of type integer but expression is of type date
-! INSERT INTO t (b, a) VALUES ('bad', DATE '2020-01-01')
-contains:column "a" is of type integer but expression is of type date
+column "a" is of type integer but expression is of type date
 
 # Attempting to insert JSON into an int column is particularly interesting.
 # While there is an "explicit" cast from `jsonb` to `int`, there is no
 # "assignment" cast, and INSERT is only allowed to use assignment/implicit
 # casts.
 ! INSERT INTO t VALUES (JSON '1', 'bad')
-contains:column "a" is of type integer but expression is of type jsonb
+column "a" is of type integer but expression is of type jsonb
 
 > SELECT * FROM t;
 a       b
@@ -198,19 +193,16 @@ a       b
 > CREATE TABLE s (a int NOT NULL);
 
 ! INSERT INTO s VALUES (1 + NULL);
-contains:null value in column "a" violates not-null constraint
+null value in column "a" violates not-null constraint
 
 > CREATE TABLE v (a timestamptz);
 > INSERT INTO v VALUES (now());
 
 ! CREATE INDEX ON v (now())
-contains:cannot materialize call to current_timestamp
+now cannot be used in static queries
 
 ! CREATE INDEX ON v (mz_logical_timestamp())
-contains:cannot materialize call to mz_logical_timestamp
-
-! CREATE INDEX ON v (mz_version())
-contains:cannot materialize call to mz_version
+calls to mz_logical_timestamp in in static or write queries are not supported
 
 > DROP TABLE IF EXISTS s;
 
@@ -219,10 +211,10 @@ contains:cannot materialize call to mz_version
 > DROP TABLE IF EXISTS t;
 
 ! SELECT * from t;
-contains:unknown catalog item 't'
+unknown catalog item 't'
 
 ! SHOW INDEXES FROM t;
-contains:unknown catalog item 't'
+unknown catalog item 't'
 
 > SHOW TABLES;
 name
@@ -245,10 +237,10 @@ name
 
 > CREATE VIEW view AS SELECT 1
 ! INSERT INTO view VALUES (1)
-contains:cannot insert into view 'materialize.public.view'
+cannot insert into view 'materialize.public.view'
 
 ! INSERT INTO mz_kafka_sinks VALUES ('bad', 'bad')
-contains:cannot insert into system table 'mz_catalog.mz_kafka_sinks'
+cannot insert into system table 'mz_catalog.mz_kafka_sinks'
 
 > CREATE TABLE j (time TIMESTAMP NOT NULL);
 
@@ -309,28 +301,28 @@ a      b    c
 <null> "c"  <null>
 
 ! INSERT INTO t (notpresent, a, c) VALUES ('str', 1, 2);
-contains:column "notpresent" of relation "materialize.public.t" does not exist
+column "notpresent" of relation "materialize.public.t" does not exist
 
 ! INSERT INTO t (a, b, c) VALUES ('str', 1, 2);
-contains:invalid input syntax for type integer: invalid digit found in string: "str"
+invalid input syntax for type integer: invalid digit found in string: "str"
 
 ! INSERT INTO t (b, a, c) VALUES (1, 'str', 2);
-contains:invalid input syntax for type integer: invalid digit found in string: "str"
+invalid input syntax for type integer: invalid digit found in string: "str"
 
 ! INSERT INTO t (d, c, b, a) VALUES (1, 1, 1, 'str');
-contains:column "d" of relation "materialize.public.t" does not exist
+column "d" of relation "materialize.public.t" does not exist
 
 ! INSERT INTO t (a) VALUES (1);
-contains:null value in column "b" violates not-null constraint
+null value in column "b" violates not-null constraint
 
 ! INSERT INTO t (a) VALUES (1, 'str');
-contains:INSERT has more expressions than target columns
+INSERT has more expressions than target columns
 
 ! INSERT INTO t (a, b, c) VALUES (1);
-contains:INSERT has more target columns than expressions
+INSERT has more target columns than expressions
 
 ! INSERT INTO t (a, a) VALUES (1, 'str')
-contains:column "a" specified more than once
+column "a" specified more than once
 
 # Test pg_table_is_visible.
 > CREATE SCHEMA non_default
@@ -348,14 +340,14 @@ v       true
 # pretty useless.
 > CREATE TABLE nocols ();
 ! INSERT INTO nocols VALUES (1)
-contains:INSERT has more expressions than target columns
+INSERT has more expressions than target columns
 > SELECT count(*) FROM nocols
 0
 > INSERT INTO nocols SELECT UNION ALL SELECT
 > SELECT count(*) FROM nocols
 2
 ! SELECT DISTINCT * FROM nocols
-contains:SELECT DISTINCT must have at least one column
+SELECT DISTINCT must have at least one column
 
 
 # Test that show columns preserves the column order

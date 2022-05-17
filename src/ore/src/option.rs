@@ -50,7 +50,7 @@ pub trait OptionExt<T> {
     /// # Examples
     ///
     /// ```
-    /// use mz_ore::option::OptionExt;
+    /// use ore::option::OptionExt;
     ///
     /// fn render(number: Option<i32>) -> String {
     ///     format!("Your lucky number is {}.", number.display_or("unknown"))
@@ -70,7 +70,7 @@ pub trait OptionExt<T> {
     /// # Examples
     ///
     /// ```
-    /// use mz_ore::option::OptionExt;
+    /// use ore::option::OptionExt;
     ///
     /// fn render(number: Option<i32>, guess: i32) -> String {
     ///     format!(

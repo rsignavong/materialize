@@ -35,9 +35,7 @@ two
       mz_sources s JOIN mz_kafka_source_statistics stats ON s.id = split_part(stats.source_id, '/', 1),
       jsonb_each(statistics->'topics') topics (topic, topic_statistics),
       jsonb_each(topic_statistics->'partitions') partitions (partition, partition_statistics)
-  WHERE s.name = 'data'
-      AND partition = '0'
-      AND (partition_statistics->'app_offset')::int <> -1001;
+  WHERE s.name = 'data' AND partition = '0';
 
 # Ensure that the statistics JSON blob indicates that the two rows have been
 # read from Kafka and that there is no consumer lag.

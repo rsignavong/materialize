@@ -20,4 +20,4 @@ public
 > DROP DATABASE "some database";
 
 ! SELECT * FROM "some database"."some schema".t1;
-contains:unknown database
+unknown database

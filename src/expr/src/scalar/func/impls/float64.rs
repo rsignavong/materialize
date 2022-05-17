@@ -12,12 +12,12 @@ use std::fmt;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use mz_lowertest::MzReflect;
-use mz_repr::adt::numeric::{self, Numeric, NumericMaxScale};
-use mz_repr::{strconv, ColumnType, ScalarType};
+use lowertest::MzStructReflect;
+use repr::adt::numeric::{self, Numeric};
+use repr::{strconv, ColumnType, ScalarType};
 
 use crate::scalar::func::EagerUnaryFunc;
-use crate::{scalar::DomainLimit, EvalError};
+use crate::EvalError;
 
 sqlfunc!(
     #[sqlname = "-"]
@@ -127,8 +127,10 @@ sqlfunc!(
     }
 );
 
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
-pub struct CastFloat64ToNumeric(pub Option<NumericMaxScale>);
+#[derive(
+    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect,
+)]
+pub struct CastFloat64ToNumeric(pub Option<u8>);
 
 impl<'a> EagerUnaryFunc<'a> for CastFloat64ToNumeric {
     type Input = f64;
@@ -142,7 +144,7 @@ impl<'a> EagerUnaryFunc<'a> for CastFloat64ToNumeric {
         }
         let mut a = Numeric::from(a);
         if let Some(scale) = self.0 {
-            if numeric::rescale(&mut a, scale.into_u8()).is_err() {
+            if numeric::rescale(&mut a, scale).is_err() {
                 return Err(EvalError::NumericFieldOverflow);
             }
         }
@@ -153,7 +155,7 @@ impl<'a> EagerUnaryFunc<'a> for CastFloat64ToNumeric {
     }
 
     fn output_type(&self, input: ColumnType) -> ColumnType {
-        ScalarType::Numeric { max_scale: self.0 }.nullable(input.nullable)
+        ScalarType::Numeric { scale: self.0 }.nullable(input.nullable)
     }
 }
 
@@ -190,34 +192,8 @@ sqlfunc!(
 );
 
 sqlfunc!(
-    fn acos(a: f64) -> Result<f64, EvalError> {
-        if a < -1.0 || 1.0 < a {
-            return Err(EvalError::OutOfDomain(
-                DomainLimit::Inclusive(-1),
-                DomainLimit::Inclusive(1),
-                "acos".to_owned(),
-            ));
-        }
-        Ok(a.acos())
-    }
-);
-
-sqlfunc!(
     fn cosh(a: f64) -> f64 {
         a.cosh()
-    }
-);
-
-sqlfunc!(
-    fn acosh(a: f64) -> Result<f64, EvalError> {
-        if a < 1.0 {
-            return Err(EvalError::OutOfDomain(
-                DomainLimit::Inclusive(1),
-                DomainLimit::None,
-                "acosh".to_owned(),
-            ));
-        }
-        Ok(a.acosh())
     }
 );
 
@@ -231,27 +207,8 @@ sqlfunc!(
 );
 
 sqlfunc!(
-    fn asin(a: f64) -> Result<f64, EvalError> {
-        if a < -1.0 || 1.0 < a {
-            return Err(EvalError::OutOfDomain(
-                DomainLimit::Inclusive(-1),
-                DomainLimit::Inclusive(1),
-                "asin".to_owned(),
-            ));
-        }
-        Ok(a.asin())
-    }
-);
-
-sqlfunc!(
     fn sinh(a: f64) -> f64 {
         a.sinh()
-    }
-);
-
-sqlfunc!(
-    fn asinh(a: f64) -> f64 {
-        a.asinh()
     }
 );
 
@@ -265,27 +222,8 @@ sqlfunc!(
 );
 
 sqlfunc!(
-    fn atan(a: f64) -> f64 {
-        a.atan()
-    }
-);
-
-sqlfunc!(
     fn tanh(a: f64) -> f64 {
         a.tanh()
-    }
-);
-
-sqlfunc!(
-    fn atanh(a: f64) -> Result<f64, EvalError> {
-        if a < -1.0 || 1.0 < a {
-            return Err(EvalError::OutOfDomain(
-                DomainLimit::Inclusive(-1),
-                DomainLimit::Inclusive(1),
-                "atanh".to_owned(),
-            ));
-        }
-        Ok(a.atanh())
     }
 );
 
@@ -295,18 +233,6 @@ sqlfunc!(
             return Err(EvalError::InfinityOutOfDomain("cot".to_owned()));
         }
         Ok(1.0 / a.tan())
-    }
-);
-
-sqlfunc!(
-    fn radians(a: f64) -> f64 {
-        a.to_radians()
-    }
-);
-
-sqlfunc!(
-    fn degrees(a: f64) -> f64 {
-        a.to_degrees()
     }
 );
 

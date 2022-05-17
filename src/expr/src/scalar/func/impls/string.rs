@@ -11,35 +11,24 @@ use std::borrow::Cow;
 use std::fmt;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use mz_lowertest::MzReflect;
-use mz_ore::cast::CastFrom;
-use mz_ore::result::ResultExt;
-use mz_repr::adt::char::{format_str_trim, Char, CharLength};
-use mz_repr::adt::interval::Interval;
-use mz_repr::adt::numeric::{self, Numeric, NumericMaxScale};
-use mz_repr::adt::system::{Oid, PgLegacyChar};
-use mz_repr::adt::varchar::{VarChar, VarCharMaxLength};
-use mz_repr::{strconv, ColumnType, Datum, RowArena, ScalarType};
+use lowertest::MzStructReflect;
+use ore::result::ResultExt;
+use repr::adt::char::{format_str_trim, Char};
+use repr::adt::interval::Interval;
+use repr::adt::numeric::{self, Numeric};
+use repr::adt::varchar::VarChar;
+use repr::{strconv, ColumnType, Datum, RowArena, ScalarType};
 
 use crate::scalar::func::{array_create_scalar, EagerUnaryFunc, LazyUnaryFunc};
-use crate::{EvalError, MirScalarExpr, UnaryFunc};
+use crate::{EvalError, MirScalarExpr};
 
 sqlfunc!(
     #[sqlname = "strtobool"]
     fn cast_string_to_bool<'a>(a: &'a str) -> Result<bool, EvalError> {
         strconv::parse_bool(a).err_into()
-    }
-);
-
-sqlfunc!(
-    #[sqlname = "strtopglegacychar"]
-    #[preserves_uniqueness = true]
-    fn cast_string_to_pg_legacy_char<'a>(a: &'a str) -> PgLegacyChar {
-        PgLegacyChar(a.as_bytes().get(0).copied().unwrap_or(0))
     }
 );
 
@@ -86,15 +75,10 @@ sqlfunc!(
     }
 );
 
-sqlfunc!(
-    #[sqlname = "strtooid"]
-    fn cast_string_to_oid<'a>(a: &'a str) -> Result<Oid, EvalError> {
-        Ok(Oid(strconv::parse_oid(a)?))
-    }
-);
-
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
-pub struct CastStringToNumeric(pub Option<NumericMaxScale>);
+#[derive(
+    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect,
+)]
+pub struct CastStringToNumeric(pub Option<u8>);
 
 impl<'a> EagerUnaryFunc<'a> for CastStringToNumeric {
     type Input = &'a str;
@@ -103,7 +87,7 @@ impl<'a> EagerUnaryFunc<'a> for CastStringToNumeric {
     fn call(&self, a: &'a str) -> Result<Numeric, EvalError> {
         let mut d = strconv::parse_numeric(a)?;
         if let Some(scale) = self.0 {
-            if numeric::rescale(&mut d.0, scale.into_u8()).is_err() {
+            if numeric::rescale(&mut d.0, scale).is_err() {
                 return Err(EvalError::NumericFieldOverflow);
             }
         }
@@ -111,7 +95,7 @@ impl<'a> EagerUnaryFunc<'a> for CastStringToNumeric {
     }
 
     fn output_type(&self, input: ColumnType) -> ColumnType {
-        ScalarType::Numeric { max_scale: self.0 }.nullable(input.nullable)
+        ScalarType::Numeric { scale: self.0 }.nullable(input.nullable)
     }
 }
 
@@ -163,7 +147,9 @@ sqlfunc!(
     }
 );
 
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(
+    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect,
+)]
 pub struct CastStringToArray {
     // Target array's type.
     pub return_ty: ScalarType,
@@ -225,7 +211,9 @@ impl fmt::Display for CastStringToArray {
     }
 }
 
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(
+    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect,
+)]
 pub struct CastStringToList {
     // Target list's type
     pub return_ty: ScalarType,
@@ -267,7 +255,7 @@ impl LazyUnaryFunc for CastStringToList {
 
     /// The output ColumnType of this function
     fn output_type(&self, _input_type: ColumnType) -> ColumnType {
-        self.return_ty.without_modifiers().nullable(false)
+        self.return_ty.default_embedded_value().nullable(false)
     }
 
     /// Whether this function will produce NULL on NULL input
@@ -292,7 +280,9 @@ impl fmt::Display for CastStringToList {
     }
 }
 
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(
+    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect,
+)]
 pub struct CastStringToMap {
     // Target map's value type
     pub return_ty: ScalarType,
@@ -367,9 +357,11 @@ impl fmt::Display for CastStringToMap {
     }
 }
 
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(
+    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect,
+)]
 pub struct CastStringToChar {
-    pub length: Option<CharLength>,
+    pub length: Option<usize>,
     pub fail_on_len: bool,
 }
 
@@ -382,7 +374,7 @@ impl<'a> EagerUnaryFunc<'a> for CastStringToChar {
             assert!(self.fail_on_len);
             EvalError::StringValueTooLong {
                 target_type: "character".to_string(),
-                length: usize::cast_from(self.length.unwrap().into_u32()),
+                length: self.length.unwrap(),
             }
         })?;
 
@@ -403,9 +395,11 @@ impl fmt::Display for CastStringToChar {
     }
 }
 
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(
+    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect,
+)]
 pub struct CastStringToVarChar {
-    pub length: Option<VarCharMaxLength>,
+    pub length: Option<usize>,
     pub fail_on_len: bool,
 }
 
@@ -414,21 +408,20 @@ impl<'a> EagerUnaryFunc<'a> for CastStringToVarChar {
     type Output = Result<VarChar<String>, EvalError>;
 
     fn call(&self, a: &'a str) -> Result<VarChar<String>, EvalError> {
-        let s =
-            mz_repr::adt::varchar::format_str(a, self.length, self.fail_on_len).map_err(|_| {
-                assert!(self.fail_on_len);
-                EvalError::StringValueTooLong {
-                    target_type: "character varying".to_string(),
-                    length: usize::cast_from(self.length.unwrap().into_u32()),
-                }
-            })?;
+        let s = repr::adt::varchar::format_str(a, self.length, self.fail_on_len).map_err(|_| {
+            assert!(self.fail_on_len);
+            EvalError::StringValueTooLong {
+                target_type: "character varying".to_string(),
+                length: self.length.unwrap(),
+            }
+        })?;
 
         Ok(VarChar(s))
     }
 
     fn output_type(&self, input: ColumnType) -> ColumnType {
         ScalarType::VarChar {
-            max_length: self.length,
+            length: self.length,
         }
         .nullable(input.nullable)
     }
@@ -437,66 +430,5 @@ impl<'a> EagerUnaryFunc<'a> for CastStringToVarChar {
 impl fmt::Display for CastStringToVarChar {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("strtovarchar")
-    }
-}
-
-// If we support another vector type, this should likely get hoisted into a
-// position akin to array parsing.
-lazy_static! {
-    static ref INT2VECTOR_CAST_EXPR: MirScalarExpr = MirScalarExpr::CallUnary {
-        func: UnaryFunc::CastStringToInt16(CastStringToInt16),
-        expr: Box::new(MirScalarExpr::Column(0)),
-    };
-}
-
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
-pub struct CastStringToInt2Vector;
-
-impl LazyUnaryFunc for CastStringToInt2Vector {
-    fn eval<'a>(
-        &'a self,
-        datums: &[Datum<'a>],
-        temp_storage: &'a RowArena,
-        a: &'a MirScalarExpr,
-    ) -> Result<Datum<'a>, EvalError> {
-        let a = a.eval(datums, temp_storage)?;
-        if a.is_null() {
-            return Ok(Datum::Null);
-        }
-
-        let datums = strconv::parse_legacy_vector(a.unwrap_str(), |elem_text| {
-            let elem_text = match elem_text {
-                Cow::Owned(s) => temp_storage.push_string(s),
-                Cow::Borrowed(s) => s,
-            };
-            INT2VECTOR_CAST_EXPR.eval(&[Datum::String(elem_text)], temp_storage)
-        })?;
-        array_create_scalar(&datums, temp_storage)
-    }
-
-    /// The output ColumnType of this function
-    fn output_type(&self, _input_type: ColumnType) -> ColumnType {
-        ScalarType::Int2Vector.nullable(false)
-    }
-
-    /// Whether this function will produce NULL on NULL input
-    fn propagates_nulls(&self) -> bool {
-        true
-    }
-
-    /// Whether this function will produce NULL on non-NULL input
-    fn introduces_nulls(&self) -> bool {
-        false
-    }
-
-    /// Whether this function preserves uniqueness
-    fn preserves_uniqueness(&self) -> bool {
-        false
-    }
-}
-
-impl fmt::Display for CastStringToInt2Vector {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("strtoint2vector")
     }
 }

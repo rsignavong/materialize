@@ -30,17 +30,17 @@
 3 "foo"
 
 ! CREATE VIEW non_temp AS SELECT * FROM temp_v
-contains:non-temporary items cannot depend on temporary item
+non-temporary items cannot depend on temporary item
 
 > CREATE TEMP VIEW double_temp_v AS SELECT * FROM temp_v
 
 ! CREATE TEMP VIEW double_temp_v AS SELECT * FROM temp_v
-contains:catalog item 'double_temp_v' already exists
+catalog item 'double_temp_v' already exists
 
 > CREATE OR REPLACE TEMP VIEW double_temp_v AS SELECT * FROM temp_v
 
 ! CREATE OR REPLACE VIEW double_temp_v AS SELECT * FROM temp_v
-contains:non-temporary items cannot depend on temporary item
+non-temporary items cannot depend on temporary item
 
 > SELECT * FROM double_temp_v
 1 "foo"
@@ -57,13 +57,13 @@ contains:non-temporary items cannot depend on temporary item
 > CREATE TEMPORARY MATERIALIZED VIEW foo AS SELECT * FROM v
 
 > SHOW INDEXES FROM foo
-cluster on_name    key_name         seq_in_index  column_name  expression  nullable  enabled
---------------------------------------------------------------------------------------------
-default foo        foo_primary_idx  1             column1      <null>      false     true
-default foo        foo_primary_idx  2             column2      <null>      false     true
+ on_name    key_name         seq_in_index  column_name  expression  nullable  enabled
+-------------------------------------------------------------------------------------
+ foo        foo_primary_idx  1             column1      <null>      false     true
+ foo        foo_primary_idx  2             column2      <null>      false     true
 
 ! CREATE TEMP MATERIALIZED VIEW foo AS SELECT * FROM v
-contains:catalog item 'foo' already exists
+catalog item 'foo' already exists
 
 > CREATE OR REPLACE TEMPORARY MATERIALIZED VIEW foo AS SELECT * FROM v
 
@@ -88,7 +88,7 @@ contains:catalog item 'foo' already exists
 > DROP VIEW v1;
 
 ! SELECT * FROM v1;
-contains:unknown catalog item 'v1'
+unknown catalog item 'v1'
 
 # Rename temporary view
 
@@ -97,7 +97,7 @@ contains:unknown catalog item 'v1'
 > ALTER VIEW v1 RENAME TO v2;
 
 ! SELECT * FROM v1;
-contains:unknown catalog item 'v1'
+unknown catalog item 'v1'
 
 > SELECT * FROM v2;
  f1
@@ -112,21 +112,15 @@ contains:unknown catalog item 'v1'
 > CREATE TEMPORARY TABLE temp_t (a int, b text NOT NULL)
 
 ! CREATE TEMP TABLE temp_t (a int, b text NOT NULL)
-contains:catalog item 'temp_t' already exists
+catalog item 'temp_t' already exists
 
 > INSERT INTO temp_t VALUES (1, 'testing')
 
 > SHOW INDEXES FROM temp_t
-
-# Blocked on https://github.com/MaterializeInc/materialize/issues/3105.
-#
-# > CREATE TEMPORARY DEFAULT INDEX ON temp_t
-#
-# > SHOW INDEXES FROM temp_t
-#  on_name    key_name            seq_in_index  column_name  expression  nullable enabled
-# ---------------------------------------------------------------------------------------
-#  temp_t     temp_t_primary_idx  1             a            <null>      true     true
-#  temp_t     temp_t_primary_idx  2             b            <null>      false    true
+ on_name    key_name            seq_in_index  column_name  expression  nullable enabled
+---------------------------------------------------------------------------------------
+ temp_t     temp_t_primary_idx  1             a            <null>      true     true
+ temp_t     temp_t_primary_idx  2             b            <null>      false    true
 
 > DROP TABLE temp_t
 
@@ -168,7 +162,7 @@ contains:catalog item 'temp_t' already exists
 > ALTER TABLE t1 RENAME TO t2;
 
 ! SELECT * FROM t1;
-contains:unknown catalog item 't1'
+unknown catalog item 't1'
 
 > SELECT * FROM t2;
  f1
@@ -182,10 +176,10 @@ contains:unknown catalog item 't1'
 > CREATE TEMPORARY TABLE t1 (f1 INTEGER);
 
 ! CREATE VIEW non_temp AS SELECT * FROM t1;
-contains:non-temporary items cannot depend on temporary item
+non-temporary items cannot depend on temporary item
 
 ! CREATE VIEW non_temp AS SELECT (SELECT * FROM t1);
-contains:non-temporary items cannot depend on temporary item
+non-temporary items cannot depend on temporary item
 
 > DROP TABLE t1;
 
@@ -193,10 +187,10 @@ contains:non-temporary items cannot depend on temporary item
 # Make sure the mz_temp schema is protected
 
 ! DROP SCHEMA mz_temp
-contains:cannot drop schema mz_temp because it is required by the database system
+cannot drop schema mz_temp because it is required by the database system
 
 ! CREATE TABLE mz_temp.table_in_mz_temp (f1 INTEGER)
-contains:unknown schema 'mz_temp'
+unknown schema 'mz_temp'
 
 #####################################################################
 # Test things we shouldn't be able to make temporary.
@@ -212,24 +206,24 @@ $ set schema={
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
   FORMAT AVRO USING SCHEMA '${schema}'
   ENVELOPE DEBEZIUM
-contains:Expected DATABASE, SCHEMA, ROLE, USER, TYPE, INDEX, SINK, SOURCE, TABLE, SECRET or [OR REPLACE] [TEMPORARY] [MATERIALIZED] VIEW or VIEWS after CREATE, found SOURCE
+Expected DATABASE, SCHEMA, ROLE, USER, TYPE, INDEX, SINK, SOURCE, TABLE or [OR REPLACE] [TEMPORARY] [MATERIALIZED] VIEW or VIEWS after CREATE, found SOURCE
 
 
 ##### Temporary sinks.
 ! CREATE TEMPORARY SINK data_sink FROM data
   INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'data-sink'
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-contains:Expected DATABASE, SCHEMA, ROLE, USER, TYPE, INDEX, SINK, SOURCE, TABLE, SECRET or [OR REPLACE] [TEMPORARY] [MATERIALIZED] VIEW or VIEWS after CREATE, found SINK
+Expected DATABASE, SCHEMA, ROLE, USER, TYPE, INDEX, SINK, SOURCE, TABLE or [OR REPLACE] [TEMPORARY] [MATERIALIZED] VIEW or VIEWS after CREATE, found SINK
 
 #####################################################################
 
 ! DROP VIEW temp_v;
-contains:cannot drop mz_temp.temp_v: still depended upon by catalog item 'mz_temp.double_temp_v'
+cannot drop mz_temp.temp_v: still depended upon by catalog item 'mz_temp.double_temp_v'
 
 > DROP VIEW double_temp_v;
 
 ! SELECT * FROM double_temp_v;
-contains:unknown catalog item 'double_temp_v'
+unknown catalog item 'double_temp_v'
 
 > DISCARD TEMP
 
@@ -238,7 +232,7 @@ contains:unknown catalog item 'double_temp_v'
 > SELECT * FROM mz_indexes WHERE name = 'temp_t_primary_idx'
 
 ! SELECT * FROM temp_v;
-contains:unknown catalog item 'temp_v'
+unknown catalog item 'temp_v'
 
-! CREATE TEMP VIEW mz_catalog.a AS SELECT 1
-contains:cannot create temporary item in non-temporary schema
+! CREATE TEMP VIEW mz_foo.a AS SELECT 1
+cannot create temporary item in non-temporary schema

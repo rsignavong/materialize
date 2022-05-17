@@ -40,7 +40,7 @@ struct Args {
 }
 
 fn main() {
-    let args: Args = mz_ore::cli::parse_args();
+    let args: Args = ore::cli::parse_args();
 
     let listener =
         TcpListener::bind((&*args.listen_addr, args.port)).expect("binding tcp listener");
@@ -65,7 +65,8 @@ fn main() {
     timely::execute_from_args(args.timely_args.into_iter(), move |worker| {
         let index = worker.index();
         let peers = worker.peers();
-        let replayers = Arc::clone(&sockets)
+        let replayers = sockets
+            .clone()
             .lock()
             .expect("sockets lock poisoned")
             .iter_mut()

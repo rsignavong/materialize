@@ -24,9 +24,9 @@
 
 use std::collections::HashMap;
 
+use expr::{Id, JoinInputMapper, MirRelationExpr, MirScalarExpr, RECURSION_LIMIT};
 use itertools::Itertools;
-use mz_expr::{Id, JoinInputMapper, MirRelationExpr, MirScalarExpr, RECURSION_LIMIT};
-use mz_ore::stack::{CheckedRecursion, RecursionGuard};
+use ore::stack::{CheckedRecursion, RecursionGuard};
 
 use crate::TransformArgs;
 
@@ -177,10 +177,7 @@ impl RedundantJoin {
                             }
                         }
 
-                        mz_expr::canonicalize::canonicalize_equivalences(
-                            equivalences,
-                            &input_types,
-                        );
+                        expr::canonicalize::canonicalize_equivalences(equivalences, &input_types);
 
                         // Build a projection that leaves the binding expressions in the same
                         // position as the columns of the removed join input they are replacing.
@@ -202,7 +199,7 @@ impl RedundantJoin {
                         }
 
                         // Unset implementation, as irrevocably hosed by this transformation.
-                        *implementation = mz_expr::JoinImplementation::Unimplemented;
+                        *implementation = expr::JoinImplementation::Unimplemented;
 
                         *relation = relation.take_dangerous().map(bindings).project(projection);
                         // The projection will gum up provenance reasoning anyhow, so don't work hard.
@@ -250,6 +247,7 @@ impl RedundantJoin {
                     }
                     Ok(result)
                 }
+                MirRelationExpr::DeclareKeys { input, .. } => self.action(input, lets),
 
                 MirRelationExpr::Union { base, inputs } => {
                     let mut prov = self.action(base, lets)?;
@@ -432,9 +430,7 @@ impl ProvInfo {
                     None
                 }
             }
-            MirScalarExpr::Literal(..) | MirScalarExpr::CallUnmaterializable(..) => {
-                Some(expr.clone())
-            }
+            MirScalarExpr::Literal(..) | MirScalarExpr::CallNullary(..) => Some(expr.clone()),
             MirScalarExpr::If { cond, then, els } => self.dereference(cond).and_then(|cond| {
                 self.dereference(then).and_then(|then| {
                     self.dereference(els).and_then(|els| {
@@ -659,9 +655,7 @@ fn try_build_expression_using_other(
                 None
             }
         }
-        MirScalarExpr::Literal(..) | MirScalarExpr::CallUnmaterializable(..) => {
-            Some(root_expr.clone())
-        }
+        MirScalarExpr::Literal(..) | MirScalarExpr::CallNullary(..) => Some(root_expr.clone()),
         MirScalarExpr::If { cond, then, els } => {
             try_build_expression_using_other(cond, other, other_prov, input_mapper).and_then(
                 |cond| {

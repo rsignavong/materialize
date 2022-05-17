@@ -11,7 +11,6 @@
 # materialized views on some source.
 
 > CREATE TABLE t1 (f1 INTEGER, f2 INTEGER);
-> CREATE DEFAULT INDEX on t1
 
 > CREATE MATERIALIZED VIEW v1 AS SELECT * FROM t1;
 
@@ -26,10 +25,10 @@
 # the frontier
 
 ! SELECT * FROM t1 AS OF NOW() - INTERVAL '1 second';
-contains:is not valid for all inputs
+is not valid for all inputs
 
 ! SELECT * FROM v1 AS OF NOW() - INTERVAL '1 second';
-contains:is not valid for all inputs
+is not valid for all inputs
 
 ! SELECT * FROM v2 AS OF NOW() - INTERVAL '1 second';
-contains:is not valid for all inputs
+is not valid for all inputs

@@ -23,13 +23,13 @@ use async_trait::async_trait;
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{sink, SinkExt, TryStreamExt};
+use log::trace;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Interest, Ready};
 use tokio_util::codec::{Decoder, Encoder, Framed};
-use tracing::trace;
 
-use mz_ore::cast::CastFrom;
-use mz_ore::future::OreSinkExt;
-use mz_ore::netio::{self, AsyncReady};
+use ore::cast::CastFrom;
+use ore::future::OreSinkExt;
+use ore::netio::{self, AsyncReady};
 
 use crate::message::{
     BackendMessage, ErrorResponse, FrontendMessage, FrontendStartupMessage, TransactionStatus,
@@ -104,9 +104,6 @@ where
     /// Note that the connection is not flushed after calling this method. You
     /// must call [`FramedConn::flush`] explicitly. Returns an error if the
     /// underlying connection is broken.
-    ///
-    /// Please use `StateMachine::send` instead if calling from `StateMachine`,
-    /// as it applies session-based filters before calling this method.
     pub async fn send<M>(&mut self, message: M) -> Result<(), io::Error>
     where
         M: Into<BackendMessage>,
@@ -147,7 +144,7 @@ where
     /// type information in the codec before sending any data row messages. This
     /// violates the abstraction boundary a bit but results in much better
     /// performance.
-    pub fn set_encode_state(&mut self, encode_state: Vec<(mz_pgrepr::Type, mz_pgrepr::Format)>) {
+    pub fn set_encode_state(&mut self, encode_state: Vec<(pgrepr::Type, pgrepr::Format)>) {
         self.inner.get_mut().codec_mut().encode_state = encode_state;
     }
 }
@@ -173,7 +170,7 @@ where
 
 struct Codec {
     decode_state: DecodeState,
-    encode_state: Vec<(mz_pgrepr::Type, mz_pgrepr::Format)>,
+    encode_state: Vec<(pgrepr::Type, pgrepr::Format)>,
 }
 
 impl Codec {
@@ -199,7 +196,6 @@ impl Encoder<BackendMessage> for Codec {
         // Write type byte.
         let byte = match &msg {
             BackendMessage::AuthenticationOk => b'R',
-            BackendMessage::AuthenticationCleartextPassword => b'R',
             BackendMessage::RowDescription(_) => b'T',
             BackendMessage::DataRow(_) => b'D',
             BackendMessage::CommandComplete { .. } => b'C',
@@ -253,9 +249,6 @@ impl Encoder<BackendMessage> for Codec {
             BackendMessage::CopyDone => (),
             BackendMessage::AuthenticationOk => {
                 dst.put_u32(0);
-            }
-            BackendMessage::AuthenticationCleartextPassword => {
-                dst.put_u32(3);
             }
             BackendMessage::RowDescription(fields) => {
                 dst.put_length_i16(fields.len())?;
@@ -371,8 +364,8 @@ impl Encoder<BackendMessage> for Codec {
 trait Pgbuf: BufMut {
     fn put_string(&mut self, s: &str);
     fn put_length_i16(&mut self, len: usize) -> Result<(), io::Error>;
-    fn put_format_i8(&mut self, format: mz_pgrepr::Format);
-    fn put_format_i16(&mut self, format: mz_pgrepr::Format);
+    fn put_format_i8(&mut self, format: pgrepr::Format);
+    fn put_format_i16(&mut self, format: pgrepr::Format);
 }
 
 impl<B: BufMut> Pgbuf for B {
@@ -388,14 +381,14 @@ impl<B: BufMut> Pgbuf for B {
         Ok(())
     }
 
-    fn put_format_i8(&mut self, format: mz_pgrepr::Format) {
+    fn put_format_i8(&mut self, format: pgrepr::Format) {
         self.put_i8(match format {
-            mz_pgrepr::Format::Text => 0,
-            mz_pgrepr::Format::Binary => 1,
+            pgrepr::Format::Text => 0,
+            pgrepr::Format::Binary => 1,
         })
     }
 
-    fn put_format_i16(&mut self, format: mz_pgrepr::Format) {
+    fn put_format_i16(&mut self, format: pgrepr::Format) {
         self.put_i8(0);
         self.put_format_i8(format);
     }
@@ -507,9 +500,6 @@ impl Decoder for Codec {
                         // Termination.
                         b'X' => decode_terminate(buf)?,
 
-                        // Authentication.
-                        b'p' => decode_password(buf)?,
-
                         // Copy from flow.
                         b'f' => decode_copy_fail(buf)?,
                         b'd' => decode_copy_data(buf, frame_len)?,
@@ -535,12 +525,6 @@ impl Decoder for Codec {
 fn decode_terminate(mut _buf: Cursor) -> Result<FrontendMessage, io::Error> {
     // Nothing more to decode.
     Ok(FrontendMessage::Terminate)
-}
-
-fn decode_password(mut buf: Cursor) -> Result<FrontendMessage, io::Error> {
-    Ok(FrontendMessage::Password {
-        password: buf.read_cstr()?.to_owned(),
-    })
 }
 
 fn decode_query(mut buf: Cursor) -> Result<FrontendMessage, io::Error> {
@@ -756,10 +740,10 @@ impl<'a> Cursor<'a> {
     }
 
     /// Reads the next 16-bit format code, advancing the cursor by two bytes.
-    fn read_format(&mut self) -> Result<mz_pgrepr::Format, io::Error> {
+    fn read_format(&mut self) -> Result<pgrepr::Format, io::Error> {
         match self.read_i16()? {
-            0 => Ok(mz_pgrepr::Format::Text),
-            1 => Ok(mz_pgrepr::Format::Binary),
+            0 => Ok(pgrepr::Format::Text),
+            1 => Ok(pgrepr::Format::Binary),
             n => Err(input_err(format!("unknown format code: {}", n))),
         }
     }

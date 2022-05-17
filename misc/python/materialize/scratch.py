@@ -14,13 +14,11 @@ import csv
 import datetime
 import os
 import shlex
-import subprocess
 import sys
 from subprocess import CalledProcessError
-from typing import Dict, List, NamedTuple, Optional, cast
+from typing import IO, Dict, List, NamedTuple, Optional, Union
 
 import boto3
-from mypy_boto3_ec2.literals import InstanceTypeType
 from mypy_boto3_ec2.service_resource import Instance
 from mypy_boto3_ec2.type_defs import (
     InstanceNetworkInterfaceSpecificationTypeDef,
@@ -38,7 +36,6 @@ DEFAULT_SECURITY_GROUP_ID = "sg-06f780c8e23c0d944"
 DEFAULT_INSTANCE_PROFILE_NAME = "admin-instance"
 
 SSH_COMMAND = ["mssh", "-o", "StrictHostKeyChecking=off"]
-SFTP_COMMAND = ["msftp", "-o", "StrictHostKeyChecking=off"]
 
 say = ui.speaker("scratch> ")
 
@@ -153,7 +150,7 @@ def launch(
         "MinCount": 1,
         "MaxCount": 1,
         "ImageId": ami,
-        "InstanceType": cast(InstanceTypeType, instance_type),
+        "InstanceType": instance_type,  # type: ignore
         "UserData": provisioning_script,
         "TagSpecifications": [
             {
@@ -229,29 +226,22 @@ async def setup(
     mkrepo(i, git_rev)
 
 
-def mkrepo(i: Instance, rev: str, init: bool = True, force: bool = False) -> None:
-    if init:
-        mssh(i, "git init --bare materialize/.git")
-
-    rev = git.rev_parse(rev)
-
-    cmd: List[str] = [
-        "git",
-        "push",
-        "--no-verify",
-        f"{instance_host(i)}:materialize/.git",
-        # Explicit refspec is required if the host repository is in detached
-        # HEAD mode.
-        f"{rev}:refs/heads/scratch",
-    ]
-    if force:
-        cmd.append("--force")
-
+def mkrepo(i: Instance, rev: str) -> None:
+    mssh(i, "git init --bare materialize/.git")
     spawn.runv(
-        cmd,
+        [
+            "git",
+            "push",
+            "--no-verify",
+            f"{instance_host(i)}:materialize/.git",
+            # Explicit refspec is required if the host repository is in detached
+            # HEAD mode.
+            "HEAD:refs/heads/scratch",
+        ],
         cwd=ROOT,
         env=dict(os.environ, GIT_SSH_COMMAND=" ".join(SSH_COMMAND)),
     )
+    rev = git.rev_parse(rev)
     mssh(
         i,
         f"cd materialize && git config core.bare false && git checkout {rev}",
@@ -319,7 +309,7 @@ def launch_cluster(
         (f"{i.private_ip_address}\t{d.name}\n" for (i, d) in zip(instances, descs))
     )
     for i in instances:
-        mssh(i, "sudo tee -a /etc/hosts", input=hosts_str.encode())
+        mssh(i, "sudo tee -a /etc/hosts", stdin=hosts_str.encode())
 
     env = " ".join(f"{k}={shlex.quote(v)}" for k, v in extra_env.items())
     for (i, d) in zip(instances, descs):
@@ -368,10 +358,13 @@ def mssh(
     instance: Instance,
     command: str,
     *,
-    input: Optional[bytes] = None,
+    stdin: Union[None, int, IO[bytes], bytes] = None,
 ) -> None:
     """Runs a command over SSH via EC2 Instance Connect."""
     host = instance_host(instance)
+    # The actual invocation of SSH that `spawn.runv` wants to print is
+    # unreadable quoted garbage, so we do our own printing here before the shell
+    # quoting.
     if command:
         print(f"{host}$ {command}", file=sys.stderr)
         # Quote to work around:
@@ -379,20 +372,12 @@ def mssh(
         command = shlex.quote(command)
     else:
         print(f"$ mssh {host}")
-    subprocess.run(
+    spawn.runv(
         [
             *SSH_COMMAND,
-            host,
+            f"{host}",
             command,
         ],
-        check=True,
-        input=input,
+        stdin=stdin,
+        print_to=open(os.devnull, "w"),
     )
-
-
-def msftp(
-    instance: Instance,
-) -> None:
-    """Connects over SFTP via EC2 Instance Connect."""
-    host = instance_host(instance)
-    spawn.runv([*SFTP_COMMAND, host])

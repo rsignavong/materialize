@@ -14,17 +14,6 @@ This page details Materialize's supported SQL [functions](#functions) and [opera
 
 ## Functions
 
-### Unmaterializable functions
-
-Several functions in Materialize are **unmaterializable** because their output
-depends upon state besides their input parameters, like the value of a session
-parameter or the timestamp of the current transaction. You cannot create an
-[index](/sql/create-index) or materialized view that depends on an
-unmaterializable function, but you can use them in unmaterialized views and
-one-off [`SELECT`](/sql/select) statements.
-
-Unmaterializable functions are marked as such in the table below.
-
 {{< fnlist >}}
 
 ## Operators
@@ -59,8 +48,8 @@ Operator | Computes
 `a IS NOT FALSE` | `a` is not false, requiring `a` to be a boolean
 `a IS UNKNOWN` | `a = NULL`, requiring `a` to be a boolean
 `a IS NOT UNKNOWN` | `a != NULL`, requiring `a` to be a boolean
-`a LIKE match_expr [ ESCAPE escape_char ]` | `a` matches `match_expr`, using [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
-`a ILIKE match_expr [ ESCAPE escape_char ]` | `a` matches `match_expr`, using case-insensitive [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
+`a LIKE match_expr` | `a` matches `match_expr`, using [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
+`a ILIKE match_expr` | `a` matches `match_expr`, using case-insensitive [SQL LIKE matching](https://www.postgresql.org/docs/13/functions-matching.html#FUNCTIONS-LIKE)
 
 ### Numbers
 

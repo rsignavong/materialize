@@ -15,8 +15,8 @@
 use std::iter;
 
 use crate::TransformArgs;
-use mz_expr::MirRelationExpr;
-use mz_repr::RelationType;
+use expr::MirRelationExpr;
+use repr::RelationType;
 
 /// Fuses multiple `Union` operators into one.
 #[derive(Debug)]

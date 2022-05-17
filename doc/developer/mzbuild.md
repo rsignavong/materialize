@@ -291,6 +291,39 @@ services:
     image: zookeeper:3.4.13
 ```
 
+A common complaint with Docker Compose is the lack of proper service
+orchestration. It is not possible to express, for exaple, that the `fancy`
+service cannot be started until `materialized` has booted successfully.
+
+`mzcompose` therefore provides a feature called "workflows" that orchestrate
+interacting with the defined services. The following `load-test` workflow waits
+for `materialized` to start listening on port 6875 before launching the `fancy`
+service.
+
+```
+version: "3.7"
+
+services:
+  fancy:
+    mzbuild: fancy-loadgen
+  materialized:
+    mzbuild: materialized
+
+mzworkflows:
+  load-test:
+    steps:
+    - step: start-services
+      services: [materialized]
+    - step: wait-for-tcp
+      host: materialized
+      port: 6875
+    - step: start-services
+      services: [fancy-loadgen]
+```
+
+To run the workflow, run `./mzcompose run load-test`, just like you would if
+`load-test` were a normal service.
+
 #### Release vs development builds
 
 Via `mzbuild`, `mzcompose` supports building binaries in either release or
@@ -399,12 +432,13 @@ publish: true
 
      In rare cases, it may be necessary to extract files from the build
      directory of a dependency. The `extract` key specifies a mapping from a
-     dependent package to a mapping from source files and directories to
-     destination directories. Source paths are interpreted relative to that
-     crate's build directory while destination paths are interpreted relative to
-     the build context. Note that `extract` is only relevant if the dependency
-     has a custom Cargo build script, as Rust crates without a build script do
-     not have a build directory.
+     dependent package to a list of files to copy into the build context. Paths
+     should be relative and are interpreted relative to that crate's build
+     directory. Each extracted file will be placed in the root of the build
+     context with the same name as the original file. Copying directories is not
+     supported. Note that `extract` is only relevant if the dependency has a
+     custom Cargo build script, as Rust crates without a build script do not
+     have a build directory.
 
   * `type: cargo-test` builds a special image that simulates `cargo test`. This
      plugin is very special-cased at the moment, and unlikely to be generally
@@ -449,6 +483,14 @@ services:
   materialized:
     mzbuild: materialized
     propagate_uid_gid: true
+
+mzworkflows:
+  NAME:
+    env:
+      KEY: VALUE
+    steps:
+    - step: STEP-NAME
+      STEP-OPTION: STEP-OPTION-VALUE
 ```
 
 #### Fields
@@ -463,6 +505,92 @@ services:
 * `propagate_uid_gid` (bool) requests that the Docker image be run with the user
   ID and group ID of the host user. It is equivalent to passing `--user $(id
   -u):$(id -g)` to `docker run`. The default is `false`.
+
+* `mzworkflows` (dict) specifies a named set of workflows. A workflow consists
+  of a series of steps that are executed in sequence and a set of environment
+  variables that are set during the execution of the workflow. The available
+  steps and their options are only documented by way of the developer docs.
+  See <https://dev.materialize.com/api/python/materialize/mzcompose.html>.
+
+  Also see the [chbench demo mzcompose](../../demo/chbench/mzcompose.yml) for
+  a detailed example.
+
+#### Bash-like Environment Substitution
+
+`mzcompose` performs "bash-like" variable substitution within workflows (for `services` the block,
+docker-compose is responsible for [variable
+substitution](https://docs.docker.com/compose/compose-file/compose-file-v3/#variable-substitution)).
+For example, you can define the following workflow, and it will pull `MZ_WORKERS` from your
+environment:
+
+```yaml
+mzworkflows:
+  example_workflow:
+    env:
+      # Use MZ_WORKERS from the environment. If not set, default to empty string
+      MZ_WORKERS: ${MZ_WORKERS}
+    steps:
+    - step: STEP-NAME
+      STEP-OPTION: STEP-OPTION-VALUE
+```
+
+The variable substitution can occur anywhere with the workflow specification:
+
+```yaml
+mzworkflows:
+  example_workflow:
+    env:
+      # Use MZ_WORKERS from the environment. If not set, default to empty string
+      MZ_WORKERS: ${MZ_WORKERS}
+    steps:
+    - step: STEP-NAME
+      STEP-OPTION: ${MZ_WORKERS}
+```
+
+Support for default values similarly as it does in bash, but the full syntax is not supported. At
+the moment, `mzcompose` only supports default replacement via the `:-` operator and only for
+variables using the `${VARIABLE}` syntax:
+
+```yaml
+mzworkflows:
+  example_workflow:
+    env:
+      # If MZ_WORKERS is set, use the value from the environment. Otherwise use 16
+      MZ_WORKERS: ${MZ_WORKERS:-16}
+    steps:
+    - step: STEP-NAME
+      STEP-OPTION: STEP-OPTION-VALUE
+```
+
+For workflows triggered by another workflow, variables substitution occurs at the time the
+workflow is triggered (as opposed to when the composition is loaded). This means that you can set
+an environment variable in one workflow and it will be picked up by the second workflow:
+
+```yaml
+mzworkflows:
+  workflow1:
+    env:
+      # Explicitly set the value to 16, ignoring the parent environment
+      MZ_WORKERS: 16
+    steps:
+    - step: workflow
+      workflow: workflow2
+  workflow2:
+    env:
+      # MZ_WORKERS will be 16 if called from workflow1
+      # If not called from workflow1, it pull the value from the environment or default
+      MZ_WORKERS: ${MZ_WORKERS:-32}
+    steps:
+    - step: STEP-NAME
+      STEP-OPTION: STEP-OPTION-VALUE
+```
+
+The preference order for variable subsitution is:
+
+1. The value specified by the mzworkflow.
+2. The value specified by the environment.
+3. The default value specified where the variable is being used.
+4. Empty string.
 
 ### mzbuild Dockerfile
 

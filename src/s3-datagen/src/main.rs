@@ -12,15 +12,17 @@ use std::iter;
 
 use aws_sdk_s3::error::{CreateBucketError, CreateBucketErrorKind};
 use aws_sdk_s3::model::{BucketLocationConstraint, CreateBucketConfiguration};
-use aws_sdk_s3::types::SdkError;
+use aws_sdk_s3::SdkError;
 use clap::Parser;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use tracing::event;
 use tracing::{error, info, Level};
 use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use mz_aws_util::config::AwsConfig;
-use mz_ore::cast::CastFrom;
+use ore::cast::CastFrom;
 
 /// Generate meaningless data in S3 to test download speeds
 #[derive(Parser)]
@@ -56,12 +58,6 @@ struct Args {
     /// Number of copy operations to run concurrently
     #[clap(long, default_value = "50")]
     concurrent_copies: usize,
-
-    /// Which log messages to emit.
-    ///
-    /// See materialized's `--log-filter` option for details.
-    #[clap(long, value_name = "FILTER", default_value = "off")]
-    log_filter: EnvFilter,
 }
 
 #[tokio::main]
@@ -73,11 +69,12 @@ async fn main() {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let args: Args = mz_ore::cli::parse_args();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(args.log_filter)
-        .with_writer(io::stderr)
+    let args: Args = ore::cli::parse_args();
+    let env_filter =
+        EnvFilter::try_from_env("MZ_LOG_FILTER").or_else(|_| EnvFilter::try_new("info"))?;
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt::layer().with_writer(io::stderr))
         .init();
 
     info!(
@@ -102,7 +99,7 @@ async fn run() -> anyhow::Result<()> {
         .collect::<String>();
 
     let config = AwsConfig::load_from_env().await;
-    let client = mz_aws_util::s3::client(&config);
+    let client = mz_aws_util::s3::client(&config)?;
 
     let first_object_key = format!("{}{:>05}", args.key_prefix, 0);
 
@@ -133,7 +130,7 @@ async fn run() -> anyhow::Result<()> {
                     },
                 ..
             } => {
-                event!(Level::INFO, bucket = %args.bucket, "reusing existing bucket");
+                tracing::event!(Level::INFO, bucket = %args.bucket, "reusing existing bucket");
                 Ok(())
             }
             _ => Err(e),

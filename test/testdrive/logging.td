@@ -10,8 +10,6 @@
 # This test only verifies that the log relations are published, not that they
 # have any specific output.
 
-$ set-regex match=s\d+ replacement=SID
-
 > CREATE MATERIALIZED VIEW count_operates AS SELECT count(*) FROM mz_dataflow_operators;
 > SELECT count(*) FROM count_operates;
 1
@@ -53,10 +51,10 @@ $ set-regex match=s\d+ replacement=SID
 1
 
 ! DROP SCHEMA mz_catalog
-contains:cannot drop schema mz_catalog because it is required by the database system
+cannot drop schema mz_catalog because it is required by the database system
 
 ! DROP VIEW mz_peek_durations
-contains:cannot drop item mz_catalog.mz_peek_durations because it is required by the database system
+cannot drop item mz_catalog.mz_peek_durations because it is required by the database system
 
 > SELECT mz_columns.id, mz_columns.name, position, type
   FROM mz_views JOIN mz_columns USING (id)
@@ -64,9 +62,9 @@ contains:cannot drop item mz_catalog.mz_peek_durations because it is required by
   ORDER BY position
 id      name        position    type
 --------------------------------------
-SID   id          1           bigint
-SID   worker      2           bigint
-SID   elapsed_ns  3           bigint
+s5027   id          1           bigint
+s5027   worker      2           bigint
+s5027   elapsed_ns  3           bigint
 
 > SELECT mz_columns.id, mz_columns.name, position, type
   FROM mz_views JOIN mz_columns USING (id)
@@ -74,10 +72,10 @@ SID   elapsed_ns  3           bigint
   ORDER BY position
 id      name        position    type
 --------------------------------------
-SID   id          1           bigint
-SID   worker      2           bigint
-SID   duration_ns 3           bigint
-SID   count       4           bigint
+s5028   id          1           bigint
+s5028   worker      2           bigint
+s5028   duration_ns 3           bigint
+s5028   count       4           bigint
 
 > SELECT mz_columns.id, mz_columns.name, position, type
   FROM mz_views JOIN mz_columns USING (id)
@@ -85,10 +83,10 @@ SID   count       4           bigint
   ORDER BY position
 id      name        position    type
 --------------------------------------
-SID   worker      1           bigint
-SID   slept_for   2           bigint
-SID   requested   3           bigint
-SID   count       4           bigint
+s5029   worker      1           bigint
+s5029   slept_for   2           bigint
+s5029   requested   3           bigint
+s5029   count       4           bigint
 
 > SELECT mz_columns.id, mz_columns.name, position, type
   FROM mz_views JOIN mz_columns USING (id)
@@ -96,11 +94,11 @@ SID   count       4           bigint
   ORDER BY position
 id      name            position    type
 ------------------------------------------
-SID   channel         1           bigint
-SID   source_worker   2           bigint
-SID   target_worker   3           bigint
-SID   sent            4           bigint
-SID   received        5           bigint
+s5030   channel         1           bigint
+s5030   source_worker   2           bigint
+s5030   target_worker   3           bigint
+s5030   sent            4           bigint
+s5030   received        5           bigint
 
 > SELECT mz_columns.id, mz_columns.name, position, type
   FROM mz_views JOIN mz_columns USING (id)
@@ -108,12 +106,12 @@ SID   received        5           bigint
   ORDER BY position
 id      name        position    type
 --------------------------------------
-SID   address     1           list
-SID   port        2           bigint
-SID   worker      3           bigint
-SID   update_type 4           text
-SID   timestamp   5           bigint
-SID   count       6           bigint
+s5031   address     1           list
+s5031   port        2           bigint
+s5031   worker      3           bigint
+s5031   update_type 4           text
+s5031   timestamp   5           bigint
+s5031   count       6           bigint
 
 > SELECT mz_columns.id, mz_columns.name, position, type
   FROM mz_views JOIN mz_columns USING (id)
@@ -121,10 +119,10 @@ SID   count       6           bigint
   ORDER BY position
 id      name        position    type
 --------------------------------------
-SID   operator    1           bigint
-SID   worker      2           bigint
-SID   records     3           bigint
-SID   batches     4           bigint
+s5032   operator    1           bigint
+s5032   worker      2           bigint
+s5032   records     3           bigint
+s5032   batches     4           bigint
 
 > SELECT mz_columns.id, mz_columns.name, position, type
   FROM mz_views JOIN mz_columns USING (id)
@@ -132,6 +130,6 @@ SID   batches     4           bigint
   ORDER BY position
 id      name        position    type
 --------------------------------------
-SID   operator    1           bigint
-SID   worker      2           bigint
-SID   count       3           bigint
+s5033   operator    1           bigint
+s5033   worker      2           bigint
+s5033   count       3           bigint

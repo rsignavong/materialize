@@ -41,7 +41,7 @@ $ set schema={
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-blah-${testdrive.seed}'
   FORMAT AVRO USING SCHEMA '${schema}'
   ENVELOPE DEBEZIUM
-contains:catalog item 's' already exists
+catalog item 's' already exists
 
 > CREATE SOURCE IF NOT EXISTS s
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-blah-${testdrive.seed}'
@@ -57,23 +57,23 @@ contains:catalog item 's' already exists
 > CREATE MATERIALIZED VIEW test3b AS SELECT * FROM test2;
 
 ! DROP VIEW test1;
-contains:cannot drop materialize.public.test1: still depended upon by catalog item 'materialize.public.test2'
+cannot drop materialize.public.test1: still depended upon by catalog item 'materialize.public.test2'
 
 ! DROP VIEW test2;
-contains:cannot drop materialize.public.test2: still depended upon by catalog item 'materialize.public.test3a'
+cannot drop materialize.public.test2: still depended upon by catalog item 'materialize.public.test3a'
 
 > DROP VIEW test3a;
 
 ! DROP VIEW test1;
-contains:cannot drop materialize.public.test1: still depended upon by catalog item 'materialize.public.test2'
+cannot drop materialize.public.test1: still depended upon by catalog item 'materialize.public.test2'
 
 ! DROP VIEW test2;
-contains:cannot drop materialize.public.test2: still depended upon by catalog item 'materialize.public.test3b'
+cannot drop materialize.public.test2: still depended upon by catalog item 'materialize.public.test3b'
 
 > DROP VIEW test3b;
 
 ! DROP VIEW test1;
-contains:cannot drop materialize.public.test1: still depended upon by catalog item 'materialize.public.test2'
+cannot drop materialize.public.test1: still depended upon by catalog item 'materialize.public.test2'
 
 > DROP VIEW test2;
 
@@ -93,10 +93,10 @@ contains:cannot drop materialize.public.test1: still depended upon by catalog it
 # rather than verifying the drop by checking whether DROP VIEW fails.
 
 ! DROP VIEW test1;
-contains:unknown catalog item 'test1'
+unknown catalog item 'test1'
 
 ! DROP VIEW test2;
-contains:unknown catalog item 'test2'
+unknown catalog item 'test2'
 
 # Test that DROP VIEW IF EXISTS succeeds even if the view does not exist.
 
@@ -110,7 +110,7 @@ contains:unknown catalog item 'test2'
 > DROP SOURCE s CASCADE;
 
 ! DROP VIEW test4;
-contains:unknown catalog item 'test4'
+unknown catalog item 'test4'
 
 > CREATE SOURCE s
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
@@ -124,7 +124,7 @@ contains:unknown catalog item 'test4'
 ! CREATE SINK s1 FROM s
   INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'v'
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-contains:catalog item 's1' already exists
+catalog item 's1' already exists
 
 > CREATE SINK IF NOT EXISTS s1 FROM s
   INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'v2'
@@ -136,7 +136,7 @@ contains:catalog item 's1' already exists
 
 # Test that sinks cannot be depended upon.
 ! CREATE MATERIALIZED VIEW v2 AS SELECT * FROM s1;
-contains:catalog item 'materialize.public.s1' is a sink and so cannot be depended upon
+catalog item 'materialize.public.s1' is a sink and so cannot be depended upon
 
 > CREATE MATERIALIZED VIEW v2 AS SELECT X from s;
 
@@ -147,37 +147,37 @@ contains:catalog item 'materialize.public.s1' is a sink and so cannot be depende
 # Test that indexes cannot be depended upon
 
 ! CREATE MATERIALIZED VIEW v3 as SELECT * FROM i1;
-contains:catalog item 'materialize.public.i1' is an index and so cannot be depended upon
+catalog item 'materialize.public.i1' is an index and so cannot be depended upon
 
 > CREATE INDEX i2 ON v2a(x*2);
 
-> SHOW INDEXES FROM v2a;
-cluster on_name   key_name         seq_in_index column_name expression  nullable  enabled
------------------------------------------------------------------------------------------
-default v2a       i2               1            <null>      "x * 2"     false     true
-default v2a       v2a_primary_idx  1            x           <null>      false     true
+> SHOW INDEX in v2a;
+on_name   key_name         seq_in_index column_name expression  nullable  enabled
+---------------------------------------------------------------------------------
+v2a       i2               1            <null>      "x * 2"     false     true
+v2a       v2a_primary_idx  1            x           <null>      false     true
 
-> SHOW INDEXES FROM v2;
-cluster on_name  key_name        seq_in_index column_name expression nullable enabled
--------------------------------------------------------------------------------------
-default v2       i1              1            x           <null>     false    true
-default v2       v2_primary_idx  1            x           <null>     false    true
+> SHOW INDEX in v2;
+on_name  key_name        seq_in_index column_name expression nullable enabled
+-----------------------------------------------------------------------------
+v2       i1              1            x           <null>     false    true
+v2       v2_primary_idx  1            x           <null>     false    true
 
 # Test that dependent indexes do not prevent view deletion when restrict is specified
 # but do not cause deletion of dependent views
 > DROP VIEW v2a;
 
 ! DROP VIEW v2a;
-contains:unknown catalog item 'v2a'
+unknown catalog item 'v2a'
 
-> SHOW INDEXES FROM v2;
-cluster on_name  key_name        seq_in_index   column_name expression nullable enabled
----------------------------------------------------------------------------------------
-default v2       i1              1              x           <null>     false    true
-default v2       v2_primary_idx  1              x           <null>     false    true
+> SHOW INDEX in v2;
+on_name  key_name        seq_in_index   column_name expression nullable enabled
+-------------------------------------------------------------------------------
+v2       i1              1              x           <null>     false    true
+v2       v2_primary_idx  1              x           <null>     false    true
 
 ! DROP INDEX i2;
-contains:unknown catalog item 'i2'
+unknown catalog item 'i2'
 
 > CREATE MATERIALIZED VIEW v4 AS SELECT x, y from s;
 
@@ -185,75 +185,75 @@ contains:unknown catalog item 'i2'
 
 > CREATE INDEX i3 ON v4a(y);
 
-> SHOW INDEXES FROM v4a;
-cluster on_name  key_name         seq_in_index   column_name expression nullable  enabled
------------------------------------------------------------------------------------------
-default v4a      i3               1              y           <null>     false     true
-default v4a      v4a_primary_idx  1              y           <null>     false     true
+> SHOW INDEX in v4a;
+on_name  key_name         seq_in_index   column_name expression nullable  enabled
+---------------------------------------------------------------------------------
+v4a      i3               1              y           <null>     false     true
+v4a      v4a_primary_idx  1              y           <null>     false     true
 
 > CREATE INDEX i4 ON v4(x);
 
-> SHOW INDEXES FROM v4;
-cluster on_name  key_name        seq_in_index  column_name expression nullable  enabled
----------------------------------------------------------------------------------------
-default v4       i4              1             x           <null>     false     true
-default v4       v4_primary_idx  1             x           <null>     false     true
-default v4       v4_primary_idx  2             y           <null>     false     true
+> SHOW INDEX in v4;
+on_name  key_name        seq_in_index  column_name expression nullable  enabled
+-------------------------------------------------------------------------------
+v4       i4              1             x           <null>     false     true
+v4       v4_primary_idx  1             x           <null>     false     true
+v4       v4_primary_idx  2             y           <null>     false     true
 
 # Test cascade deletes associated indexes as well
 > DROP VIEW v4a CASCADE;
 
 ! DROP VIEW v4a;
-contains:unknown catalog item 'v4a'
+unknown catalog item 'v4a'
 
 ! DROP INDEX i3;
-contains:unknown catalog item 'i3'
+unknown catalog item 'i3'
 
-> SHOW INDEXES FROM v4;
-cluster on_name  key_name        seq_in_index  column_name expression nullable  enabled
----------------------------------------------------------------------------------------
-default v4       i4              1             x           <null>     false     true
-default v4       v4_primary_idx  1             x           <null>     false     true
-default v4       v4_primary_idx  2             y           <null>     false     true
+> SHOW INDEX in v4;
+on_name  key_name        seq_in_index  column_name expression nullable  enabled
+-------------------------------------------------------------------------------
+v4       i4              1             x           <null>     false     true
+v4       v4_primary_idx  1             x           <null>     false     true
+v4       v4_primary_idx  2             y           <null>     false     true
 
 > CREATE MATERIALIZED VIEW v5 AS SELECT substr(y, 3, 2) as substr from v4;
 
 > CREATE INDEX i5 ON v5(substr);
 
-> SHOW INDEXES FROM v5;
-cluster on_name   key_name        seq_in_index  column_name expression nullable enabled
----------------------------------------------------------------------------------------
-default v5        i5              1             substr      <null>     true     true
-default v5        v5_primary_idx  1             substr      <null>     true     true
+> SHOW INDEX in v5;
+on_name   key_name        seq_in_index  column_name expression nullable enabled
+-------------------------------------------------------------------------------
+v5        i5              1             substr      <null>     true     true
+v5        v5_primary_idx  1             substr      <null>     true     true
 
 > CREATE VIEW multicol AS SELECT 'a' AS a, 'b' AS b, 'c' AS c, 'd' AS d
 > CREATE INDEX i6 ON multicol (2, a, 4)
-> SHOW INDEXES FROM multicol
-cluster on_name   key_name  seq_in_index column_name  expression   nullable enabled
------------------------------------------------------------------------------------
-default multicol  i6        1            b            <null>       false     true
-default multicol  i6        2            a            <null>       false     true
-default multicol  i6        3            d            <null>       false     true
+> SHOW INDEX IN multicol
+on_name   key_name  seq_in_index column_name  expression   nullable enabled
+---------------------------------------------------------------------------
+multicol  i6        1            b            <null>       false     true
+multicol  i6        2            a            <null>       false     true
+multicol  i6        3            d            <null>       false     true
 
-> SHOW INDEXES FROM multicol WHERE column_name = 'a'
-cluster on_name   key_name  seq_in_index column_name  expression   nullable enabled
------------------------------------------------------------------------------------
-default multicol  i6        2            a            <null>       false    true
+> SHOW INDEX IN multicol WHERE column_name = 'a'
+on_name   key_name  seq_in_index column_name  expression   nullable enabled
+---------------------------------------------------------------------------
+multicol  i6        2            a            <null>       false    true
 
 # Test cascade deletes all indexes associated with cascaded views
 > DROP VIEW v4 CASCADE;
 
 ! DROP VIEW v4;
-contains:unknown catalog item 'v4'
+unknown catalog item 'v4'
 
 ! DROP INDEX i5;
-contains:unknown catalog item 'i5'
+unknown catalog item 'i5'
 
 ! DROP VIEW v5;
-contains:unknown catalog item 'v5'
+unknown catalog item 'v5'
 
 ! DROP INDEX i4;
-contains:unknown catalog item 'i4'
+unknown catalog item 'i4'
 
 # Test that dropping indexes even with cascade does not cause the underlying view to be dropped
 
@@ -271,20 +271,20 @@ contains:unknown catalog item 'i4'
 # Test that dependent indexes do not prevent source deletion when restrict is specified
 > CREATE INDEX j1 on s3(ascii(y))
 
-> SHOW INDEXES FROM s3;
-cluster on_name  key_name        seq_in_index  column_name expression             nullable  enabled
----------------------------------------------------------------------------------------------------
-default s3       j1              1             <null>      "pg_catalog.ascii(y)"  false     true
-default s3       s3_primary_idx  1             x           <null>                 false     true
-default s3       s3_primary_idx  2             y           <null>                 false     true
+> SHOW INDEX in s3;
+on_name  key_name        seq_in_index  column_name expression             nullable  enabled
+-------------------------------------------------------------------------------------------
+s3       j1              1             <null>      "pg_catalog.ascii(y)"  false     true
+s3       s3_primary_idx  1             x           <null>                 false     true
+s3       s3_primary_idx  2             y           <null>                 false     true
 
 > DROP SOURCE s3;
 
 ! DROP SOURCE s3;
-contains:unknown catalog item 's3'
+unknown catalog item 's3'
 
 ! DROP INDEX j1;
-contains:unknown catalog item 'j1'
+unknown catalog item 'j1'
 
 # Test cascade deletes all indexes associated with cascaded sources and views
 
@@ -299,31 +299,31 @@ contains:unknown catalog item 'j1'
 
 > CREATE INDEX j3 on w(z);
 
-> SHOW INDEXES FROM s4;
-cluster on_name  key_name        seq_in_index   column_name expression  nullable  enabled
------------------------------------------------------------------------------------------
-default s4       j2              1               <null>      "x + 2"    false     true
-default s4       s4_primary_idx  1               x           <null>     false     true
-default s4       s4_primary_idx  2               y           <null>     false     true
-
-> SHOW INDEXES FROM w;
-cluster on_name  key_name   seq_in_index  column_name expression nullable enabled
+> SHOW INDEX in s4;
+on_name  key_name        seq_in_index   column_name expression  nullable  enabled
 ---------------------------------------------------------------------------------
-default w        j3         1             z           <null>     false    true
+s4       j2              1               <null>      "x + 2"    false     true
+s4       s4_primary_idx  1               x           <null>     false     true
+s4       s4_primary_idx  2               y           <null>     false     true
+
+> SHOW INDEX in w;
+on_name  key_name   seq_in_index  column_name expression nullable enabled
+-------------------------------------------------------------------------
+w        j3         1             z           <null>     false    true
 
 > DROP SOURCE s4 CASCADE;
 
 ! DROP VIEW w;
-contains:unknown catalog item 'w'
+unknown catalog item 'w'
 
 ! DROP INDEX j3;
-contains:unknown catalog item 'j3'
+unknown catalog item 'j3'
 
 ! DROP SOURCE s4;
-contains:unknown catalog item 's4'
+unknown catalog item 's4'
 
 ! DROP INDEX j2;
-contains:unknown catalog item 'j2'
+unknown catalog item 'j2'
 
 # Test that dropping indexes even with cascade does not cause the underlying source to be dropped
 
@@ -342,14 +342,14 @@ contains:unknown catalog item 'j2'
 > CREATE VIEW v1 AS SELECT CAST('{2}' AS int4_list)
 
 ! DROP TYPE int4_list
-contains:cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.v1'
+cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.v1'
 
 > DROP VIEW v1
 
 > CREATE TABLE t1 (custom int4_list)
 
 ! DROP TYPE int4_list
-contains:cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.t1'
+cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.t1'
 
 > DROP TABLE t1
 
@@ -358,28 +358,28 @@ contains:cannot drop materialize.public.int4_list: still depended upon by catalo
 > CREATE MATERIALIZED VIEW v1 AS SELECT * FROM ( SELECT CAST('{2}' AS int4_list) )
 
 ! DROP TYPE int4_list
-contains:cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.v1'
+cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.v1'
 
 > DROP VIEW v1
 
 > CREATE VIEW v1 AS SELECT CAST(CAST('{2}' AS int4_list) AS text)
 
 ! DROP TYPE int4_list
-contains:cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.v1'
+cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.v1'
 
 > DROP VIEW v1
 
 > CREATE VIEW v1 AS VALUES (CAST('{2}' AS int4_list))
 
 ! DROP TYPE int4_list
-contains:cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.v1'
+cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.v1'
 
 > DROP VIEW v1
 
 > CREATE VIEW v1 AS SELECT MIN(CAST(CAST('{1}' AS int4_list) AS string))
 
 ! DROP TYPE int4_list
-contains:cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.v1'
+cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.v1'
 
 > DROP VIEW v1
 
@@ -390,7 +390,7 @@ contains:cannot drop materialize.public.int4_list: still depended upon by catalo
 > CREATE TEMPORARY TABLE t1 (f1 int4_list)
 
 ! DROP TYPE int4_list
-contains:cannot drop materialize.public.int4_list: still depended upon by catalog item 'mz_temp.t1'
+cannot drop materialize.public.int4_list: still depended upon by catalog item 'mz_temp.t1'
 
 > DROP TABLE t1
 
@@ -399,14 +399,14 @@ contains:cannot drop materialize.public.int4_list: still depended upon by catalo
 > CREATE INDEX i1 ON t1 (CAST(f1 AS int4_list))
 
 ! DROP TYPE int4_list
-contains:cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.i1'
+cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.i1'
 
 > DROP TABLE t1
 
 > CREATE TYPE int4_list_list AS LIST (element_type=int4_list)
 
 ! DROP TYPE int4_list
-contains:cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.int4_list_list'
+cannot drop materialize.public.int4_list: still depended upon by catalog item 'materialize.public.int4_list_list'
 
 > DROP TYPE int4_list_list
 
@@ -432,7 +432,7 @@ contains:cannot drop materialize.public.int4_list: still depended upon by catalo
 2
 
 ! CREATE OR REPLACE MATERIALIZED VIEW v3 AS SELECT 3
-contains:cannot drop materialize.public.v3: still depended upon by catalog item 'materialize.public.v4'
+cannot drop materialize.public.v3: still depended upon by catalog item 'materialize.public.v4'
 
 > CREATE OR REPLACE MATERIALIZED VIEW v4 AS SELECT 3
 > SELECT * FROM v4
@@ -452,7 +452,7 @@ contains:cannot drop materialize.public.v3: still depended upon by catalog item 
 > CREATE MATERIALIZED VIEW test2 AS SELECT * FROM test1;
 
 ! DROP VIEW test1;
-contains:cannot drop materialize.public.test1: still depended upon by catalog item 'materialize.public.test2'
+cannot drop materialize.public.test1: still depended upon by catalog item 'materialize.public.test2'
 
 # Succeeds even though it's dependent on.
 > CREATE MATERIALIZED VIEW IF NOT EXISTS test1 AS SELECT 2 as b;

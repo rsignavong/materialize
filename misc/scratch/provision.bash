@@ -28,7 +28,7 @@ touch /opt/provision/docker-installed
 
 # Step 3. Install Materialize build prerequisites. These are just a convenience
 # for manual debugging/development.
-apt-get install -y cmake g++
+apt-get install -y cmake
 sudo -u ubuntu sh -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -q -y"
 touch /opt/provision/materialize-build-deps-installed
 
@@ -40,9 +40,5 @@ unzip awscliv2.zip
 aws/install
 rm -r aws awscliv2.zip
 touch /opt/provision/awscli-installed
-
-# Step 5. Install the psql CLI
-apt-get install -y postgresql-client
-touch /opt/provision/psql-installed
 
 touch /opt/provision/done

@@ -7,13 +7,13 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use anyhow::{bail, Context};
 use async_trait::async_trait;
+
 use tokio::process::Command;
 
-use mz_ore::option::OptionExt;
+use ore::option::OptionExt;
 
-use crate::action::{Action, ControlFlow, State};
+use crate::action::{Action, State};
 use crate::parser::BuiltinCommand;
 use crate::util::text;
 
@@ -22,7 +22,7 @@ pub struct ExecuteAction {
     expected_output: String,
 }
 
-pub fn build_execute(mut cmd: BuiltinCommand) -> Result<ExecuteAction, anyhow::Error> {
+pub fn build_execute(mut cmd: BuiltinCommand) -> Result<ExecuteAction, String> {
     let command = cmd.args.string("command")?;
     Ok(ExecuteAction {
         command,
@@ -32,11 +32,11 @@ pub fn build_execute(mut cmd: BuiltinCommand) -> Result<ExecuteAction, anyhow::E
 
 #[async_trait]
 impl Action for ExecuteAction {
-    async fn undo(&self, _: &mut State) -> Result<(), anyhow::Error> {
+    async fn undo(&self, _: &mut State) -> Result<(), String> {
         Ok(())
     }
 
-    async fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+    async fn redo(&self, state: &mut State) -> Result<(), String> {
         let output = Command::new("psql")
             .args(&[
                 "--pset",
@@ -50,19 +50,19 @@ impl Action for ExecuteAction {
             ])
             .output()
             .await
-            .context("execution of `psql` failed")?;
+            .map_err(|e| format!("execution of `psql` failed: {}", e))?;
         if !output.status.success() {
-            bail!(
+            return Err(format!(
                 "psql reported failure with exit code {}: {}",
                 output.status.code().display_or("unknown"),
                 String::from_utf8_lossy(&output.stderr),
-            );
+            ));
         }
         let stdout = text::trim_trailing_space(&String::from_utf8_lossy(&output.stdout));
         if self.expected_output != stdout {
             text::print_diff(&self.expected_output, &*stdout);
-            bail!("psql returned unexpected output (diff above)");
+            return Err("psql returned unexpected output (diff above)".into());
         }
-        Ok(ControlFlow::Continue)
+        Ok(())
     }
 }

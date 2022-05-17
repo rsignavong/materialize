@@ -8,7 +8,6 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use anyhow::{bail, Context};
 use regex::Regex;
 
 pub fn validate_sink<I>(
@@ -17,7 +16,7 @@ pub fn validate_sink<I>(
     actual: &[(Option<serde_json::Value>, Option<serde_json::Value>)],
     regex: &Option<Regex>,
     regex_replacement: &String,
-) -> Result<(), anyhow::Error>
+) -> Result<(), String>
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
@@ -29,18 +28,18 @@ where
             let key = if has_key {
                 match deserializer.next() {
                     None => None,
-                    Some(r) => r.context("parsing json")?,
+                    Some(r) => r.map_err(|e| format!("parsing JSON: {}", e))?,
                 }
             } else {
                 None
             };
             let value = match deserializer.next() {
                 None => None,
-                Some(r) => r.context("parsing json")?,
+                Some(r) => r.map_err(|e| format!("parsing JSON: {}", e))?,
             };
             Ok((key, value))
         })
-        .collect::<Result<Vec<_>, anyhow::Error>>()?;
+        .collect::<Result<Vec<_>, String>>()?;
     let mut expected = expected.iter();
     let mut actual = actual.iter();
     let mut index = 0..;
@@ -57,26 +56,24 @@ where
                 };
 
                 if e_str != a_str {
-                    bail!(
+                    return Err(format!(
                         "record {} did not match\nexpected:\n{}\n\nactual:\n{}",
-                        i,
-                        e_str,
-                        a_str
-                    );
+                        i, e_str, a_str
+                    ));
                 }
             }
-            (Some(e), None) => bail!("missing record {}: {:#?}", i, e),
-            (None, Some(a)) => bail!("extra record {}: {:#?}", i, a),
+            (Some(e), None) => return Err(format!("missing record {}: {:#?}", i, e)),
+            (None, Some(a)) => return Err(format!("extra record {}: {:#?}", i, a)),
             (None, None) => break,
         }
     }
     let expected: Vec<_> = expected.map(|e| format!("{:#?}", e)).collect();
     let actual: Vec<_> = actual.map(|a| format!("{:#?}", a)).collect();
     if !expected.is_empty() {
-        bail!("missing records:\n{}", expected.join("\n"));
+        Err(format!("missing records:\n{}", expected.join("\n")))
+    } else if !actual.is_empty() {
+        Err(format!("extra records:\n{}", actual.join("\n")))
+    } else {
+        Ok(())
     }
-    if !actual.is_empty() {
-        bail!("extra records:\n{}", actual.join("\n"));
-    }
-    Ok(())
 }

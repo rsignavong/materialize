@@ -24,46 +24,34 @@ $ set schema={
     ]
   }
 
-$ kafka-create-topic topic=avro-data partitions=1
-$ kafka-ingest format=avro key-format=avro topic=avro-data key-schema=${conflictkeyschema} schema=${schema} timestamp=1 publish=true
+$ kafka-create-topic topic=avro-data
+$ kafka-ingest format=avro key-format=avro topic=avro-data key-schema=${conflictkeyschema} schema=${schema} timestamp=1
 {"id": 1} {"id": 2, "b": 3}
 
 ! CREATE SOURCE missing_key_format
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-data-${testdrive.seed}'
   FORMAT AVRO USING SCHEMA '${schema}'
   INCLUDE KEY
-contains:INCLUDE KEY requires specifying KEY FORMAT .. VALUE FORMAT, got bare FORMAT
+INCLUDE KEY requires specifying KEY FORMAT .. VALUE FORMAT, got bare FORMAT
 
 ! CREATE SOURCE missing_key_format
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-data-${testdrive.seed}'
   FORMAT AVRO USING SCHEMA '${schema}'
   INCLUDE KEY AS key_col
-contains:INCLUDE KEY requires specifying KEY FORMAT .. VALUE FORMAT, got bare FORMAT
+INCLUDE KEY requires specifying KEY FORMAT .. VALUE FORMAT, got bare FORMAT
 
-# "Bare" format works when the key format is in a registry
-> CREATE MATERIALIZED SOURCE bareformatconfluent
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC
-  'testdrive-avro-data-${testdrive.seed}'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-  INCLUDE KEY AS named
-  ENVELOPE UPSERT
-
-> SELECT * from bareformatconfluent
-named         id       b
-------------------------
-1             2        3
 
 ! CREATE SOURCE not_supported
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-data-${testdrive.seed}'
   FORMAT AVRO USING SCHEMA '${schema}'
   INCLUDE TOPIC
-contains:INCLUDE TOPIC not yet supported
+INCLUDE TOPIC not yet supported
 
 ! CREATE SOURCE not_supported
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-data-${testdrive.seed}'
   FORMAT AVRO USING SCHEMA '${schema}'
   INCLUDE TIMESTAMP as myts, TOPIC
-contains:INCLUDE TOPIC not yet supported
+INCLUDE TOPIC not yet supported
 
 > CREATE MATERIALIZED SOURCE avro_data_conflict
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avro-data-${testdrive.seed}'
@@ -72,7 +60,7 @@ contains:INCLUDE TOPIC not yet supported
   INCLUDE KEY
 
 ! SELECT id, b FROM avro_data_conflict
-contains:column reference "id" is ambiguous
+column reference "id" is ambiguous
 
 > SELECT * FROM avro_data_conflict
 id id b
@@ -182,10 +170,10 @@ named_id named_geo a
   VALUE FORMAT AVRO USING SCHEMA '${schema}'
   INCLUDE KEY AS named
   ENVELOPE debezium
-contains:Cannot use INCLUDE KEY with ENVELOPE DEBEZIUM: Debezium values include all keys.
+Cannot use INCLUDE KEY with ENVELOPE DEBEZIUM: Debezium values include all keys.
 
 # formats: TEXT and REGEX
-$ kafka-create-topic topic=textsrc partitions=1
+$ kafka-create-topic topic=textsrc
 
 $ kafka-ingest topic=textsrc format=bytes key-format=bytes key-terminator=:
 one,1:horse,apple
@@ -262,8 +250,8 @@ $ protobuf-compile-descriptors inputs=test.proto output=test.proto
 $ kafka-create-topic topic=proto partitions=1
 
 $ kafka-ingest topic=proto
-  key-format=protobuf key-descriptor-file=test.proto key-message=Key
-  format=protobuf descriptor-file=test.proto message=Value
+  key-format=protobuf key-descriptor-file=test.proto key-message=.Key
+  format=protobuf descriptor-file=test.proto message=.Value
 {"id": "a"} {"measurement": 10}
 
 > CREATE MATERIALIZED SOURCE input_proto
@@ -280,8 +268,8 @@ a   10           1
 $ kafka-create-topic topic=proto-structured partitions=1
 
 $ kafka-ingest topic=proto-structured
-  key-format=protobuf key-descriptor-file=test.proto key-message=KeyComplex
-  format=protobuf descriptor-file=test.proto message=Value
+  key-format=protobuf key-descriptor-file=test.proto key-message=.KeyComplex
+  format=protobuf descriptor-file=test.proto message=.Value
 {"id1": 1, "id2": 2} {"measurement": 10}
 
 > CREATE MATERIALIZED SOURCE input_proto_structured

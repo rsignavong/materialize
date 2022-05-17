@@ -62,13 +62,13 @@ You can now include the diagram on a page using:
 You can check links locally with [`htmltest`](https://github.com/wjdp/htmltest).
 
 Visit their website for installation instructions, or, if you have installed [Homebrew](https://brew.sh/)
-on a Mac or on Linux, run:
+on a Mac or on Linux, run
 
 `brew install htmltest`
 
-To check the links on your branch, run:
+To check the links:
 
-`./ci/test/lint-docs.sh`
+Run `./ci/www/lint.sh` on your branch.
 
 ## Function + operator docs
 

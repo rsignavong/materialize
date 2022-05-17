@@ -24,7 +24,7 @@
 //! SQL.
 //!
 //! ```
-//! use mz_sql_parser::parser;
+//! use sql_parser::parser;
 //!
 //! let sql = "SELECT a, b, 123, myfunc(b) \
 //!            FROM table_1 \

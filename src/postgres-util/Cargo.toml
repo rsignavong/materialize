@@ -1,16 +1,15 @@
 [package]
-name = "mz-postgres-util"
+name = "postgres-util"
 description = "Internal postgres utility library for Materialize."
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.59.0"
 publish = false
 
 [dependencies]
-anyhow = "1.0.56"
-
-mz-ore = { path = "../ore", features = ["task"] }
+anyhow = "1.0.52"
 openssl = { version = "0.10.38", features = ["vendored"] }
 postgres-openssl = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2" }
-tokio = { version = "1.17.0", features = ["fs"] }
+sql-parser = { path = "../sql-parser" }
+repr = { path = "../repr" }
+tokio = { version = "1.15.0", features = ["fs"] }
 tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2" }

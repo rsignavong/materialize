@@ -25,14 +25,12 @@ services:
       antithesis-net:
         ipv4_address: 10.0.0.12
     command:
-      --listen-addr 0.0.0.0:6875
       --data-directory=/share/mzdata
-      --workers 2
+      --workers 1
       --experimental
       --timestamp-frequency 100ms
       --disable-telemetry
       --retain-prometheus-metrics 1s
-      --no-sigbus-sigsegv-backtraces
     image: antithesis-materialized
     volumes:
       - mzdata:/share/mzdata:rw
@@ -43,7 +41,7 @@ services:
     fault_injector_block: false
     networks:
       antithesis-net:
-        ipv4_address: 10.0.0.129
+        ipv4_address: 10.0.0.80
     depends_on:
       cp-combined:
         condition: service_started
@@ -54,7 +52,10 @@ services:
       - -O
       - extglob
       - -c
-      # Start Mz and the required components and leave the container up forever
+      # Run testdrive an an endless loop, exiting with a non-zero exit code if
+      # testdrive fails and the loop has terminated.
+      #
+      # We set the timeout below to 120 seconds rather than the original 30 seconds.
       - >-
         wait-for-it --timeout=120 cp-combined:9092 &&
         wait-for-it --timeout=120 cp-combined:8081 &&
@@ -78,4 +79,8 @@ networks:
     driver: bridge
     ipam:
       config:
-      - subnet: 10.0.0.0/24
+      - subnet: 10.0.0.0/25
+
+fault_injector:
+  blocked: 10.0.0.0/26
+  unblocked: 10.0.0.65/26

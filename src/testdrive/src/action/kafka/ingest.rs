@@ -11,19 +11,22 @@ use std::cmp;
 use std::io::{BufRead, Read};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use byteorder::{NetworkEndian, WriteBytesExt};
 use futures::stream::{FuturesUnordered, StreamExt};
 use maplit::hashmap;
-use prost::Message;
-use prost_reflect::{DynamicMessage, FileDescriptor, MessageDescriptor};
-use rdkafka::message::{Header, OwnedHeaders};
+use protobuf::descriptor::FileDescriptorSet;
+use protobuf::reflect::FileDescriptor;
+use protobuf::reflect::MessageDescriptor;
+use protobuf::Message;
 use rdkafka::producer::FutureRecord;
 use serde::de::DeserializeOwned;
 use tokio::fs;
 
-use crate::action::{self, Action, ControlFlow, State};
+use ore::display::DisplayExt;
+use ore::result::ResultExt;
+
+use crate::action::{substitute_vars, Action, State};
 use crate::format::avro::{self, Schema};
 use crate::format::bytes;
 use crate::parser::BuiltinCommand;
@@ -40,7 +43,6 @@ pub struct IngestAction {
     rows: Vec<String>,
     start_iteration: isize,
     repeat: isize,
-    headers: Option<Vec<(String, Option<String>)>>,
 }
 
 #[derive(Clone)]
@@ -79,20 +81,19 @@ enum Transcoder {
 }
 
 impl Transcoder {
-    fn decode_json<R, T>(row: R) -> Result<Option<T>, anyhow::Error>
+    fn decode_json<R, T>(row: R) -> Result<Option<T>, String>
     where
         R: Read,
         T: DeserializeOwned,
     {
         let deserializer = serde_json::Deserializer::from_reader(row);
-        deserializer
-            .into_iter()
-            .next()
-            .transpose()
-            .context("parsing json")
+        match deserializer.into_iter().next() {
+            None => Ok(None),
+            Some(r) => r.map(Some).map_err(|e| format!("parsing json: {:#}", e)),
+        }
     }
 
-    fn transcode<R>(&self, mut row: R) -> Result<Option<Vec<u8>>, anyhow::Error>
+    fn transcode<R>(&self, mut row: R) -> Result<Option<Vec<u8>>, String>
     where
         R: BufRead,
     {
@@ -114,7 +115,7 @@ impl Transcoder {
                         out.write_u8(0).unwrap();
                         out.write_i32::<NetworkEndian>(*schema_id).unwrap();
                     }
-                    out.extend(avro::to_avro_datum(&schema, val)?);
+                    out.extend(avro::to_avro_datum(&schema, val).map_err_to_string()?);
                     Ok(Some(out))
                 } else {
                     Ok(None)
@@ -126,9 +127,9 @@ impl Transcoder {
                 schema_id,
                 schema_message_id,
             } => {
-                if let Some(val) = Self::decode_json::<_, serde_json::Value>(row)? {
-                    let message = DynamicMessage::deserialize(message.clone(), val)
-                        .context("parsing protobuf JSON")?;
+                if let Some(val) = Self::decode_json::<_, Box<serde_json::value::RawValue>>(row)? {
+                    let message = protobuf::json::parse_dynamic_from_str(message, val.get())
+                        .map_err(|e| format!("parsing protobuf JSON: {}", e))?;
                     let mut out = vec![];
                     if *confluent_wire_format {
                         // See: https://github.com/MaterializeInc/materialize/issues/9250
@@ -141,7 +142,9 @@ impl Transcoder {
                         out.write_i32::<NetworkEndian>(*schema_id).unwrap();
                         out.write_u8(*schema_message_id).unwrap();
                     }
-                    message.encode(&mut out)?;
+                    message
+                        .write_to_vec_dyn(&mut out)
+                        .map_err(|e| e.to_string())?;
                     Ok(Some(out))
                 } else {
                     Ok(None)
@@ -151,11 +154,11 @@ impl Transcoder {
                 let mut out = vec![];
                 match terminator {
                     Some(t) => {
-                        row.read_until(*t, &mut out)?;
+                        row.read_until(*t, &mut out).map_err_to_string()?;
                         out.pop();
                     }
                     None => {
-                        row.read_to_end(&mut out)?;
+                        row.read_to_end(&mut out).map_err_to_string()?;
                     }
                 }
                 if out.is_empty() {
@@ -168,7 +171,7 @@ impl Transcoder {
     }
 }
 
-pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, anyhow::Error> {
+pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, String> {
     let topic_prefix = format!("testdrive-{}", cmd.args.string("topic")?);
     let partition = cmd.args.opt_parse::<i32>("partition")?;
     let start_iteration = cmd.args.opt_parse::<isize>("start-iteration")?.unwrap_or(0);
@@ -181,19 +184,21 @@ pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, anyhow::Err
         },
         "protobuf" => {
             let descriptor_file = cmd.args.string("descriptor-file")?;
+            // This was introduced after the avro format's confluent-wire-format, so it defaults to
+            // false
             let message = cmd.args.string("message")?;
+            validate_protobuf_message_name(&message)?;
+
             Format::Protobuf {
                 descriptor_file,
                 message,
-                // This was introduced after the avro format's confluent-wire-format, so it defaults to
-                // false
                 confluent_wire_format: cmd.args.opt_bool("confluent-wire-format")?.unwrap_or(false),
                 schema_id_subject: cmd.args.opt_string("schema-id-subject"),
                 schema_message_id: cmd.args.opt_parse::<u8>("schema-message-id")?.unwrap_or(0),
             }
         }
         "bytes" => Format::Bytes { terminator: None },
-        f => bail!("unknown format: {}", f),
+        f => return Err(format!("unknown format: {}", f)),
     };
     let key_format = match cmd.args.opt_string("key-format").as_deref() {
         Some("avro") => Some(Format::Avro {
@@ -203,6 +208,7 @@ pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, anyhow::Err
         Some("protobuf") => {
             let descriptor_file = cmd.args.string("key-descriptor-file")?;
             let message = cmd.args.string("key-message")?;
+            validate_protobuf_message_name(&message)?;
             Some(Format::Protobuf {
                 descriptor_file,
                 message,
@@ -217,58 +223,21 @@ pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, anyhow::Err
         Some("bytes") => Some(Format::Bytes {
             terminator: match cmd.args.opt_parse::<char>("key-terminator")? {
                 Some(c) if c.is_ascii() => Some(c as u8),
-                Some(_) => bail!("key terminator must be single ASCII character"),
+                Some(_) => return Err("key terminator must be single ASCII character".into()),
                 None => Some(b':'),
             },
         }),
-        Some(f) => bail!("unknown key format: {}", f),
+        Some(f) => return Err(format!("unknown key format: {}", f)),
         None => None,
     };
-
     let timestamp = cmd.args.opt_parse("timestamp")?;
-
-    use serde_json::Value;
-    let headers = if let Some(headers_val) = cmd.args.opt_parse::<serde_json::Value>("headers")? {
-        let mut headers = Vec::new();
-        let headers_maps = match headers_val {
-            Value::Array(values) => {
-                let mut headers_map = Vec::new();
-                for value in values {
-                    if let Value::Object(m) = value {
-                        headers_map.push(m)
-                    } else {
-                        bail!("`headers` array values must be maps")
-                    }
-                }
-                headers_map
-            }
-            Value::Object(v) => vec![v],
-            _ => bail!("`headers` must be a map or an array"),
-        };
-
-        for headers_map in headers_maps {
-            for (k, v) in headers_map.iter() {
-                if let Value::String(val) = v {
-                    headers.push((k.clone(), Some(val.clone())));
-                } else if let Value::Null = v {
-                    headers.push((k.clone(), None));
-                } else {
-                    bail!("`headers` must have string or null values")
-                }
-            }
-        }
-        Some(headers)
-    } else {
-        None
-    };
-
     cmd.args.done()?;
 
     if publish
         && !matches!(format, Format::Avro { .. })
         && !matches!(key_format, Some(Format::Avro { .. }))
     {
-        bail!("publish=true is invalid unless format=avro or key-format=avro");
+        return Err("publish=true is invalid unless format=avro or key-format=avro".into());
     }
 
     Ok(IngestAction {
@@ -281,19 +250,28 @@ pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, anyhow::Err
         rows: cmd.input,
         start_iteration,
         repeat,
-        headers,
     })
+}
+
+fn validate_protobuf_message_name(message: &str) -> Result<(), String> {
+    if !message.starts_with('.') {
+        return Err(format!(
+            "protobuf message name must start with a dot: {}",
+            message
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
 impl Action for IngestAction {
-    async fn undo(&self, state: &mut State) -> Result<(), anyhow::Error> {
+    async fn undo(&self, state: &mut State) -> Result<(), String> {
         if self.publish {
             let subjects = state
                 .ccsr_client
                 .list_subjects()
                 .await
-                .context("listing schema registry subjects")?;
+                .map_err(|e| format!("unable to list subjects in schema registry: {}", e))?;
 
             let stale_subjects: Vec<_> = subjects
                 .iter()
@@ -303,8 +281,8 @@ impl Action for IngestAction {
             for subject in stale_subjects {
                 println!("Deleting stale schema registry subject {}", subject);
                 match state.ccsr_client.delete_subject(&subject).await {
-                    Ok(()) | Err(mz_ccsr::DeleteError::SubjectNotFound) => (),
-                    Err(e) => return Err(e.into()),
+                    Ok(()) | Err(ccsr::DeleteError::SubjectNotFound) => (),
+                    Err(e) => return Err(e.to_string()),
                 }
             }
         }
@@ -312,12 +290,9 @@ impl Action for IngestAction {
         Ok(())
     }
 
-    async fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+    async fn redo(&self, state: &mut State) -> Result<(), String> {
         let topic_name = &format!("{}-{}", self.topic_prefix, state.seed);
-        println!(
-            "Ingesting data into Kafka topic {} with repeat {}",
-            topic_name, self.repeat
-        );
+        println!("Ingesting data into Kafka topic {}", topic_name);
 
         let ccsr_client = &state.ccsr_client;
         let temp_path = &state.temp_path;
@@ -330,16 +305,16 @@ impl Action for IngestAction {
                 } => {
                     let schema_id = if self.publish {
                         let schema_id = ccsr_client
-                            .publish_schema(&ccsr_subject, &schema, mz_ccsr::SchemaType::Avro, &[])
+                            .publish_schema(&ccsr_subject, &schema, ccsr::SchemaType::Avro, &[])
                             .await
-                            .context("publishing to schema registry")?;
+                            .map_err(|e| format!("schema registry error: {}", e))?;
                         schema_id
                     } else {
                         1
                     };
                     let schema = avro::parse_schema(&schema)
-                        .with_context(|| format!("parsing avro schema: {}", schema))?;
-                    Ok::<_, anyhow::Error>(Transcoder::Avro {
+                        .map_err(|e| format!("parsing avro schema: {}\nschema={}", e, schema))?;
+                    Ok::<_, String>(Transcoder::Avro {
                         schema,
                         schema_id,
                         confluent_wire_format,
@@ -358,7 +333,7 @@ impl Action for IngestAction {
                                 schema_id_subject.as_deref().unwrap_or(&ccsr_subject),
                             )
                             .await
-                            .context("fetching schema from registry")?
+                            .map_err(|e| format!("schema registry error: {}", e))?
                             .id
                     } else {
                         0
@@ -366,12 +341,14 @@ impl Action for IngestAction {
 
                     let bytes = fs::read(temp_path.join(descriptor_file))
                         .await
-                        .context("reading protobuf descriptor file")?;
-                    let fd = FileDescriptor::decode(&*bytes)
-                        .context("parsing protobuf descriptor file")?;
-                    let message = fd
-                        .get_message_by_name(&message)
-                        .ok_or_else(|| anyhow!("unknown message name {}", message))?;
+                        .map_err(|e| format!("reading protobuf descriptor file: {}", e))?;
+                    let fds = FileDescriptorSet::parse_from_bytes(&bytes)
+                        .map_err(|e| format!("parsing protobuf descriptor file: {}", e))?;
+                    let fds = FileDescriptor::new_dynamic_fds(fds.file);
+                    let message = fds
+                        .iter()
+                        .find_map(|fd| fd.message_by_full_name(&message))
+                        .ok_or_else(|| format!("unknown message name {}", message))?;
                     Ok(Transcoder::Protobuf {
                         message,
                         confluent_wire_format,
@@ -392,14 +369,11 @@ impl Action for IngestAction {
         let mut futs = FuturesUnordered::new();
 
         for iteration in self.start_iteration..(self.start_iteration + self.repeat) {
-            let iter = &mut self.rows.iter().peekable();
-
-            for row in iter {
-                let row = action::substitute_vars(
+            for row in &self.rows {
+                let row = substitute_vars(
                     row,
                     &hashmap! { "kafka-ingest.iteration".into() => iteration.to_string() },
                     &None,
-                    false,
                 )?;
                 let mut row = row.as_bytes();
                 let key = match &key_transcoder {
@@ -408,10 +382,9 @@ impl Action for IngestAction {
                 };
                 let value = value_transcoder
                     .transcode(&mut row)
-                    .with_context(|| format!("parsing row: {}", String::from_utf8_lossy(row)))?;
+                    .map_err(|e| format!("parsing row: {} {}", String::from_utf8_lossy(row), e))?;
                 let producer = &state.kafka_producer;
                 let timeout = cmp::max(state.default_timeout, Duration::from_secs(1));
-                let headers = self.headers.clone();
                 futs.push(async move {
                     let mut record: FutureRecord<_, _> = FutureRecord::to(topic_name);
 
@@ -427,16 +400,6 @@ impl Action for IngestAction {
                     if let Some(timestamp) = self.timestamp {
                         record = record.timestamp(timestamp);
                     }
-                    if let Some(headers) = headers {
-                        let mut rd_meta = OwnedHeaders::new();
-                        for (k, v) in &headers {
-                            rd_meta = rd_meta.insert(Header {
-                                key: k,
-                                value: v.as_deref(),
-                            });
-                        }
-                        record = record.headers(rd_meta);
-                    }
                     producer.send(record, timeout).await
                 });
             }
@@ -446,10 +409,10 @@ impl Action for IngestAction {
                 || iteration == (self.start_iteration + self.repeat - 1)
             {
                 while let Some(res) = futs.next().await {
-                    res.map_err(|(e, _message)| e)?;
+                    res.map_err(|(e, _message)| e.to_string_alt())?;
                 }
             }
         }
-        Ok(ControlFlow::Continue)
+        Ok(())
     }
 }

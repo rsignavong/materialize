@@ -13,15 +13,8 @@
 
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
 
-use anyhow::{anyhow, Context};
-use itertools::Itertools;
-
-use mz_ore::display::DisplayExt;
-
-use self::action::ControlFlow;
-use self::error::{ErrorLocation, PosError};
+use self::error::InputError;
 use self::parser::LineReader;
 
 mod action;
@@ -31,15 +24,14 @@ mod parser;
 mod util;
 
 pub use self::action::Config;
-pub use self::error::Error;
+pub use self::error::{Error, ResultExt};
 
 /// Runs a testdrive script stored in a file.
-pub async fn run_file(config: &Config, filename: &Path) -> Result<(), Error> {
-    let mut file =
-        File::open(filename).with_context(|| format!("opening {}", filename.display()))?;
+pub async fn run_file(config: &Config, filename: &str) -> Result<(), Error> {
+    let mut file = File::open(&filename).err_ctx(format!("opening {}", filename))?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)
-        .with_context(|| format!("reading {}", filename.display()))?;
+        .err_ctx(format!("reading {}", filename))?;
     run_string(config, filename, &contents).await
 }
 
@@ -48,8 +40,8 @@ pub async fn run_stdin(config: &Config) -> Result<(), Error> {
     let mut contents = String::new();
     io::stdin()
         .read_to_string(&mut contents)
-        .context("reading <stdin>")?;
-    run_string(config, Path::new("<stdin>"), &contents).await
+        .err_ctx("reading <stdin>")?;
+    run_string(config, "<stdin>", &contents).await
 }
 
 /// Runs a testdrive script stored in a string.
@@ -57,76 +49,88 @@ pub async fn run_stdin(config: &Config) -> Result<(), Error> {
 /// The script in `contents` is used verbatim. The provided `filename` is used
 /// only as output in error messages and such. No attempt is made to read
 /// `filename`.
-pub async fn run_string(config: &Config, filename: &Path, contents: &str) -> Result<(), Error> {
-    println!("--- {}", filename.display());
+pub async fn run_string(config: &Config, filename: &str, contents: &str) -> Result<(), Error> {
+    if config.ci_output {
+        print!("--- ");
+    }
+    println!("==> {}", filename);
 
     let mut line_reader = LineReader::new(contents);
     run_line_reader(config, &mut line_reader)
         .await
-        .map_err(|e| {
-            let location = e.pos.map(|pos| {
-                let (line, col) = line_reader.line_col(pos);
-                ErrorLocation::new(filename, contents, line, col)
-            });
-            Error::new(e.source, location)
-        })
+        .map_err(|e| e.with_input_details(&filename, &contents, &line_reader))
 }
 
-async fn run_line_reader(
-    config: &Config,
-    line_reader: &mut LineReader<'_>,
-) -> Result<(), PosError> {
+async fn run_line_reader(config: &Config, line_reader: &mut LineReader<'_>) -> Result<(), Error> {
     // TODO(benesch): consider sharing state between files, to avoid
     // reconnections for every file. For now it's nice to not open any
     // connections until after parsing.
     let cmds = parser::parse(line_reader)?;
-    let (mut state, state_cleanup) = action::create_state(config).await?;
-    let actions = action::build(cmds, &state).await?;
-
-    if config.reset {
-        state.reset_materialized().await?;
-
-        for a in actions.iter().rev() {
-            let undo = a.action.undo(&mut state);
-            undo.await.map_err(|e| PosError::new(e, a.pos))?
+    let mut cmds_exec = cmds.clone();
+    // Extract number of executions
+    let mut execution_count = 1;
+    if let Some(command) = cmds_exec.iter_mut().find(|el| {
+        if let parser::Command::Builtin(c) = &el.command {
+            if c.name == "set-execution-count" {
+                return true;
+            }
         }
-    }
-
-    for a in &actions {
-        let redo = a.action.redo(&mut state);
-        match redo.await.map_err(|e| PosError::new(e, a.pos))? {
-            ControlFlow::Continue => (),
-            ControlFlow::Break => break,
+        false
+    }) {
+        if let parser::Command::Builtin(c) = &mut command.command {
+            let count = c.args.string("count").unwrap_or_default();
+            execution_count = count.parse::<u32>().unwrap_or(1);
         }
-    }
+    };
+    println!("Running test {} time(s) ... ", execution_count);
+    for _ in 1..execution_count + 1 {
+        println!("Run {} ...", execution_count);
+        cmds_exec = cmds.clone();
+        let (mut state, state_cleanup) = action::create_state(config).await?;
 
-    if config.reset {
-        let mut errors = Vec::new();
+        let actions = action::build(cmds_exec, &state).await?;
 
-        if let Err(e) = state.reset_s3().await {
-            errors.push(e);
-        }
+        if config.reset {
+            state.reset_materialized().await?;
 
-        if let Err(e) = state.reset_sqs().await {
-            errors.push(e);
-        }
-
-        if let Err(e) = state.reset_kinesis().await {
-            errors.push(e);
+            for a in actions.iter().rev() {
+                let undo = a.action.undo(&mut state);
+                undo.await.map_err(|e| InputError { msg: e, pos: a.pos })?;
+            }
         }
 
-        drop(state);
-        if let Err(e) = state_cleanup.await {
-            errors.push(e);
+        for a in &actions {
+            let redo = a.action.redo(&mut state);
+            redo.await.map_err(|e| InputError { msg: e, pos: a.pos })?;
         }
 
-        if !errors.is_empty() {
-            return Err(anyhow!(
-                "cleanup failed: {} errors: {}",
-                errors.len(),
-                errors.into_iter().map(|e| e.to_string_alt()).join("\n"),
-            )
-            .into());
+        if config.reset {
+            let mut errors = Vec::new();
+
+            if let Err(e) = state.reset_s3().await {
+                errors.push(e);
+            }
+
+            if let Err(e) = state.reset_sqs().await {
+                errors.push(e);
+            }
+
+            if let Err(e) = state.reset_kinesis().await {
+                errors.push(e);
+            }
+
+            drop(state);
+            if let Err(e) = state_cleanup.await {
+                errors.push(e);
+            }
+
+            if !errors.is_empty() {
+                return Err(Error::General {
+                    ctx: "Failed to clean up state at shut down".into(),
+                    causes: errors.into_iter().map(Into::into).collect(),
+                    hints: Vec::new(),
+                });
+            }
         }
     }
     Ok(())

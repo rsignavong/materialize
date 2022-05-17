@@ -8,31 +8,32 @@
 // by the Apache License, Version 2.0.
 
 //! A persistent, compacting data structure containing indexed `(Key, Value,
-//! Time, i64)` entries.
+//! Time, Diff)` entries.
 
-use std::mem;
+use std::collections::VecDeque;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::{fmt, mem};
 
+use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use uuid::Uuid;
 
 use crate::error::Error;
-use crate::gen::persist::ProtoBatchFormat;
-use crate::indexed::background::{
-    CompactTraceReq, CompactTraceRes, DrainUnsealedReq, DrainUnsealedRes,
-};
-use crate::indexed::cache::{BlobCache, CacheHint};
-use crate::indexed::columnar::ColumnarRecordsVec;
+use crate::indexed::background::{CompactTraceReq, Maintainer};
+use crate::indexed::cache::BlobCache;
+use crate::indexed::columnar::ColumnarRecords;
 use crate::indexed::encoding::{
-    ArrangementMeta, BlobTraceBatchPart, TraceBatchMeta, UnsealedBatchMeta, UnsealedSnapshotMeta,
+    ArrangementMeta, BlobTraceBatch, TraceBatchMeta, UnsealedBatchMeta,
 };
-use crate::indexed::snapshot::{ArrangementSnapshot, Snapshot, TraceSnapshot};
-use crate::indexed::{BlobUnsealedBatch, Id};
-use crate::location::{Blob, BlobRead, SeqNo};
+use crate::indexed::{BlobUnsealedBatch, Id, Snapshot};
+use crate::pfuture::PFuture;
+use crate::storage::{Blob, SeqNo};
 
 /// A persistent, compacting data structure containing indexed `(Key, Value,
-/// Time, i64)` entries.
+/// Time, Diff)` entries.
 ///
 ///
 /// The data is logically and physically separated into two "buckets":
@@ -61,7 +62,7 @@ use crate::location::{Blob, BlobRead, SeqNo};
 /// Unsealed exists to hold data that has been added to the persistent
 /// collection but not yet "seal"ed into a trace. We store incoming data as
 /// immutable batches of updates, corresponding to non-empty, sorted intervals
-/// of [crate::location::SeqNo]s.
+/// of [crate::storage::SeqNo]s.
 ///
 /// As times get sealed and the corresponding updates get moved into the trace,
 /// Unsealed can remove those updates, and eventually, entire batches. The
@@ -190,16 +191,14 @@ impl Arrangement {
 
     /// Returns a consistent read of all the updates contained in this
     /// arrangement.
-    pub fn snapshot<L: BlobRead>(
+    pub fn snapshot<L: Blob>(
         &self,
         seqno: SeqNo,
         blob: &BlobCache<L>,
     ) -> Result<ArrangementSnapshot, Error> {
         let seal_frontier = self.get_seal();
         let trace = self.trace_snapshot(blob);
-        let unsealed = self
-            .unsealed_snapshot(trace.ts_upper.clone(), Antichain::new())?
-            .fetch(blob);
+        let unsealed = self.unsealed_snapshot(trace.ts_upper.clone(), Antichain::new(), blob)?;
         Ok(ArrangementSnapshot(unsealed, trace, seqno, seal_frontier))
     }
 
@@ -248,11 +247,9 @@ impl Arrangement {
         };
 
         debug_assert!(ts_upper >= ts_lower);
-        let format = ProtoBatchFormat::ParquetKvtd;
-        let size_bytes = blob.set_unsealed_batch(key.clone(), batch, format)?;
+        let size_bytes = blob.set_unsealed_batch(key.clone(), batch)?;
         Ok(UnsealedBatchMeta {
             key,
-            format,
             desc,
             ts_upper,
             ts_lower,
@@ -315,11 +312,12 @@ impl Arrangement {
 
     /// Returns a consistent read of the updates contained in this unsealed
     /// matching the given filters (in practice, everything not in Trace).
-    pub fn unsealed_snapshot(
+    pub fn unsealed_snapshot<L: Blob>(
         &self,
         ts_lower: Antichain<u64>,
         ts_upper: Antichain<u64>,
-    ) -> Result<UnsealedSnapshotMeta, Error> {
+        blob: &BlobCache<L>,
+    ) -> Result<UnsealedSnapshot, Error> {
         if PartialOrder::less_than(&ts_upper, &ts_lower) {
             return Err(Error::from(format!(
                 "invalid snapshot request: ts_upper {:?} is less than ts_lower {:?}",
@@ -335,11 +333,11 @@ impl Arrangement {
             // - ts_lower <= hi
             // - ts_upper > lo
             if ts_lower.less_equal(&meta.ts_upper) && !ts_upper.less_equal(&meta.ts_lower) {
-                batches.push(meta.clone());
+                batches.push(blob.get_unsealed_batch_async(&meta.key));
             }
         }
 
-        Ok(UnsealedSnapshotMeta {
+        Ok(UnsealedSnapshot {
             ts_lower,
             ts_upper,
             batches,
@@ -350,23 +348,12 @@ impl Arrangement {
     /// seal frontier into the trace and does any necessary resulting eviction
     /// work to remove unnecessary batches.
     pub fn unsealed_drain<L: Blob>(&mut self, blob: &mut BlobCache<L>) -> Result<(), Error> {
-        let req = match self.unsealed_next_drain_req()? {
-            Some(req) => req,
-            None => return Ok(()),
-        };
-        let res = Self::drain_unsealed_blocking(blob, req)?;
-        self.unsealed_handle_drain_response(res);
-        Ok(())
-    }
-
-    /// Get the next available drain work from the unsealed, if some exists.
-    pub fn unsealed_next_drain_req(&self) -> Result<Option<DrainUnsealedReq>, Error> {
         // If the trace's physical frontier matches the arrangement's logical
         // seal frontier, then nothing to do.
         let seal = self.get_seal();
         let trace_upper = self.trace_ts_upper();
         if seal == trace_upper {
-            return Ok(None);
+            return Ok(());
         }
 
         let desc = Description::new(
@@ -380,18 +367,9 @@ impl Arrangement {
 
         // Move a batch of data from unsealed into trace by reading a
         // snapshot from unsealed...
-        let snap = self.unsealed_snapshot(desc.lower().clone(), desc.upper().clone())?;
-        Ok(Some(DrainUnsealedReq { desc, snap }))
-    }
-
-    /// Copies unsealed data matching the specified description into a new trace
-    /// batch.
-    pub fn drain_unsealed_blocking<B: Blob>(
-        blob: &BlobCache<B>,
-        req: DrainUnsealedReq,
-    ) -> Result<DrainUnsealedRes, Error> {
-        let snap = req.snap.clone().fetch(&blob);
-        let mut updates = Snapshot::<Vec<u8>, Vec<u8>>::into_iter(snap)
+        let snap = self.unsealed_snapshot(desc.lower().clone(), desc.upper().clone(), blob)?;
+        let mut updates = snap
+            .into_iter()
             .collect::<Result<Vec<_>, Error>>()
             .map_err(|err| format!("failed to fetch snapshot: {}", err))?;
 
@@ -400,63 +378,15 @@ impl Arrangement {
         // everything works perfectly well when the trace upper hasn't yet
         // caught up to sealed.
         if updates.is_empty() {
-            return Ok(DrainUnsealedRes { req, drained: None });
+            return Ok(());
         }
 
         // Trace batches are required to be sorted and consolidated by ((k, v), t)
         differential_dataflow::consolidation::consolidate_updates(&mut updates);
 
-        let updates = updates.iter().collect::<ColumnarRecordsVec>().into_inner();
-        let desc = req.desc.clone();
-        let format = ProtoBatchFormat::ParquetKvtd;
-
-        let (keys, size_bytes) = if !updates.is_empty() {
-            let batch = BlobTraceBatchPart {
-                desc: desc.clone(),
-                index: 0,
-                updates,
-            };
-
-            let key = Self::new_blob_key();
-            let size_bytes = blob.set_trace_batch(key.clone(), batch, format)?;
-            (vec![key], size_bytes)
-        } else {
-            (vec![], 0)
-        };
-
-        // Batches are inserted into the trace with compaction level set to 0.
-        let drained = TraceBatchMeta {
-            keys,
-            format,
-            desc,
-            level: 0,
-            size_bytes,
-        };
-
-        Ok(DrainUnsealedRes {
-            req,
-            drained: Some(drained),
-        })
-    }
-
-    /// Handle an externally completed trace compaction request.
-    ///
-    /// TODO: Call unsealed_evict at the end of this and return a list of
-    /// unsealed batches that can now be physically deleted after the drain step
-    /// is committed to durable storage. This could save us a META write.
-    pub fn unsealed_handle_drain_response(&mut self, res: DrainUnsealedRes) {
-        let batch = match res.drained {
-            Some(batch) => batch,
-            None => return,
-        };
-
-        if &self.trace_ts_upper() != batch.desc.lower() {
-            // This trace batch doesn't line up with the ones we have. Nothing
-            // to do here.
-            return;
-        }
-
-        self.trace_batches.push(batch);
+        // ...and atomically swapping that snapshot's data into trace.
+        let batch = BlobTraceBatch { desc, updates };
+        self.trace_append(batch, blob)
     }
 
     /// Remove all batches containing only data strictly before the trace's
@@ -490,19 +420,18 @@ impl Arrangement {
     ) -> Result<UnsealedBatchMeta, Error> {
         // Sanity check that batch cannot be evicted
         debug_assert!(self.trace_ts_upper().less_equal(&batch.ts_upper));
-        let updates = ColumnarRecordsVec::from_iter(
-            blob.get_unsealed_batch_async(&batch.key, CacheHint::NeverAdd)
+        let updates = ColumnarRecords::from_iter(
+            blob.get_unsealed_batch_async(&batch.key)
                 .recv()?
                 .updates
                 .iter()
                 .flat_map(|u| u.iter())
                 .filter(|(_, ts, _)| self.trace_ts_upper().less_equal(ts)),
-        )
-        .into_inner();
+        );
         debug_assert!(updates.len() != 0);
         let new_batch = BlobUnsealedBatch {
             desc: batch.desc,
-            updates,
+            updates: vec![updates],
         };
 
         self.unsealed_write_batch(new_batch, blob)
@@ -588,6 +517,13 @@ impl Arrangement {
     /// Checks whether the given since would be valid to pass to
     /// [Self::allow_compaction].
     pub fn validate_allow_compaction(&self, since: &Antichain<u64>) -> Result<(), String> {
+        if PartialOrder::less_equal(&self.seal, since) {
+            return Err(format!(
+                "invalid compaction at or in advance of trace seal {:?}: {:?}",
+                self.seal, since,
+            ));
+        }
+
         if PartialOrder::less_than(since, &self.since) {
             return Err(format!(
                 "invalid compaction less than trace since {:?}: {:?}",
@@ -607,30 +543,41 @@ impl Arrangement {
         self.since = since;
     }
 
+    /// Writes the given batch to [Blob] storage and logically adds the contained
+    /// updates to this trace.
+    pub fn trace_append<B: Blob>(
+        &mut self,
+        batch: BlobTraceBatch,
+        blob: &mut BlobCache<B>,
+    ) -> Result<(), Error> {
+        if &self.trace_ts_upper() != batch.desc.lower() {
+            return Err(Error::from(format!(
+                "batch lower doesn't match trace upper {:?}: {:?}",
+                self.trace_ts_upper(),
+                batch.desc
+            )));
+        }
+        let desc = batch.desc.clone();
+        let key = Self::new_blob_key();
+        let size_bytes = blob.set_trace_batch(key.clone(), batch)?;
+        // As mentioned above, batches are inserted into the trace with compaction
+        // level set to 0.
+        self.trace_batches.push(TraceBatchMeta {
+            key,
+            desc,
+            level: 0,
+            size_bytes,
+        });
+        Ok(())
+    }
+
     /// Returns a consistent read of all the updates contained in this trace.
-    pub fn trace_snapshot<B: BlobRead>(&self, blob: &BlobCache<B>) -> TraceSnapshot {
+    pub fn trace_snapshot<B: Blob>(&self, blob: &BlobCache<B>) -> TraceSnapshot {
         let ts_upper = self.trace_ts_upper();
         let since = self.since();
         let mut batches = Vec::with_capacity(self.trace_batches.len());
         for meta in self.trace_batches.iter() {
-            // We want to save these results to the cache (if possible) because
-            // currently the cache is purely in-memory and thus will be empty on
-            // restart. This policy is much more clearly worthwhile for unsealed
-            // batches, as every unsealed batch will eventually get moved into
-            // trace and therefore every unsealed batch we can populate in the
-            // saves us an external read later.
-            //
-            // The rationale for trace is more unclear. If the size of all data
-            // in trace ends up being smaller than the size of the cache then
-            // clearly populating the cache is better. Otherwise, we could get
-            // unlucky and fill the cache with one large trace batch that won't
-            // get compacted for a very long time. We chose to allow trace snapshots
-            // to populate the cache because the default cache size is small
-            // enough that in real workloads large batches won't pollute the
-            // cache.
-            for key in meta.keys.iter() {
-                batches.push(blob.get_trace_batch_async(key, CacheHint::MaybeAdd));
-            }
+            batches.push(blob.get_trace_batch_async(&meta.key));
         }
         TraceSnapshot {
             ts_upper,
@@ -639,8 +586,16 @@ impl Arrangement {
         }
     }
 
-    /// Get the next available compaction work from the trace, if some exists.
-    pub fn trace_next_compact_req(&self) -> Result<Option<CompactTraceReq>, Error> {
+    /// Take one step towards compacting the trace.
+    ///
+    /// Returns a list of trace batches that can now be physically deleted after
+    /// the compaction step is committed to durable storage.
+    pub fn trace_step<B: Blob>(
+        &mut self,
+        maintainer: &Maintainer<B>,
+    ) -> Result<(u64, Vec<TraceBatchMeta>), Error> {
+        let mut written_bytes = 0;
+        let mut deleted = vec![];
         // TODO: should we remember our position in this list?
         for i in 1..self.trace_batches.len() {
             if (self.trace_batches[i - 1].level == self.trace_batches[i].level)
@@ -654,80 +609,308 @@ impl Arrangement {
                     b1,
                     since: self.since.clone(),
                 };
-
-                return Ok(Some(req));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Handle an externally completed trace compaction request.
-    ///
-    /// Returns a list of trace batches that can now be physically deleted after
-    /// the compaction step is committed to durable storage.
-    pub fn trace_handle_compact_response(&mut self, res: CompactTraceRes) -> Vec<TraceBatchMeta> {
-        let mut deleted = vec![];
-        for i in 1..self.trace_batches.len() {
-            let b0 = &self.trace_batches[i - 1];
-            let b1 = &self.trace_batches[i];
-
-            if &res.req.b0 == b0 && &res.req.b1 == b1 {
+                let res = maintainer.compact_trace(req).recv()?;
                 let mut new_batch = res.merged;
+                written_bytes += new_batch.size_bytes;
+
+                // TODO: more performant way to do this?
                 deleted.push(self.trace_batches.remove(i));
                 mem::swap(&mut self.trace_batches[i - 1], &mut new_batch);
                 deleted.push(new_batch);
 
                 // Sanity check that the modified list of batches satisfies
                 // all invariants.
-                debug_assert_eq!(self.meta().validate(), Ok(()));
+                if cfg!(any(debug_assertions, test)) {
+                    self.meta().validate()?;
+                }
 
                 break;
             }
         }
+        Ok((written_bytes, deleted))
+    }
+}
 
-        return deleted;
+/// A consistent snapshot of the data that is currently _physically_ in the
+/// unsealed bucket of a persistent [Arrangement].
+#[derive(Debug)]
+pub struct UnsealedSnapshot {
+    /// A closed lower bound on the times of contained updates.
+    pub ts_lower: Antichain<u64>,
+    /// An open upper bound on the times of the contained updates.
+    pub ts_upper: Antichain<u64>,
+    batches: Vec<PFuture<Arc<BlobUnsealedBatch>>>,
+}
+
+impl Snapshot<Vec<u8>, Vec<u8>> for UnsealedSnapshot {
+    type Iter = UnsealedSnapshotIter;
+
+    fn into_iters(self, num_iters: NonZeroUsize) -> Vec<Self::Iter> {
+        let mut iters = Vec::with_capacity(num_iters.get());
+        iters.resize_with(num_iters.get(), || UnsealedSnapshotIter {
+            ts_lower: self.ts_lower.clone(),
+            ts_upper: self.ts_upper.clone(),
+            current_batch: Vec::new(),
+            batches: VecDeque::new(),
+        });
+        // TODO: This should probably distribute batches based on size, but for
+        // now it's simpler to round-robin them.
+        for (i, batch) in self.batches.into_iter().enumerate() {
+            let iter_idx = i % num_iters;
+            iters[iter_idx].batches.push_back(batch);
+        }
+        iters
+    }
+}
+
+/// An [Iterator] representing one part of the data in a [UnsealedSnapshot].
+//
+// This intentionally stores the batches as a VecDeque so we can return the data
+// in roughly increasing timestamp order, but it's unclear if this is in any way
+// important.
+pub struct UnsealedSnapshotIter {
+    /// A closed lower bound on the times of contained updates.
+    ts_lower: Antichain<u64>,
+    /// An open upper bound on the times of the contained updates.
+    ts_upper: Antichain<u64>,
+
+    current_batch: Vec<((Vec<u8>, Vec<u8>), u64, isize)>,
+    batches: VecDeque<PFuture<Arc<BlobUnsealedBatch>>>,
+}
+
+impl fmt::Debug for UnsealedSnapshotIter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnsealedSnapshotIter")
+            .field("ts_lower", &self.ts_lower)
+            .field("ts_upper", &self.ts_upper)
+            .field("current_batch(len)", &self.current_batch.len())
+            .field("batches", &self.batches)
+            .finish()
+    }
+}
+
+impl Iterator for UnsealedSnapshotIter {
+    type Item = Result<((Vec<u8>, Vec<u8>), u64, isize), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if !self.current_batch.is_empty() {
+                let update = self.current_batch.pop().unwrap();
+                return Some(Ok(update));
+            } else {
+                // current_batch is empty, find a new one.
+                let b = match self.batches.pop_front() {
+                    None => return None,
+                    Some(b) => b,
+                };
+                match b.recv() {
+                    Ok(b) => {
+                        // Reverse the updates so we can pop them off the back
+                        // in roughly increasing time order. At the same time,
+                        // enforce our filter before we clone them. Note that we
+                        // don't reverse the updates within each ColumnarRecords,
+                        // because those are not guaranteed to be in any order.
+                        let ts_lower = self.ts_lower.borrow();
+                        let ts_upper = self.ts_upper.borrow();
+                        self.current_batch.extend(
+                            b.updates
+                                .iter()
+                                .rev()
+                                .flat_map(|u| u.iter())
+                                .filter(|(_, ts, _)| {
+                                    ts_lower.less_equal(&ts) && !ts_upper.less_equal(&ts)
+                                })
+                                .map(|((k, v), t, d)| ((k.to_vec(), v.to_vec()), t, d)),
+                        );
+                        continue;
+                    }
+                    Err(err) => return Some(Err(err)),
+                }
+            }
+        }
+    }
+}
+
+/// A consistent snapshot of the data that is currently _physically_ in the
+/// trace bucket of a persistent [Arrangement].
+#[derive(Debug)]
+pub struct TraceSnapshot {
+    /// An open upper bound on the times of contained updates.
+    pub ts_upper: Antichain<u64>,
+    /// Since frontier of the given updates.
+    ///
+    /// All updates not at times greater than this frontier must be advanced
+    /// to a time that is equivalent to this frontier.
+    pub since: Antichain<u64>,
+    batches: Vec<PFuture<Arc<BlobTraceBatch>>>,
+}
+
+impl Snapshot<Vec<u8>, Vec<u8>> for TraceSnapshot {
+    type Iter = TraceSnapshotIter;
+
+    fn into_iters(self, num_iters: NonZeroUsize) -> Vec<Self::Iter> {
+        let mut iters = Vec::with_capacity(num_iters.get());
+        iters.resize_with(num_iters.get(), TraceSnapshotIter::default);
+        // TODO: This should probably distribute batches based on size, but for
+        // now it's simpler to round-robin them.
+        for (i, batch) in self.batches.into_iter().enumerate() {
+            let iter_idx = i % num_iters;
+            iters[iter_idx].batches.push_back(batch);
+        }
+        iters
+    }
+}
+
+/// An [Iterator] representing one part of the data in a [TraceSnapshot].
+//
+// This intentionally stores the batches as a VecDeque so we can return the data
+// in roughly increasing timestamp order, but it's unclear if this is in any way
+// important.
+pub struct TraceSnapshotIter {
+    current_batch: Vec<((Vec<u8>, Vec<u8>), u64, isize)>,
+    batches: VecDeque<PFuture<Arc<BlobTraceBatch>>>,
+}
+
+impl Default for TraceSnapshotIter {
+    fn default() -> Self {
+        TraceSnapshotIter {
+            current_batch: Vec::new(),
+            batches: VecDeque::new(),
+        }
+    }
+}
+
+impl fmt::Debug for TraceSnapshotIter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TraceSnapshotIter")
+            .field("current_batch(len)", &self.current_batch.len())
+            .field("batches", &self.batches)
+            .finish()
+    }
+}
+
+impl Iterator for TraceSnapshotIter {
+    type Item = Result<((Vec<u8>, Vec<u8>), u64, isize), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if !self.current_batch.is_empty() {
+                let update = self.current_batch.pop().unwrap();
+                return Some(Ok(update));
+            } else {
+                // current_batch is empty, find a new one.
+                let b = match self.batches.pop_front() {
+                    None => return None,
+                    Some(b) => b,
+                };
+                match b.recv() {
+                    Ok(b) => {
+                        // Reverse the updates so we can pop them off the back
+                        // in roughly increasing time order.
+                        self.current_batch.extend(b.updates.iter().rev().cloned());
+                        continue;
+                    }
+                    Err(err) => return Some(Err(err)),
+                }
+            }
+        }
+    }
+}
+
+/// A consistent snapshot of all data currently stored for an id.
+#[derive(Debug)]
+pub struct ArrangementSnapshot(
+    pub(crate) UnsealedSnapshot,
+    pub(crate) TraceSnapshot,
+    pub(crate) SeqNo,
+    pub(crate) Antichain<u64>,
+);
+
+impl ArrangementSnapshot {
+    /// Returns the SeqNo at which this snapshot was run.
+    ///
+    /// All writes assigned a seqno < this are included.
+    pub fn seqno(&self) -> SeqNo {
+        self.2
+    }
+
+    /// Returns the since frontier of this snapshot.
+    ///
+    /// All updates at times less than this frontier must be forwarded
+    /// to some time in this frontier.
+    pub fn since(&self) -> Antichain<u64> {
+        self.1.since.clone()
+    }
+
+    /// A logical upper bound on the times that had been added to the collection
+    /// when this snapshot was taken
+    pub(crate) fn get_seal(&self) -> Antichain<u64> {
+        self.3.clone()
+    }
+}
+
+impl Snapshot<Vec<u8>, Vec<u8>> for ArrangementSnapshot {
+    type Iter = ArrangementSnapshotIter;
+
+    fn into_iters(self, num_iters: NonZeroUsize) -> Vec<ArrangementSnapshotIter> {
+        let since = self.since();
+        let ArrangementSnapshot(unsealed, trace, _, _) = self;
+        let unsealed_iters = unsealed.into_iters(num_iters);
+        let trace_iters = trace.into_iters(num_iters);
+        // I don't love the non-debug asserts, but it doesn't seem worth it to
+        // plumb an error around here.
+        assert_eq!(unsealed_iters.len(), num_iters.get());
+        assert_eq!(trace_iters.len(), num_iters.get());
+        unsealed_iters
+            .into_iter()
+            .zip(trace_iters.into_iter())
+            .map(|(unsealed_iter, trace_iter)| ArrangementSnapshotIter {
+                since: since.clone(),
+                iter: trace_iter.chain(unsealed_iter),
+            })
+            .collect()
+    }
+}
+
+/// An [Iterator] representing one part of the data in an [ArrangementSnapshot].
+//
+// This intentionally chains trace before unsealed so we get the data in roughly
+// increasing timestamp order, but it's unclear if this is in any way important.
+#[derive(Debug)]
+pub struct ArrangementSnapshotIter {
+    since: Antichain<u64>,
+    iter: std::iter::Chain<TraceSnapshotIter, UnsealedSnapshotIter>,
+}
+
+impl Iterator for ArrangementSnapshotIter {
+    type Item = Result<((Vec<u8>, Vec<u8>), u64, isize), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|x| {
+            x.map(|(kv, mut ts, diff)| {
+                // When reading a snapshot, the contract of since is that all
+                // update timestamps will be advanced to it. We do this
+                // physically during compaction, but don't have hard guarantees
+                // about how long that takes, so we have to account for
+                // un-advanced batches on reads.
+                ts.advance_by(self.since.borrow());
+                (kv, ts, diff)
+            })
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use differential_dataflow::trace::Description;
-    use tokio::runtime::Runtime as AsyncRuntime;
+    use tokio::runtime::Runtime;
 
-    use crate::gen::persist::ProtoBatchFormat;
-    use crate::indexed::columnar::ColumnarRecords;
     use crate::indexed::encoding::Id;
     use crate::indexed::metrics::Metrics;
-    use crate::indexed::snapshot::SnapshotExt;
-    use crate::indexed::Maintainer;
+    use crate::indexed::SnapshotExt;
     use crate::mem::{MemBlob, MemRegistry};
 
     use super::*;
-
-    /// Take one step towards compacting the trace.
-    ///
-    /// Returns a list of trace batches that can now be physically deleted after
-    /// the compaction step is committed to durable storage.
-    fn trace_step<B: Blob>(
-        arrangement: &mut Arrangement,
-        maintainer: &Maintainer<B>,
-    ) -> Result<(u64, Vec<TraceBatchMeta>), Error> {
-        let req = arrangement.trace_next_compact_req()?;
-
-        if let Some(req) = req {
-            let fut = maintainer.compact_trace(req);
-            let res = fut.recv()?;
-            let written_bytes = res.merged.size_bytes;
-            Ok((
-                written_bytes,
-                arrangement.trace_handle_compact_response(res),
-            ))
-        } else {
-            Ok((0, vec![]))
-        }
-    }
 
     fn desc_from(lower: u64, upper: u64, since: u64) -> Description<u64> {
         Description::new(
@@ -738,7 +921,7 @@ mod tests {
     }
 
     // Generate a list of ((k, v), t, 1) updates at all of the specified times.
-    fn unsealed_updates(update_times: Vec<u64>) -> Vec<((Vec<u8>, Vec<u8>), u64, i64)> {
+    fn unsealed_updates(update_times: Vec<u64>) -> Vec<((Vec<u8>, Vec<u8>), u64, isize)> {
         update_times
             .into_iter()
             .map(|t| (("k".into(), "v".into()), t, 1))
@@ -746,8 +929,8 @@ mod tests {
     }
 
     // Generate a ColumnarRecords containing the provided updates
-    fn columnar_records(updates: Vec<((Vec<u8>, Vec<u8>), u64, i64)>) -> Vec<ColumnarRecords> {
-        updates.iter().collect::<ColumnarRecordsVec>().into_inner()
+    fn columnar_records(updates: Vec<((Vec<u8>, Vec<u8>), u64, isize)>) -> ColumnarRecords {
+        updates.iter().collect()
     }
 
     // Generate an unsealed batch spanning the specified sequence numbers with
@@ -755,7 +938,7 @@ mod tests {
     fn unsealed_batch(lower: u64, upper: u64, update_times: Vec<u64>) -> BlobUnsealedBatch {
         BlobUnsealedBatch {
             desc: SeqNo(lower)..SeqNo(upper),
-            updates: columnar_records(unsealed_updates(update_times)),
+            updates: vec![columnar_records(unsealed_updates(update_times))],
         }
     }
 
@@ -769,7 +952,6 @@ mod tests {
     ) -> UnsealedBatchMeta {
         UnsealedBatchMeta {
             key: key.to_string(),
-            format: ProtoBatchFormat::ParquetKvtd,
             desc: SeqNo(lower)..SeqNo(upper),
             ts_upper,
             ts_lower,
@@ -783,11 +965,9 @@ mod tests {
         blob: &BlobCache<L>,
         lo: u64,
         hi: Option<u64>,
-    ) -> Result<Vec<((Vec<u8>, Vec<u8>), u64, i64)>, Error> {
+    ) -> Result<Vec<((Vec<u8>, Vec<u8>), u64, isize)>, Error> {
         let hi = hi.map_or_else(Antichain::new, Antichain::from_elem);
-        let snapshot = arrangement
-            .unsealed_snapshot(Antichain::from_elem(lo), hi)?
-            .fetch(&blob);
+        let snapshot = arrangement.unsealed_snapshot(Antichain::from_elem(lo), hi, &blob)?;
         let updates = snapshot.read_to_end()?;
         Ok(updates)
     }
@@ -815,7 +995,7 @@ mod tests {
             .iter()
             .cloned()
             .map(|mut b| {
-                b.keys = vec![];
+                b.key = "KEY".to_string();
                 b.size_bytes = 0;
                 b
             })
@@ -825,17 +1005,14 @@ mod tests {
     #[test]
     fn append_trace_ts_upper_invariant() -> Result<(), Error> {
         let mut blob = BlobCache::new(
-            mz_build_info::DUMMY_BUILD_INFO,
-            Arc::new(Metrics::default()),
-            Arc::new(AsyncRuntime::new()?),
+            build_info::DUMMY_BUILD_INFO,
+            Metrics::default(),
             MemBlob::new_no_reentrance("append_trace_ts_upper_invariant"),
-            None,
         );
         let mut f = Arrangement::new(ArrangementMeta {
             id: Id(0),
             trace_batches: vec![TraceBatchMeta {
-                keys: vec![],
-                format: ProtoBatchFormat::Unknown,
+                key: "key1".to_string(),
                 desc: desc_from(0, 2, 0),
                 level: 1,
                 size_bytes: 0,
@@ -846,7 +1023,7 @@ mod tests {
         // ts < trace_ts_upper is disallowed
         let batch = BlobUnsealedBatch {
             desc: SeqNo(0)..SeqNo(1),
-            updates: columnar_records(vec![(("k".into(), "v".into()), 1, 1)]),
+            updates: vec![columnar_records(vec![(("k".into(), "v".into()), 1, 1)])],
         };
         assert_eq!(
             f.unsealed_append(batch, &mut blob),
@@ -858,7 +1035,7 @@ mod tests {
         // ts == trace_ts_upper is allowed
         let batch = BlobUnsealedBatch {
             desc: SeqNo(0)..SeqNo(1),
-            updates: columnar_records(vec![(("k".into(), "v".into()), 2, 1)]),
+            updates: vec![columnar_records(vec![(("k".into(), "v".into()), 2, 1)])],
         };
         assert_eq!(f.unsealed_append(batch, &mut blob), Ok(()));
 
@@ -868,13 +1045,11 @@ mod tests {
     /// This test checks whether we correctly determine the min/max times stored
     /// in a unsealed batch consisting of unsorted updates.
     #[test]
-    fn append_detect_min_max_times() -> Result<(), Error> {
+    fn append_detect_min_max_times() {
         let mut blob = BlobCache::new(
-            mz_build_info::DUMMY_BUILD_INFO,
-            Arc::new(Metrics::default()),
-            Arc::new(AsyncRuntime::new()?),
+            build_info::DUMMY_BUILD_INFO,
+            Metrics::default(),
             MemBlob::new_no_reentrance("append_ts_lower_invariant"),
-            None,
         );
         let mut f = Arrangement::new(ArrangementMeta {
             id: Id(0),
@@ -885,10 +1060,10 @@ mod tests {
         // Construct a unsealed batch where the updates are not sorted by time.
         let batch = BlobUnsealedBatch {
             desc: SeqNo(0)..SeqNo(1),
-            updates: columnar_records(vec![
+            updates: vec![columnar_records(vec![
                 (("k".into(), "v".into()), 3, 1),
                 (("k".into(), "v".into()), 2, 1),
-            ]),
+            ])],
         };
 
         assert_eq!(f.unsealed_append(batch, &mut blob), Ok(()));
@@ -897,18 +1072,14 @@ mod tests {
         let meta = &f.unsealed_batches[0];
         assert_eq!(meta.ts_lower, 2);
         assert_eq!(meta.ts_upper, 3);
-
-        Ok(())
     }
 
     #[test]
     fn unsealed_evict() -> Result<(), Error> {
         let mut blob = BlobCache::new(
-            mz_build_info::DUMMY_BUILD_INFO,
-            Arc::new(Metrics::default()),
-            Arc::new(AsyncRuntime::new()?),
+            build_info::DUMMY_BUILD_INFO,
+            Metrics::default(),
             MemBlob::new_no_reentrance("unsealed_evict"),
-            None,
         );
         let mut f = Arrangement::new(ArrangementMeta {
             id: Id(0),
@@ -980,11 +1151,9 @@ mod tests {
     #[test]
     fn unsealed_snapshot() -> Result<(), Error> {
         let mut blob = BlobCache::new(
-            mz_build_info::DUMMY_BUILD_INFO,
-            Arc::new(Metrics::default()),
-            Arc::new(AsyncRuntime::new()?),
+            build_info::DUMMY_BUILD_INFO,
+            Metrics::default(),
             MemBlob::new_no_reentrance("unsealed_snapshot"),
-            None,
         );
         let mut f = Arrangement::new(ArrangementMeta {
             id: Id(0),
@@ -999,7 +1168,7 @@ mod tests {
         ];
         let batch = BlobUnsealedBatch {
             desc: SeqNo(0)..SeqNo(2),
-            updates: columnar_records(updates.clone()),
+            updates: vec![columnar_records(updates.clone())],
         };
 
         f.unsealed_append(batch, &mut blob)?;
@@ -1035,11 +1204,9 @@ mod tests {
     #[test]
     fn unsealed_batch_trim() -> Result<(), Error> {
         let mut blob = BlobCache::new(
-            mz_build_info::DUMMY_BUILD_INFO,
-            Arc::new(Metrics::default()),
-            Arc::new(AsyncRuntime::new()?),
+            build_info::DUMMY_BUILD_INFO,
+            Metrics::default(),
             MemBlob::new_no_reentrance("unsealed_batch_trim"),
-            None,
         );
         let mut f = Arrangement::new(ArrangementMeta {
             id: Id(0),
@@ -1055,7 +1222,7 @@ mod tests {
         ];
         let batch = BlobUnsealedBatch {
             desc: SeqNo(0)..SeqNo(2),
-            updates: columnar_records(updates.clone()),
+            updates: vec![columnar_records(updates.clone())],
         };
 
         f.unsealed_append(batch, &mut blob)?;
@@ -1087,8 +1254,7 @@ mod tests {
         let mut t = Arrangement::new(ArrangementMeta {
             id: Id(0),
             trace_batches: vec![TraceBatchMeta {
-                keys: vec![],
-                format: ProtoBatchFormat::Unknown,
+                key: "key1".to_string(),
                 desc: desc_from(0, 10, 5),
                 level: 1,
                 size_bytes: 0,
@@ -1111,10 +1277,12 @@ mod tests {
             Err("invalid compaction less than trace since Antichain { elements: [6] }: Antichain { elements: [5] }".into()));
 
         // Advance since frontier to seal
-        t.validate_allow_compaction(&Antichain::from_elem(10))?;
+        assert_eq!(t.validate_allow_compaction(&Antichain::from_elem(10)),
+            Err("invalid compaction at or in advance of trace seal Antichain { elements: [10] }: Antichain { elements: [10] }".into()));
 
         // Advance since frontier beyond seal
-        t.validate_allow_compaction(&Antichain::from_elem(11))?;
+        assert_eq!(t.validate_allow_compaction(&Antichain::from_elem(11)),
+            Err("invalid compaction at or in advance of trace seal Antichain { elements: [10] }: Antichain { elements: [11] }".into()));
 
         Ok(())
     }
@@ -1124,8 +1292,7 @@ mod tests {
         let mut t = Arrangement::new(ArrangementMeta {
             id: Id(0),
             trace_batches: vec![TraceBatchMeta {
-                keys: vec![],
-                format: ProtoBatchFormat::Unknown,
+                key: "key1".to_string(),
                 desc: Description::new(
                     Antichain::from_elem(0),
                     Antichain::from_elem(10),
@@ -1156,55 +1323,42 @@ mod tests {
 
     #[test]
     fn trace_compact() -> Result<(), Error> {
-        let async_runtime = Arc::new(AsyncRuntime::new()?);
-        let metrics = Arc::new(Metrics::default());
         let mut blob = BlobCache::new(
-            mz_build_info::DUMMY_BUILD_INFO,
-            Arc::new(Metrics::default()),
-            Arc::clone(&async_runtime),
+            build_info::DUMMY_BUILD_INFO,
+            Metrics::default(),
             MemRegistry::new().blob_no_reentrance()?,
-            None,
         );
-        let maintainer = Maintainer::new(blob.clone(), async_runtime, metrics);
+        let maintainer = Maintainer::new(blob.clone(), Arc::new(Runtime::new()?));
         let mut t = Arrangement::new(ArrangementMeta::new(Id(0)));
         t.update_seal(10);
 
-        let batch = BlobUnsealedBatch {
-            desc: SeqNo(0)..SeqNo(1),
-            updates: columnar_records(vec![
+        let batch = BlobTraceBatch {
+            desc: desc_from(0, 1, 0),
+            updates: vec![
                 (("k".into(), "v".into()), 0, 1),
                 (("k2".into(), "v2".into()), 0, 1),
-            ]),
+            ],
         };
-        assert_eq!(t.unsealed_append(batch, &mut blob), Ok(()));
-        t.update_seal(1);
-        assert_eq!(t.unsealed_drain(&mut blob), Ok(()));
-        assert_eq!(t.trace_batches.len(), 1);
 
-        let batch = BlobUnsealedBatch {
-            desc: SeqNo(1)..SeqNo(2),
-            updates: columnar_records(vec![
+        assert_eq!(t.trace_append(batch, &mut blob), Ok(()));
+        let batch = BlobTraceBatch {
+            desc: desc_from(1, 3, 0),
+            updates: vec![
                 (("k".into(), "v".into()), 2, 1),
                 (("k3".into(), "v3".into()), 2, 1),
-            ]),
+            ],
         };
-        assert_eq!(t.unsealed_append(batch, &mut blob), Ok(()));
-        t.update_seal(3);
-        assert_eq!(t.unsealed_drain(&mut blob), Ok(()));
-        assert_eq!(t.trace_batches.len(), 2);
+        assert_eq!(t.trace_append(batch, &mut blob), Ok(()));
 
-        let batch = BlobUnsealedBatch {
-            desc: SeqNo(2)..SeqNo(3),
-            updates: columnar_records(vec![(("k".into(), "v".into()), 5, 1)]),
+        let batch = BlobTraceBatch {
+            desc: desc_from(3, 9, 0),
+            updates: vec![(("k".into(), "v".into()), 5, 1)],
         };
-        assert_eq!(t.unsealed_append(batch, &mut blob), Ok(()));
-        t.update_seal(9);
-        assert_eq!(t.unsealed_drain(&mut blob), Ok(()));
-        assert_eq!(t.trace_batches.len(), 3);
+        assert_eq!(t.trace_append(batch, &mut blob), Ok(()));
 
         t.validate_allow_compaction(&Antichain::from_elem(3))?;
         t.allow_compaction(Antichain::from_elem(3));
-        let (written_bytes, deleted_batches) = trace_step(&mut t, &maintainer)?;
+        let (written_bytes, deleted_batches) = t.trace_step(&maintainer)?;
         // NB: This intentionally doesn't assert any particular size so this
         // test doesn't need to be updated if encoded batch size changes.
         assert!(written_bytes > 0);
@@ -1217,7 +1371,7 @@ mod tests {
         );
 
         // Check that step doesn't do anything when there's nothing to compact.
-        let (written_bytes, deleted_batches) = trace_step(&mut t, &maintainer)?;
+        let (written_bytes, deleted_batches) = t.trace_step(&maintainer)?;
         assert_eq!(written_bytes, 0);
         assert_eq!(deleted_batches, vec![]);
 
@@ -1225,15 +1379,13 @@ mod tests {
             cleared_trace(&t.trace_batches),
             vec![
                 TraceBatchMeta {
-                    keys: vec![],
-                    format: ProtoBatchFormat::ParquetKvtd,
+                    key: "KEY".to_string(),
                     desc: desc_from(0, 3, 3),
                     level: 1,
                     size_bytes: 0,
                 },
                 TraceBatchMeta {
-                    keys: vec![],
-                    format: ProtoBatchFormat::ParquetKvtd,
+                    key: "KEY".to_string(),
                     desc: desc_from(3, 9, 0),
                     level: 0,
                     size_bytes: 0,
@@ -1259,17 +1411,14 @@ mod tests {
 
         t.update_seal(11);
 
-        let batch = BlobUnsealedBatch {
-            desc: SeqNo(3)..SeqNo(4),
-            updates: columnar_records(vec![(("k".into(), "v".into()), 9, 1)]),
+        let batch = BlobTraceBatch {
+            desc: desc_from(9, 10, 0),
+            updates: vec![(("k".into(), "v".into()), 9, 1)],
         };
-        assert_eq!(t.unsealed_append(batch, &mut blob), Ok(()));
-        t.update_seal(10);
-        assert_eq!(t.unsealed_drain(&mut blob), Ok(()));
-
+        assert_eq!(t.trace_append(batch, &mut blob), Ok(()));
         t.validate_allow_compaction(&Antichain::from_elem(10))?;
         t.allow_compaction(Antichain::from_elem(10));
-        let (written_bytes, deleted_batches) = trace_step(&mut t, &maintainer)?;
+        let (written_bytes, deleted_batches) = t.trace_step(&maintainer)?;
         // NB: This intentionally doesn't assert any particular size so this
         // test doesn't need to be updated if encoded batch size changes.
         assert!(written_bytes > 0);
@@ -1287,15 +1436,13 @@ mod tests {
             cleared_trace(&t.trace_batches),
             vec![
                 TraceBatchMeta {
-                    keys: vec![],
-                    format: ProtoBatchFormat::ParquetKvtd,
+                    key: "KEY".to_string(),
                     desc: desc_from(0, 3, 3),
                     level: 1,
                     size_bytes: 0,
                 },
                 TraceBatchMeta {
-                    keys: vec![],
-                    format: ProtoBatchFormat::ParquetKvtd,
+                    key: "KEY".to_string(),
                     desc: desc_from(3, 10, 10),
                     level: 0,
                     size_bytes: 0,
@@ -1318,79 +1465,6 @@ mod tests {
                 (("k3".into(), "v3".into()), 3, 1),
             ]
         );
-
-        Ok(())
-    }
-
-    #[test]
-    fn compaction_beyond_upper() -> Result<(), Error> {
-        let async_runtime = Arc::new(AsyncRuntime::new()?);
-        let metrics = Arc::new(Metrics::default());
-        let mut blob = BlobCache::new(
-            mz_build_info::DUMMY_BUILD_INFO,
-            Arc::new(Metrics::default()),
-            Arc::clone(&async_runtime),
-            MemRegistry::new().blob_no_reentrance()?,
-            None,
-        );
-        let maintainer = Maintainer::new(blob.clone(), async_runtime, metrics);
-        let mut t = Arrangement::new(ArrangementMeta::new(Id(0)));
-
-        // Add updates to both the trace and the unsealeds.
-        let batch = BlobUnsealedBatch {
-            desc: SeqNo(0)..SeqNo(1),
-            updates: columnar_records(vec![
-                (("k1".into(), "v1".into()), 0, 1),
-                (("k2".into(), "v2".into()), 1, 1),
-            ]),
-        };
-        assert_eq!(t.unsealed_append(batch, &mut blob), Ok(()));
-        t.update_seal(10);
-        assert_eq!(t.unsealed_drain(&mut blob), Ok(()));
-
-        let unsealed_updates = vec![
-            (("k3".into(), "v3".into()), 10, 1),
-            (("k4".into(), "v4".into()), 11, 1),
-        ];
-        let batch = BlobUnsealedBatch {
-            desc: SeqNo(1)..SeqNo(2),
-            updates: columnar_records(unsealed_updates),
-        };
-        t.unsealed_append(batch, &mut blob)?;
-
-        // Allow compaction beyond the seal frontier of [10].
-        t.validate_allow_compaction(&Antichain::from_elem(30))?;
-        t.allow_compaction(Antichain::from_elem(30));
-
-        // The updated compaction since and seal frontier should hold even if we did not yet step
-        // for compaction.
-
-        let expected = vec![
-            (("k1".into(), "v1".into()), 30, 1),
-            (("k2".into(), "v2".into()), 30, 1),
-            (("k3".into(), "v3".into()), 30, 1),
-            (("k4".into(), "v4".into()), 30, 1),
-        ];
-
-        let snapshot = t.snapshot(SeqNo(42) /* this is unused */, &blob)?;
-        assert_eq!(snapshot.since(), Antichain::from_elem(30));
-        assert_eq!(snapshot.get_seal(), Antichain::from_elem(10));
-
-        let updates = snapshot.read_to_end()?;
-
-        assert_eq!(updates, expected,);
-
-        // The yielded updates must be the same after compaction.
-
-        trace_step(&mut t, &maintainer)?;
-
-        let snapshot = t.snapshot(SeqNo(42) /* this is unused */, &blob)?;
-        assert_eq!(snapshot.since(), Antichain::from_elem(30));
-        assert_eq!(snapshot.get_seal(), Antichain::from_elem(10));
-
-        let updates = snapshot.read_to_end()?;
-
-        assert_eq!(updates, expected,);
 
         Ok(())
     }

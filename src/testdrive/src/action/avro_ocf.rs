@@ -13,12 +13,12 @@ use std::io::Write;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{self, PathBuf};
 
-use anyhow::{bail, Context};
 use async_trait::async_trait;
 
-use mz_ore::retry::Retry;
+use ore::result::ResultExt;
+use ore::retry::Retry;
 
-use crate::action::{Action, ControlFlow, State, SyncAction};
+use crate::action::{Action, Context, State, SyncAction};
 use crate::format::avro::{self, Codec, Reader, Writer};
 use crate::parser::BuiltinCommand;
 
@@ -27,135 +27,134 @@ pub struct WriteAction {
     schema: String,
     records: Vec<String>,
     codec: Option<Codec>,
-    repeat: usize,
 }
 
-pub fn build_write(mut cmd: BuiltinCommand) -> Result<WriteAction, anyhow::Error> {
+pub fn build_write(mut cmd: BuiltinCommand) -> Result<WriteAction, String> {
     let path = cmd.args.string("path")?;
     let schema = cmd.args.string("schema")?;
     let codec = cmd.args.opt_parse("codec")?;
-    let repeat = cmd.args.opt_parse("repeat")?.unwrap_or(1);
 
     let records = cmd.input;
     cmd.args.done()?;
     if path.contains(path::MAIN_SEPARATOR) {
         // The goal isn't security, but preventing mistakes.
-        bail!("separators in paths are forbidden");
+        return Err("separators in paths are forbidden".into());
     }
     Ok(WriteAction {
         path,
         schema,
         records,
         codec,
-        repeat,
     })
 }
 
 impl SyncAction for WriteAction {
-    fn undo(&self, _state: &mut State) -> Result<(), anyhow::Error> {
+    fn undo(&self, _state: &mut State) -> Result<(), String> {
         // Files are written to a fresh temporary directory, so no need to
         // explicitly remove the file here.
         Ok(())
     }
 
-    fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+    fn redo(&self, state: &mut State) -> Result<(), String> {
         let path = state.temp_path.join(&self.path);
         println!("Writing to {}", path.display());
-        let mut file = File::create(&path)
-            .with_context(|| format!("creating Avro OCF file: {}", path.display()))?;
-        let schema = avro::parse_schema(&self.schema).context("parsing avro schema")?;
+        let mut file = File::create(path).map_err_to_string()?;
+        let schema = avro::parse_schema(&self.schema)
+            .map_err(|e| format!("parsing avro schema: {:#}", e))?;
         let mut writer = Writer::with_codec_opt(schema, &mut file, self.codec);
-        for _ in 0..self.repeat {
-            write_records(&mut writer, &self.records)?;
-        }
-        writer.flush().context("flushing avro writer")?;
+        write_records(&mut writer, &self.records)?;
         file.sync_all()
-            .with_context(|| format!("syncing Avro OCF file: {}", path.display()))?;
-        Ok(ControlFlow::Continue)
+            .map_err(|e| format!("error syncing file: {}", e))?;
+        Ok(())
     }
 }
 
 pub struct AppendAction {
     path: String,
     records: Vec<String>,
-    repeat: usize,
 }
 
-pub fn build_append(mut cmd: BuiltinCommand) -> Result<AppendAction, anyhow::Error> {
+pub fn build_append(mut cmd: BuiltinCommand) -> Result<AppendAction, String> {
     let path = cmd.args.string("path")?;
-    let repeat = cmd.args.opt_parse("repeat")?.unwrap_or(1);
     let records = cmd.input;
     cmd.args.done()?;
     if path.contains(path::MAIN_SEPARATOR) {
         // The goal isn't security, but preventing mistakes.
-        bail!("separators in paths are forbidden");
+        return Err("separators in paths are forbidden".into());
     }
-    Ok(AppendAction {
-        path,
-        records,
-        repeat,
-    })
+    Ok(AppendAction { path, records })
 }
 
 impl SyncAction for AppendAction {
-    fn undo(&self, _state: &mut State) -> Result<(), anyhow::Error> {
+    fn undo(&self, _state: &mut State) -> Result<(), String> {
         Ok(())
     }
 
-    fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+    fn redo(&self, state: &mut State) -> Result<(), String> {
         let path = state.temp_path.join(&self.path);
         println!("Appending to {}", path.display());
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut writer = Writer::append_to(file)?;
-        for _ in 0..self.repeat {
-            write_records(&mut writer, &self.records)?;
-        }
-        writer.flush().context("flushing avro writer")?;
-        Ok(ControlFlow::Continue)
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err_to_string()?;
+        let mut writer = Writer::append_to(file).map_err_to_string()?;
+        write_records(&mut writer, &self.records)?;
+        Ok(())
     }
 }
 
-fn write_records<W>(writer: &mut Writer<W>, records: &[String]) -> Result<(), anyhow::Error>
+fn write_records<W>(writer: &mut Writer<W>, records: &[String]) -> Result<(), String>
 where
     W: Write,
 {
     let schema = writer.schema().clone();
     for record in records {
         let record = avro::from_json(
-            &serde_json::from_str(record).context("parsing avro datum: {:#}")?,
+            &serde_json::from_str(record).map_err(|e| format!("parsing avro datum: {:#}", e))?,
             schema.top_node(),
         )?;
-        writer.append(record).context("writing avro record")?;
+        writer
+            .append(record)
+            .map_err(|e| format!("writing avro record: {:#}", e))?;
     }
+    writer
+        .flush()
+        .map_err(|e| format!("flushing avro writer: {:#}", e))?;
     Ok(())
 }
 
 pub struct VerifyAction {
     sink: String,
     expected: Vec<String>,
+    context: Context,
 }
 
-pub fn build_verify(mut cmd: BuiltinCommand) -> Result<VerifyAction, anyhow::Error> {
+pub fn build_verify(mut cmd: BuiltinCommand, context: Context) -> Result<VerifyAction, String> {
     let sink = cmd.args.string("sink")?;
     let expected = cmd.input;
     cmd.args.done()?;
     if sink.contains(path::MAIN_SEPARATOR) {
         // The goal isn't security, but preventing mistakes.
-        bail!("separators in file sink names are forbidden");
+        return Err("separators in file sink names are forbidden".into());
     }
-    Ok(VerifyAction { sink, expected })
+    Ok(VerifyAction {
+        sink,
+        expected,
+        context,
+    })
 }
 
 #[async_trait]
 impl Action for VerifyAction {
-    async fn undo(&self, _state: &mut State) -> Result<(), anyhow::Error> {
+    async fn undo(&self, _state: &mut State) -> Result<(), String> {
         Ok(())
     }
 
-    async fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+    async fn redo(&self, state: &mut State) -> Result<(), String> {
         let path = Retry::default()
             .max_duration(state.default_timeout)
-            .retry_async_canceling(|_| async {
+            .retry_async(|_| async {
                 let row = state
                     .pgclient
                     .query_one(
@@ -165,12 +164,12 @@ impl Action for VerifyAction {
                         &[&self.sink],
                     )
                     .await
-                    .context("querying materialize")?;
+                    .map_err(|e| format!("querying materialize: {:#}", e))?;
                 let bytes: Vec<u8> = row.get("path");
-                Ok::<_, anyhow::Error>(PathBuf::from(OsString::from_vec(bytes)))
+                Ok::<_, String>(PathBuf::from(OsString::from_vec(bytes)))
             })
             .await
-            .context("retrieving path")?;
+            .map_err(|e| format!("retrieving path: {:?}", e))?;
 
         println!("Verifying results in file {}", path.display());
 
@@ -178,23 +177,21 @@ impl Action for VerifyAction {
         // we drop into synchronous code here.
         tokio::task::block_in_place(|| {
             let file = File::open(&path)
-                .with_context(|| format!("reading sink file {}", path.display()))?;
-            let reader = Reader::new(file).context("creating avro reader")?;
+                .map_err(|e| format!("reading sink file {}: {}", path.display(), e))?;
+            let reader = Reader::new(file).map_err(|e| format!("creating avro reader: {}", e))?;
             let schema = reader.writer_schema().clone();
             let actual = reader
                 .map(|res| res.map(|val| (None, Some(val))))
                 .collect::<Result<Vec<_>, _>>()
-                .context("reading avro values from file")?;
+                .map_err(|e| format!("reading avro values from file: {}", e))?;
             avro::validate_sink(
                 None,
                 &schema,
                 &self.expected,
                 &actual,
-                &state.regex,
-                &state.regex_replacement,
+                &self.context.regex,
+                &self.context.regex_replacement,
             )
-        })?;
-
-        Ok(ControlFlow::Continue)
+        })
     }
 }

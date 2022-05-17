@@ -14,8 +14,8 @@ use std::vec;
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
-use mz_lowertest::MzReflect;
-use mz_ore::str::StrExt;
+use lowertest::MzStructReflect;
+use ore::str::StrExt;
 
 use crate::{Datum, ScalarType};
 
@@ -26,7 +26,9 @@ use crate::{Datum, ScalarType};
 ///
 /// To construct a column type, either initialize the struct directly, or
 /// use the [`ScalarType::nullable`] method.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash, MzStructReflect,
+)]
 pub struct ColumnType {
     /// The underlying scalar type (e.g., Int32 or String) of this column.
     pub scalar_type: ScalarType,
@@ -114,7 +116,7 @@ impl ColumnType {
 }
 
 /// The type of a relation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect)]
 pub struct RelationType {
     /// The type for each column, in order.
     pub column_types: Vec<ColumnType>,
@@ -184,8 +186,8 @@ impl RelationType {
 }
 
 /// The name of a column in a [`RelationDesc`].
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash, MzReflect)]
-pub struct ColumnName(pub(crate) String);
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct ColumnName(String);
 
 impl ColumnName {
     /// Returns this column name as a `str`.
@@ -233,7 +235,7 @@ impl From<&ColumnName> for ColumnName {
 /// A `RelationDesc`s is typically constructed via its builder API:
 ///
 /// ```
-/// use mz_repr::{ColumnType, RelationDesc, ScalarType};
+/// use repr::{ColumnType, RelationDesc, ScalarType};
 ///
 /// let desc = RelationDesc::empty()
 ///     .with_column("id", ScalarType::Int64.nullable(false))
@@ -245,9 +247,9 @@ impl From<&ColumnName> for ColumnName {
 /// type first, and imbue it with column names to form a `RelationDesc` later:
 ///
 /// ```
-/// use mz_repr::RelationDesc;
+/// use repr::RelationDesc;
 ///
-/// # fn plan_query(_: &str) -> mz_repr::RelationType { mz_repr::RelationType::new(vec![]) }
+/// # fn plan_query(_: &str) -> repr::RelationType { repr::RelationType::new(vec![]) }
 /// let relation_type = plan_query("SELECT * FROM table");
 /// let names = (0..relation_type.arity()).map(|i| match i {
 ///     0 => "first",

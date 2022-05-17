@@ -199,8 +199,6 @@ Field         | Type           | Meaning
 `name`        | [`text`]       | The name of the function.
 `arg_ids`     | [`text array`] | The function's arguments' types. Elements refers to `mz_types.id`.
 `variadic_id` | [`text`]       | The variadic array parameter's elements, or `NULL` if the function does not have a variadic parameter. Refers to `mz_types.id`.
-`ret_id`      | [`text`]       | The returned value's type, or `NULL` if the function does not return a value. Refers to `mz_types.id`. Note that for table functions with > 1 column, this type corresponds to [`record`].
-`ret_set`     | [`bool`]       | Whether the returned value is a set, i.e. the function is a table function.
 
 ### `mz_indexes`
 
@@ -381,12 +379,12 @@ Field       | Type       | Meaning
 The `mz_peek_active` source describes all read queries ("peeks") that are
 pending in the dataflow layer.
 
-Field      | Type       | Meaning
------------|------------|--------
-`id`       | [`uuid`]   | The ID of the peek request.
-`worker`   | [`bigint`] | The ID of the worker thread servicing the peek.
-`index_id` | [`text`]   | The ID of the index the peek is targeting.
-`time`     | [`bigint`] | The timestamp the peek has requested.
+Field    | Type       | Meaning
+---------|------------|--------
+`uuid`   | [`text`]   | The ID of the connection that requested the peek. `uuid` is a misnomer; connection IDs are 32-bit unsigned integers.
+`worker` | [`bigint`] | The ID of the worker thread servicing the peek.
+`id`     | [`text`]   | The ID of the index the peek is targeting.
+`time`   | [`bigint`] | The timestamp the peek has requested.
 
 ### `mz_peek_durations`
 
@@ -604,7 +602,6 @@ Field          | Type        | Meaning
 `schema_id`    | [`bigint`]  | The ID of the schema to which the view belongs.
 `name`         | [`text`]    | The name of the view.
 `volatility`   | [`text`]    | Whether the view is [volatile](/overview/volatility). Either `volatile`, `nonvolatile`, or `unknown`.
-`definition`   | [`text`]    | The view definition (a `SELECT` query).
 
 ### `mz_worker_materialization_frontiers`
 
@@ -624,28 +621,19 @@ Field       | Type       | Meaning
 
 ## `pg_catalog`
 
-Materialize has compatibility shims for the following relations from [PostgreSQL's
+Materialize has compatibility shims for the following tables from [PostgreSQL's
 system catalog](https://www.postgresql.org/docs/current/catalogs.html):
 
-  * [`pg_am`](https://www.postgresql.org/docs/current/catalog-pg-am.html)
   * [`pg_attribute`](https://www.postgresql.org/docs/current/catalog-pg-attribute.html)
   * [`pg_class`](https://www.postgresql.org/docs/current/catalog-pg-class.html)
-  * [`pg_collation`](https://www.postgresql.org/docs/current/catalog-pg-collation.html)
-  * [`pg_constraint`](https://www.postgresql.org/docs/current/catalog-pg-constraint.html)
   * [`pg_database`](https://www.postgresql.org/docs/current/catalog-pg-database.html)
   * [`pg_description`](https://www.postgresql.org/docs/current/catalog-pg-description.html)
   * [`pg_enum`](https://www.postgresql.org/docs/current/catalog-pg-enum.html)
   * [`pg_index`](https://www.postgresql.org/docs/current/catalog-pg-index.html)
-  * [`pg_inherits`](https://www.postgresql.org/docs/current/catalog-pg-inherits.html)
   * [`pg_namespace`](https://www.postgresql.org/docs/current/catalog-pg-namespace.html)
-  * [`pg_policy`](https://www.postgresql.org/docs/current/catalog-pg-policy.html)
   * [`pg_proc`](https://www.postgresql.org/docs/current/catalog-pg-proc.html)
   * [`pg_range`](https://www.postgresql.org/docs/current/catalog-pg-range.html)
-  * [`pg_roles`](https://www.postgresql.org/docs/current/view-pg-roles.html)
-  * [`pg_settings`](https://www.postgresql.org/docs/current/view-pg-settings.html)
-  * [`pg_tables`](https://www.postgresql.org/docs/current/view-pg-tables.html)
   * [`pg_type`](https://www.postgresql.org/docs/current/catalog-pg-type.html)
-  * [`pg_views`](https://www.postgresql.org/docs/current/view-pg-views.html)
 
 These compatibility shims are largely incomplete. Most are lacking some columns
 that are present in PostgreSQL, or if they do include the column the result set
@@ -656,21 +644,6 @@ the documented [`mz_catalog`](#mz_catalog) API instead.
 If you are having trouble making a PostgreSQL tool work with Materialize, please
 [file a GitHub issue][gh-issue]. Many PostgreSQL tools can be made to work with
 Materialize with minor changes to the `pg_catalog` compatibility shim.
-
-## `information_schema`
-
-Materialize has compatibility shims for the following relations from the
-SQL standard [`information_schema`](https://www.postgresql.org/docs/current/infoschema-schema.html)
-schema, which is automatically available in all databases:
-
-  * [`columns`](https://www.postgresql.org/docs/current/infoschema-columns.html)
-  * [`tables`](https://www.postgresql.org/docs/current/infoschema-tables.html)
-
-These compatibility shims are largely incomplete. Most are lacking some columns
-that are present in the SQL standard, or if they do include the column the
-result set its value may always be `NULL`. The precise nature of the
-incompleteness is intentionally undocumented. New tools developed against
-Materialize should use the documented [`mz_catalog`](#mz_catalog) API instead.
 
 [`bigint`]: /sql/types/bigint
 [`bigint list`]: /sql/types/list
@@ -683,7 +656,6 @@ Materialize should use the documented [`mz_catalog`](#mz_catalog) API instead.
 [`text`]: /sql/types/text
 [`timestamp`]: /sql/types/timestamp
 [`timestamp with time zone`]: /sql/types/timestamp
-[`uuid`]: /sql/types/uuid
 [gh-issue]: https://github.com/MaterializeInc/materialize/issues/new?labels=C-feature&template=feature.md
 [oid]: /sql/types/oid
 [`text array`]: /sql/types/array

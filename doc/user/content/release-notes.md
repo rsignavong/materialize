@@ -14,465 +14,116 @@ This page details changes between versions of Materialize, including:
 For information about available versions, see our [Versions page](/versions).
 
 {{< comment >}}
-ATTENTION: Don't add new release notes here! Add them in the designated spot in
-the PR description instead. They will be migrated here during the release
-process by the release notes team.
+# What changes require a release note?
+
+Any behavior change to a stable, user-visible API requires a release note.
+Roughly speaking, Materialize's stable APIs are:
+
+  * The syntax and semantics of all documented SQL statements.
+  * The observable behavior of any source or sink.
+  * The behavior of all documented command-line flags.
+
+For details, see the [backwards compatibility policy](/versions/#Backwards-compatibility).
+
+Notably, changes to experimental or unstable APIs should *not* have release
+notes. The point of having experimental and unstable APIs is to decrease the
+engineering burden when those features are changed. Instead, write a release
+note introducing the feature for the release in which the feature is
+de-experimentalized.
+
+Examples of changes that require release notes:
+
+  * The addition of a new, documented SQL function.
+  * The stabilization of a new source type.
+  * A bug fix that fixes a panic in any component.
+  * A bug fix that changes the output format of a particular data type in a
+    sink.
+
+Examples of changes that do not require release notes:
+
+  * **An improvement to the build system.** The build system is not user
+    visible.
+  * **The addition of a feature to testdrive.** Similarly, our test frameworks
+    are not user visible.
+  * **An upgrade of an internal Rust dependency.** Most dependency upgrades
+    do not result in user-visible changes. (If they do, document the change
+    itself, not the fact that the dependency was upgraded. Users care about
+    the visible behavior of Materialize, not its implementation!)
+
+Performance improvements are a borderline case. A small performance improvement
+does not need a release note, but a large performance improvement may warrant
+one if it results in a noticeable improvement for a large class of users or
+unlocks new use cases for Materialize. Examples of performance improvements
+that warrant a release note include:
+
+  * Improving the speed of Avro decoding by 2x
+  * Converting an O(n<sup>2</sup>) algorithm in the optimizer to an O(n)
+    algorithm so that queries with several dozen `UNION` operations can be
+    planned in a reasonable amount of time
+
+# How to write a good release note
+
+Every release note should be phrased in the imperative mood, like a Git
+commit message. They should complete the sentence, "This release will...".
+
+Good release notes:
+
+  - [This release will...] Require the `-w` / `--workers` command-line option.
+  - [This release will...] In the event of a crash, print the stack trace.
+
+Misbehaved release notes:
+
+  - Users must now specify the `-w` / `-threads` command line option.
+  - Materialize will print a stack trace if it crashes.
+  - Instead of limiting SQL statements to 8KiB, limit them to 1024KiB instead.
+
+Link to at least one page where users can learn more about either the change or
+the area which the change was made. Notes about new features can be concise if
+the new feature has comprehensive documentation. Notes about changes to features
+must be more detailed, as the note is likely the only documentation of the
+change in behavior. Consider linking to a GitHub issue or pull request via the
+`gh` shortcode if there is no good section of the documentation to link to.
+
+Strive for some variety of verbs. "Support new feature" gets boring as a release
+note.
+
+Use relative links (/path/to/doc), not absolute links
+(https://materialize.com/docs/path/to/doc).
+
+Wrap your release notes at the 80 character mark.
+
+## Internal note order
+
+Put breaking changes before other release notes, and mark them with
+`**Breaking change.**` at the start.
+
+List new features before bug fixes.
+
 {{< /comment >}}
 
-{{% version-header v0.25.0 %}}
+## Unstable
 
-- Fix `base64` decoding to support numerals in encoded strings. Previously, if the encoded string contained a numeral, decoding would fail.
+These changes are present in [unstable builds](/versions/#unstable-builds) and
+are slated for inclusion in the next stable release. There may be additional
+changes that have not yet been documented.
 
-- Fix a panic that would occur if an object or type was over-qualified (i.e., the fully qualified object name consisted of more than three identifiers separated by a `.`).
-
-{{% version-header v0.24.0 %}}
-
-- Restore the documented behavior of the
-  [`--differential-idle-merge-effort`](/cli/#dataflow-tuning)
-  and [`--timely-progress-mode`](/cli/#dataflow-tuning)
-  command line flags {{% gh 11256 %}}.
-
-  Due to a bug, these parameters were silently ignored between v0.9.13
-  and v0.23.0.
-
-- Fix a bug where a statement descriptor could change before execution,
-  resulting in an error or a crash {{% gh 11214 11258 %}}.
-
-- Limit the views in the [`pg_catalog`](/sql/system-catalog#pg_catalog) schema
-  to reflect the state of only the current database {{% gh 11292 %}}. The new
-  behavior matches PostgreSQL.
-
-{{% version-header v0.23.0 %}}
-
-- **Breaking change.** Change the default [listen address](/cli/#listen-address)
-  to `127.0.0.1:6875`.
-
-  Previously, Materialize would accept HTTP and SQL connections from any machine
-  on the network by default; now it accepts HTTP and SQL connections from only
-  the local machine by default. To return to the old behavior, specify the
-  command line flag `--listen-addr=0.0.0.0:6875`.
-
-  The `materialized` [Docker image](/install/#docker) continues to use a
-  listen address of `0.0.0.0:6875` by default.
-
-- Improve PostgreSQL compatibility:
-
-  - Add the `pg_collation`, `pg_inherits`, and `pg_policy` relations to the
-    [`pg_catalog`](/sql/system-catalog#pg_catalog) schema.
-
-  - Add several columns to the existing `pg_attribute`, `pg_class`, `pg_index`,
-    and `pg_type` relations in the
-    [`pg_catalog`](/sql/system-catalog#pg_catalog) schema.
-
-  - Add the [`pg_get_indexdef`](/sql/functions/#pg_get_indexdef) function.
-
-  - Change the [`pg_get_constraintdef`](/sql/functions/#pg_get_constraintdef)
-    function to always return `NULL` instead of raising an error.
-
-  - Add a `USING <method>` clause to [`CREATE INDEX`], with
-    [`arrangement`](/overview/arrangements) as the only valid method.
-
-  Together these changes enable support for [Apache Superset] and the
-  `\d <object>` command in the  [psql terminal](/connect/cli).
-
-- Support calling [`date_trunc`](/sql/functions/#date_trunc) with
-  [`interval`](/sql/types/interval) values {{% gh 9871 %}}.
-
-- Remove the mandatory default index on [tables](/sql/create-table/#memory-usage).
-
-- Fix a crash when calling [`array_to_string`](/sql/functions/#array_to_string)
-  with an empty array {{% gh 11073 %}}.
-
-- Fix an error when calling [`string_agg`](/sql/functions/#string_agg) with
-  all `NULL` inputs {{% gh 11139 %}}.
-
-- Include information about the experimental
-  [cluster feature](/overview/api-components/#clusters) in
-  [`SHOW INDEX`](/sql/show-index) and [`SHOW SINKS`](/sql/show-sinks).
-
-- Improve recovery of [Postgres sources](/sql/create-source/postgres) when
-  errors occur during initial data loading {{% gh 10938 %}}.
-
-- Make [`CREATE VIEWS`](/sql/create-views) on a [Postgres
-  source](/sql/create-source/postgres) resilient to changes to the upstream
-  publication that are made after the the source is created. {{% gh 11083 %}}
-
-{{% version-header v0.22.0 %}}
-
-- **Breaking change.** Standardize handling of the following [unmaterializable
-  functions](/sql/functions/#unmaterializable-functions) {{% gh 10445 %}}:
-
-  - `current_database`
-  - `current_timestamp`
-  - `current_role`
-  - `current_schema`
-  - `current_schemas`
-  - `current_user`
-  - `mz_cluster_id`
-  - `mz_logical_timestamp`
-  - `mz_uptime`
-  - `mz_version`
-  - `session_user`
-  - `pg_backend_pid`
-  - `pg_postmaster_start_time`
-  - `version`
-
-  Materialize now allows use of unmaterializable functions in views, but will
-  refuse to create an index that directly or indirectly depends on a
-  unmaterializable function. The one exception is [`mz_logical_timestamp`],
-  which can be used in limited contexts in a materialized view as a [temporal
-  filter](/guides/temporal-filters).
-
-  Previously `current_timestamp`, `mz_logical_timestamp`, and `mz_uptime` were
-  incorrectly disallowed in unmaterialized views, while the remaining
-  unmaterializable functions were incorrectly allowed in materialized views.
-
-- **Breaking change.** Store days separately in [`interval`]. Unlike in previous
-  versions, hours are not automatically converted to days. This means that: an
-  interval of 24 hours will not be equal to an interval of 1 day, you cannot
-  subtract hours from days, and when ordering intervals `d days > h hours` for
-  all `d` and `h` {{% gh 10708 %}}.
-
-  To force a conversion from hours to days, use the new
-  [`justify_hours`](/sql/functions/justify-hours) function.
-
-- **Breaking change.** Print all negative [`interval`] units as plural (e.g.,
-  `-1 days` will be printed instead of `-1 day`). This matches the behavior of
-  PostgreSQL.
-
-- **Breaking change.** Round microsecond field of [`interval`] to 6 places
-  before applying the given precision. For example `INTERVAL '1.2345649'
-  SECOND(5)` will be rounded to `00:00:01.23457`, not `00:00:01.23456`. This
-  matches the behavior of PostgreSQL.
-
-- Add several new time units to [`interval`](/sql/types/interval) parsing:
-  `yr`, `yrs`, `hr`, `hrs`, `min`, `mins`, `sec`, and `secs`.
-
-  Thanks to external contributor [@sunisdown](https://github.com/sunisdown).
-
-- Add the [`justify_days`](/sql/functions/justify-days),
-  [`justify_hours`](/sql/functions/justify-hours),
-  and [`justify_interval`](/sql/functions/justify-interval) functions.
-
-- Add support for [named composite types](/sql/create-type/#custom-row-type).
-  Unimplemented features are listed in the original issue {{% gh 10734 %}}.
-
-- Change the range of the [`oid`] type from [-2<sup>31</sup>, 2<sup>31</sup> - 1]
-  to [0, 2<sup>32</sup> - 1] to match PostgreSQL.
-
-- Change the claimed PostgreSQL version returned by the
-  [`version()`](/sql/functions#system-information-func) function to 9.5 to
-  match the values of the `server_version` and `server_version_num` session
-  parameters.
-
-- In Kafka sources that use `INCLUDE KEY`, allow the key schema to be directly
-  provided by the Confluent Schema Registry using the bare `FORMAT` syntax:
-
-  ```sql
-  CREATE SOURCE src
-  FROM KAFKA BROKER '...' TOPIC '...'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '...'
-  INCLUDE KEY AS named;
-  ```
-
-  Previously, this required explicitly using the `KEY FORMAT ... VALUE FORMAT`
-  syntax when _also_ using the Confluent Schema Registry.
-
-- Allow specifying the same [command line flag](/cli/) multiple times. The last
-  specification takes precedence. This matches the behavior of many standard
-  Unix tools and is particularly useful for folks using `materialized` via
-  Docker, as it allows overwriting the default `--log-file` option.
-
-- Fix a panic that could occur if you rematerialized a source that had
-  previously been materialized under a different name, e.g. via the following
-  sequence of operations {{% gh 10904 %}}:
-
-  - `CREATE SOURCE src ...;`
-  - `CREATE INDEX src_idx ON src ...;`
-  - `ALTER src RENAME TO new_src;`
-  - `DROP INDEX src_idx;`
-  - `CREATE INDEX new_src_idx ON new_src ...;`
-
-- Fix a data loss bug in [Postgres sources] introduced in v0.20.0 {{% gh 10981 %}}.
-
-{{% version-header v0.21.0 %}}
-
-- **Breaking change.** Return an empty list for slice operations that yield no
-  elements (e.g., when the beginning of the slice's range exceeds the length of
-  the list); previously these operations returned `NULL` {{% gh 10557 %}}.
-
-- **Breaking change.** Decrease the minimum [`interval`] value from `-2147483647
-  months -2147483647 days -2147483647 hours -59 minutes -59.999999 seconds` to
-  `-2147483648 months -2147483648 days -2147483648 hours -59 minutes -59.999999
-  seconds` to match PostgreSQL {{% gh 10598 %}}.
-
-- Support sequences of subscript operations on [`array`] values when
-  indexing/accessing individual elements (as opposed to slicing/accessing ranges
-  of elements) {{% gh 9815 %}}.
-
-- Allow setting the `standard_conforming_strings` session parameter to its
-  default value of `on` {{% gh 10691 %}}. Setting it to `off` remains
-  unsupported.
-
-- Allow setting the `client_min_messages` session parameter, which controls
-  which messages are sent to the client based on the severity level
-  {{% gh 10693 %}}.
-
-- Improve the clarity of schema resolution errors generated by Avro-formatted
-  sources {{% gh 8415 %}}.
-
-- Add the [`chr`](/sql/functions#string-func) function to convert a Unicode
-  codepoint into a string.
-
-- Change inclusive ranges of column indices in the plans generated by
-  [`EXPLAIN`](/sql/explain) to use `..=` instead of `..`.
-
-- Support the `ARRAY(<subquery>)` expression for constructing an [`array`]
-  from the result of a subquery {{% gh 10700 %}}.
-
-- In Kafka sources that use `ENVELOPE UPSERT`, fix renaming the key column via
-  [`INCLUDE KEY AS`](/sql/create-source/kafka#key) {{% gh 10730 %}}.
-
-- Return the correct number of columns when both a wildcard (`*`) and a [table
-  function](/sql/functions#table-func) appear in the `SELECT` list
-  {{% gh 10363 %}}.
-
-- Avoid panicking when negating certain intervals {{% gh 10729 %}}.
-
-- Fix an issue in Avro-formatted sources where an invalid record could corrupt
-  the next record, yielding either wrong results or a panic {{% gh 10767 %}}.
-
-{{% version-header v0.20.0 %}}
-
-- **Breaking change.** In Kafka sources and sinks, do not default the SSL
-  parameters for the Confluent Schema Registry to the SSL parameters for the
-  Kafka broker.
-
-  SSL parameters for the Confluent Schema Registry must now always be provided
-  explicitly, even when they are identical to the SSL parameters for the Kafka
-  broker. See the [Confluent Schema Registry options](/sql/create-source/kafka/#confluent-schema-registry-ssl-with-options)
-  for details.
-
-  Existing source definitions have been automatically migrated to account for
-  the new behavior.
-
-- **Breaking change.** Change the return type of the
-  [`extract`](/sql/functions/extract/) function from [`float`](/sql/types/float/)
-  to [`numeric`](/sql/types/numeric/) {{% gh 9853 %}}.
-
-  The new behavior matches PostgreSQL v14.
-
-- **Breaking change.** Return an error when [`extract`](/sql/functions/extract/)
-  is called with a [`date`] value but a time-related field (e.g., `SECOND`)
-  {{% gh 9853 %}}.
-
-  Previous versions of Materialize would incorrectly return `0` in these cases.
-  The new behavior matches PostgreSQL.
-
-  [`date_part`](/sql/functions/date-part/) still returns a `0` in these cases,
-  which matches the PostgreSQL behavior.
-
-- **Breaking change.** Change the output of
-  [`format_type`](/sql/functions/#system-information-func) to use SQL standard
-  type names when possible, rather than PostgreSQL-specific type names.
-
-- Support assuming AWS roles in S3 and Kinesis sources {{% gh 5895 %}}. See
-  [Specifying AWS credentials](/sql/create-source/kinesis/#aws-credentials)
-  for details.
-
-- Support arbitrary `SELECT` statements in [`TAIL`](/sql/tail).
-
-  Previously, `TAIL` could only operate on sources, tables, and views.
-
-- Add the [`greatest`](/sql/functions/#generic-func) and [`least`](/sql/functions/#generic-func)
-  functions.
-
-- Add the [`radians`](/sql/functions/#trigonometric-func) and
-  [`degrees`](/sql/functions/#trigonometric-func) functions.
-
-- Add the inverse [trigonometric functions](/sql/functions/#trigonometric-func)
-  `asin`, `asinh`, `acos`, `acosh`, `atan`, `atanh`.
-
-- Add the [cryptography functions](/sql/functions/#cryptography-func) `md5`,
-  `sha224`, `sha256`, `sha384`, and `sha512`.
-
-- Add `microsecond`, `month`, `decade`, `century`, `millennium` units to
-  [`interval`] parsing using the PostgreSQL verbose format.
-
-- Improve millisecond parsing for [`interval`] using the PostgreSQL verbose
-  format {{% gh 6420 %}}.
-
-- Support casting [`array`] types to [`list`] types.
-
-- Follow PostgreSQL's type conversion rules for the relations involved in a
-  `UNION`, `EXCEPT`, or `INTERSECT` operation {{% gh 3331 %}}.
-
-- Correctly deduplicate Debezium-enveloped Kafka sources when the underlying
-  Kafka topic has more than one partition {{% gh 10375 %}}. Previous versions of
-  Materialize would lose data unless the `deduplication = 'full'` option was
-  specified.
-
-- Improve the performance of SQL `LIKE` expressions.
-
-{{% version-header v0.19.0 %}}
-
-- **Breaking change.** Reject unknown `WITH` options in the [`CONFLUENT SCHEMA
-  REGISTRY` clause](/sql/create-source/kafka#confluent-schema-registry-ssl-with-options)
-  when creating a Kafka source or sink {{% gh 10129 %}}.
-
-  Previously, unknown options were silently ignored. The new behavior matches
-  with how other clauses handle unknown `WITH` options.
-
-- **Breaking change.** Fix interpretation of certain [`interval`] values
-  involving time expressions with two components (e.g., `12:34`) {{% gh 7918
-  %}}.
-
-  Previous versions of Materialize would assume the interval's head time unit
-  to always be hours. The new behavior matches PostgreSQL.
-
-- **Breaking change.** Drop support for the `consistency_topic` option when
-  creating a source with `ENVELOPE DEBEZIUM`. This was an undocumented option
-  that is no longer relevant.
-
-- Fix planning of repeat constant expressions in a `GROUP BY` clause
-  {{% gh 8302 %}}.
-
-- Support calling multiple distinct [table functions](/sql/functions/#table-func)
-  in the `SELECT` list, as long as those table functions are not nested inside
-  other table functions {{% gh 9988 %}}.
-
-{{% version-header v0.18.0 %}}
-
-- **Breaking change.** Further improve consistency with PostgreSQL's column name
-  inference rules:
-
-    * When inferring a column name for a nested cast expression, prefer the
-      name of the outermost cast rather than the innermost cast {{% gh 10167 %}}.
-
-      Consider the following query:
-
-      ```sql
-      SELECT 'a'::int::text;
-      ```
-
-      This version of Materialize will infer the column name `text`, while
-      previous versions of Materialize would incorrectly infer the name `int4`.
-
-    * Infer the name `case` for `CASE` expressions unless column name inference
-      on the `ELSE` expression produces a preferred name.
-
-- When creating Avro-formatted sinks, allow setting fullnames on the
-  generated key and value schemas via the new
-  [`avro_key_fullname`](/sql/create-sink#with-options) and
-  [`avro_value_fullname`](/sql/create-sink#with-options) options {{% gh 8352 %}}.
-
-- Detect and reject multiple materializations of sources that would silently
-  lose data if materialized more than once {{% gh 8203 %}}.
-
-  This enables safe use of unmaterialized [PostgreSQL
-  sources](/sql/create-source/postgres)
-  and [S3 sources](/sql/create-source/json-s3)
-  with SQS notifications enabled.
-
-- Support `SHOW TIME ZONE` as an alias for `SHOW TIMEZONE` {{% gh 9908 %}}.
-
-- Fix a bug in the `ILIKE` operator where matching against a `char` value did
-  not take trailing spaces into account {{% gh 10076 %}}. The new behavior
-  matches the behavior of the `LIKE` operator.
-
-- Allow wildcards in `LIKE` patterns to match newline characters
-  {{% gh 10077 %}}. The new behavior matches PostgreSQL.
-
-- Fix parsing of nested empty `SELECT` statements, as in
-  `SELECT * FROM (SELECT)` {{% gh 8723 %}}.
-
-{{% version-header v0.17.0 %}}
-
-- **Breaking change.** Improve consistency with PostgreSQL's column name
-  inference rules:
-
-    * When inferring a column name for a cast expression, fall back
-      to choosing the name of the target type.
-
-      Consider the following query:
-
-      ```sql
-      SELECT 'a'::text;
-      ```
-
-      This version of Materialize will infer the column name `text`, while
-      previous versions of Materialize would fall back to the default column
-      name `?column?`.
-
-    * When inferring a column name for a [`boolean`] or [`interval`] literal,
-      fall back to choosing `bool` or `interval`, respectively.
-
-- Support [subscripting `jsonb` values](/sql/types/jsonb/#subscripting) to
-  retrieve array elements or object values, as in:
-
-  ```sql
-  SELECT ('{"a": 1, "b": 2, "c": 3}'::jsonb)['b'];
-  ```
-  ```nofmt
-   jsonb
-  -------
-   2
-  ```
-
-- In Kafka sources and sinks, support independent SSL configurations for the Confluent
-  Schema Registry and the Kafka broker. See the new
-  [Confluent Schema Registry options](/sql/create-source/kafka#confluent-schema-registry-ssl-with-options)
-  for details.
-
-- Fix a bug where using a `ROWS FROM` clause with an alias in a view would cause
-  Materialize to fail to reboot {{% gh 10008 %}}.
-
-- When initializing a [PostgreSQL source](/sql/create-source/postgres), report
-  an error if the configured publication does not exist {{% gh 9933 %}}.
-  Previously, Materialize would silently import zero tables.
-
-{{% version-header v0.16.0 %}}
-
-- **Breaking change.** Return an error when [`extract`](/sql/functions/extract/)
-  is called with a [`time`] value but a date-related field (e.g., `YEAR`)
-  {{% gh 9839 %}}.
-
-  Previous versions of Materialize would incorrectly return `0` in these cases.
-  The new behavior matches PostgreSQL.
-
-- **Breaking change.** Disallow the string `'sNaN'` (in any casing) as a valid
-  [`numeric`] value.
-
-- Add the [`array_remove`](https://materialize.com/docs/sql/functions/#array-func)
-  and [`list_remove`](https://materialize.com/docs/sql/functions/#list-func)
-  functions.
-
-- Support the special PostgreSQL syntax
-  [`SET NAMES` and `SET SCHEMA`](https://www.postgresql.org/docs/14/sql-set.html#id-1.9.3.173.6)
-  for setting the `client_encoding` and `search_path` parameters, respectively.
-
-- Fix a crash when a condition of a `CASE` statement evaluates to an error. {{% gh 9995 %}}
-
-- Fix a crash in the optimizer when the branches of a `CASE` statement involved
-  record types whose fields had differing nullability {{% gh 9931 %}}.
-
-
-{{% version-header v0.15.0 %}}
+- Fix a problem when connecting with Npgsql 6 {{% gh 9751 %}}.
 
 - **Breaking change.** Disallow window functions outside of `SELECT`
-  lists, `DISTINCT ON` clauses, and `ORDER BY` clauses {{% gh 9749 %}}.
+  lists, `DISTINCT ON` clauses, and `ORDER BY` clauses.
 
-  Window functions in other positions were never meant to be allowed and do not
-  have sensible semantics, so there is no replacement for the old behavior.
+- **Breaking change.** Return an error when [`extract`](/sql/functions/extract/)
+  is called with a [`time`] value but a date-related field (e.g., `YEAR`).
 
-- Improve timestamp selection when the first statement in a transaction does not
-  reference any sources {{% gh 9751 %}}.
+  Previous versions of Materialize would incorrectly return `0` in these cases.
+  The new behavior matches PostgreSQL.
 
-  This facilitates using [Npgsql](https://www.npgsql.org) v6 to connect to
-  Materialize.
+{{< comment >}}
+Only add new release notes above this line.
 
-- Permit passing the `fetch_message_max_bytes` librdkafka option to
-  [Kafka sources](/sql/create-source/kafka#with-options).
+The presence of this comment ensures that PRs that are alive across a release
+boundary don't silently merge their release notes into the wrong place.
+{{</ comment >}}
 
 {{% version-header v0.14.0 %}}
 
@@ -483,7 +134,7 @@ process by the release notes team.
   name:
 
   ```sql
-  CREATE VIEW view AS SELECT 1, 2;
+  CREATE VIEW view AS SELECT 1, 2
   ```
 
   To make this view compatible with v0.14.0, adjust it view to have at most one
@@ -497,7 +148,7 @@ process by the release notes team.
   [`jsonb`](/sql/types/jsonb) {{% gh 5919 9669 %}}. Previously, JSON numbers
   were stored as either [`int8`](/sql/types/int8) or
   [`float8`](/sql/types/float8) values; now they are always stored as
-  [`numeric`] values.
+  [`numeric`](/sql/types/numeric) values.
 
   The upshot is that the `jsonb` type has a wider range for integers but a
   smaller range for floats. We expect this to cause very little practical
@@ -508,7 +159,7 @@ process by the release notes team.
   because `t1.a` does not appear in the `GROUP BY` clause:
 
   ```sql
-  SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t2.a;
+  SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t2.a
   ```
 
   Previous versions of Materialize permitted this query by noticing that the
@@ -519,7 +170,7 @@ process by the release notes team.
   BY` clause and the `SELECT` list:
 
   ```sql
-  SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a;
+  SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a
   ```
 
 - **Breaking change.** When using an arbitrary expression in an `ORDER BY` or
@@ -607,7 +258,7 @@ Improve PostgreSQL compatibility:
   function.
 
 - Avoid crashing when executing certain queries involving the
-  [`mz_logical_timestamp`] function
+  [`mz_logical_timestamp`](/sql/functions/#date-and-time-func) function
   {{% gh 9504 %}}.
 
 {{% version-header v0.11.0 %}}
@@ -644,10 +295,10 @@ Improve PostgreSQL compatibility:
 - Speed up the creation or restart of a [Kafka sink](/sql/create-sink/)
   that uses the `reuse_topic` option {{% gh 9094 %}}.
 
-- Accept message names in Protobuf sources that do not start with a leading
+- Accept message names in [Protobuf sources] that do not start with a leading
   dot {{% gh 9372 %}}. This fixes a regression introduced in v0.9.12.
 
-- Fix decoding of Protobuf sources whose type contains a nested message type
+- Fix decoding of [Protobuf sources] whose type contains a nested message type
   with one or more integer fields {{% gh 8930 %}}. These messages could
   cause previous versions of Materialize to crash.
 
@@ -655,8 +306,8 @@ Improve PostgreSQL compatibility:
   of our intermediate representations. These queries now report an internal
   error of the form "exceeded recursion limit of {X}".
 
-- Correctly autogenerate views from [Postgres sources] during [`CREATE
-  VIEWS`](/sql/create-source/postgres/#creating-replication-views) when the upstream table
+- Correctly autogenerate views from Postgres sources during [`CREATE
+  VIEWS`](/sql/create-source/postgres/#creating-views) when the upstream table
   contains numeric columns with no specified scale and precision {{% gh 9268
   %}}.
 
@@ -687,7 +338,7 @@ Improve PostgreSQL compatibility:
 - **Breaking change.** Disallow `SELECT DISTINCT` when applied to a 0-column
   relation, like a table with no columns {{% gh 9122 %}}.
 
-- Allow creating [Avro-formatted sources](/sql/create-source/kafka/#supported-formats)
+- Allow creating [Avro-formatted sources](/sql/create-source/avro-kafka/#avro-format-details)
   from Avro schemas whose top-level type is not a record.
 
 - Support invoking a single [table function](/sql/functions/#table-func) in a
@@ -712,7 +363,7 @@ Improve PostgreSQL compatibility:
 
 {{% version-header v0.9.12 %}}
 
-- **Known issue.** Message names in Protobuf sources that do not start with a
+- **Known issue.** Message names in [Protobuf sources] that do not start with a
   leading dot are erroneously rejected. As a workaround, add a leading dot to
   the message name. This regression is corrected in v0.11.0.
 
@@ -918,7 +569,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 
 {{% version-header v0.9.0 %}}
 
-- **Breaking change.** Reject Protobuf sources whose schemas contain
+- **Breaking change.** Reject [Protobuf sources] whose schemas contain
   unsigned integer types (`uint32`, `uint64`, `fixed32`, and `fixed64`).
   Materialize previously converted these types to
   [`numeric`](/sql/types/numeric).
@@ -933,7 +584,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 - Respect the [`no_proxy` environment variable](/cli/#http-proxies) to exclude
   certain hosts from the configured HTTP/HTTPS proxy, if any.
 
-- Add [`reuse_topic`](/sql/create-sink/#exactly-once-sinks-with-topic-reuse-after-restart) as
+- Add [`reuse_topic`](/sql/create-sink/#enabling-topic-reuse-after-restart-exactly-once-sinks) as
   a beta feature for Kafka Sinks. This allows re-using the output topic across
   restarts of Materialize.
 
@@ -962,11 +613,11 @@ a problem with PostgreSQL JDBC 42.3.0.
 
 {{% version-header v0.8.2 %}}
 
-- Stabilized [Postgres sources] (no longer require
+- Stabilized [postgres sources](/sql/create-source/postgres) (no longer require
   `--experimental`)
 
 - **Breaking change.** `HOST` keyword when creating
-  [Postgres sources] has been renamed to
+  [postgres sources](/sql/create-source/postgres/#syntax) has been renamed to
   `CONNECTION`.
 
 - Record the initial high watermark offset on the broker for Kafka sources. This
@@ -983,11 +634,11 @@ a problem with PostgreSQL JDBC 42.3.0.
   [CDC](/connect/materialize-cdc) and Debezium consistency topic sources
   by default.
 
-- Add the [`isolation_level`](/sql/create-source/kafka#with-options)
+- Add the [`isolation_level`](/sql/create-source/avro-kafka/#with-options)
   `WITH` option to Kafka sources to allow changing read behavior of
   transactionally written messages.
 
-- Add the [`kafka_time_offset`](/sql/create-source/kafka#with-options)
+- Add the [`kafka_time_offset`](/sql/create-source/avro-kafka/#with-options)
   `WITH` option for Kafka sources, which allows to set `start_offset` based on
   Kafka timestamps.
 
@@ -1007,7 +658,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 - Add the [`current_role`](/sql/functions/#system-information-func) system
   information function.
 
-- Support manually declaring a [`(non-enforced) primary key`](/sql/create-source/kafka/#defining-primary-keys)
+- Support manually declaring a [`(non-enforced) primary key`](/sql/create-source/avro-kafka/#key-constraint-details)
   on sources.
 
 - S3 sources retry failed requests to list buckets and download objects.
@@ -1099,7 +750,7 @@ a problem with PostgreSQL JDBC 42.3.0.
   reference {{% gh 6021 %}}.
 
 - Support Kafka log compaction on Debezium topics via the [`DEBEZIUM
-  UPSERT`](/sql/create-source/kafka/#using-debezium) source envelope.
+  UPSERT`](/sql/create-source/avro-kafka/#debezium-envelope-details) source envelope.
 
 {{% version-header v0.7.1 %}}
 
@@ -1145,7 +796,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 - Restore the `-D` command-line option as the short form of the
   [`--data-directory`](/cli/#data-directory) option.
 
-- Allow setting [index parameters](/sql/create-index/#with-options) when
+- Allow setting [index parameters](/sql/alter-index/#available-parameters) when
   creating an index via the new `WITH` clause to [`CREATE INDEX`]. In older
   versions, setting these parameters required a separate call to [`ALTER
   INDEX`](/sql/alter-index).
@@ -1226,7 +877,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 
 - Support [multi-partition](/sql/create-sink/#with-options) Kafka sinks {{% gh 5537 %}}.
 
-- Support [gzip-compressed](/sql/create-source/file/#compression) file sources {{% gh 5392 %}}.
+- Support [gzip-compressed](/sql/create-source/text-file/#compression) file sources {{% gh 5392 %}}.
 
 {{% version-header v0.6.1 %}}
 
@@ -1247,7 +898,7 @@ a problem with PostgreSQL JDBC 42.3.0.
   To maintain the old behavior, explicitly set the timeout to `0s`, as in:
 
   ```sql
-  FETCH ... WITH (timeout = '0s');
+  FETCH ... WITH (timeout = '0s')
   ```
 
 - **Backwards-incompatible change.** Consider the following keywords to be fully
@@ -1293,14 +944,15 @@ a problem with PostgreSQL JDBC 42.3.0.
 
   - Allow specifying units of `microseconds`, `milliseconds`, `month`,
     `quarter`, `decade`, `century`, or `millenium` when applying the `EXTRACT`
-    function to an [`interval`] {{% gh 5107 %}}. Previously these units were
-    only supported with the [`timestamp`](/sql/types/timestamp) and
-    [`timestamptz`](/sql/types/timestamptz) types.
+    function to an [`interval`](/sql/types/interval) {{% gh 5107 %}}. Previously
+    these units were only supported with the [`timestamp`](/sql/types/timestamp)
+    and [`timestamptz`](/sql/types/timestamptz) types.
 
     Thanks again to external contributor
     [@zRedShift](https://github.com/zRedShift).
 
-  - Support multiplying and dividing [`interval`]s by numbers {{% gh 5107 %}}.
+  - Support multiplying and dividing [`interval`](/sql/types/interval)s by
+    numbers {{% gh 5107 %}}.
 
     Thanks once more to external contributor
     [@zRedShift](https://github.com/zRedShift).
@@ -1593,7 +1245,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 {{% version-header v0.4.3 %}}
 
 - Permit adjusting the logical compaction window on a per-index basis via the
-  [`logical_compaction_window`](/sql/alter-index/#setreset-options)
+  [`logical_compaction_window`](/sql/alter-index/#available-parameters)
   parameter to the new [`ALTER INDEX`](/sql/alter-index) statement.
 
 - Add the [`uuid`](/sql/types/uuid) type to efficiently represent
@@ -1609,7 +1261,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 {{% version-header v0.4.2 %}}
 
 - Remove the `max_timestamp_batch_size` [`WITH`
-  option](/sql/create-source/kafka#with-options) from sources. Materialize
+  option](/sql/create-source/avro-kafka/#with-options) from sources. Materialize
   now automatically selects the optimal batch size. **Backwards-incompatible
   change.**
 
@@ -1629,7 +1281,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 
   - Consume only a constant amount of memory when computing a
     [`min` or `max` aggregation](/sql/functions/#aggregate-func)
-    on an append-only source
+    on an [append-only source](/sql/create-source/avro-kafka/#append-only-envelope)
     {{% gh 3994 %}}.
 
 - Always permit memory profiling via the `/prof` web UI, even if the
@@ -1648,7 +1300,7 @@ a problem with PostgreSQL JDBC 42.3.0.
   [Kafka sources](/sql/create-source/avro-kafka/), as in
 
   ```sql
-  CREATE SOURCE ... FROM KAFKA BROKER 'host1:9092,host2:9092' ...;
+  CREATE SOURCE ... FROM KAFKA BROKER 'host1:9092,host2:9092' ...
   ```
 
   is incorrectly prohibited in this version. This change was unintentional and
@@ -1671,7 +1323,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 
   - Handle Snappy-encoded [Avro OCF files](/sql/create-source/avro-file/).
 
-  - In [Avro sources that use the Debezium envelope](/sql/create-source/kafka/#using-debezium),
+  - In [Avro sources that use the Debezium envelope](/sql/create-source/avro-kafka/#debezium-envelope-details),
     automatically filter out duplicate records generated by Debezium's
     PostgreSQL connector.
 
@@ -1699,14 +1351,14 @@ a problem with PostgreSQL JDBC 42.3.0.
     `SELECT` list that are formed from arbitrary expressions, as in:
 
     ```sql
-    SELECT a + 1, sum(b) FROM ... GROUP BY 1;
+    SELECT a + 1, sum(b) FROM ... GROUP BY 1
     ```
 
     Previously, Materialize only handled ordinal references to items that were
     simple column references, as in:
 
     ```sql
-    SELECT a, sum(b) FROM ... GROUP BY 1;
+    SELECT a, sum(b) FROM ... GROUP BY 1
     ```
 
 - Fix two PostgreSQL compatibility issues:
@@ -1727,12 +1379,12 @@ a problem with PostgreSQL JDBC 42.3.0.
   **Backwards-incompatible change.**
 
 - Add the `--experimental` command-line option to enable a new [experimental
-  mode], which grants access to experimental features
+  mode](/cli/#experimental-mode), which grants access to experimental features
   at the risk of compromising stability and backwards compatibility. Forthcoming
   features that require experimental mode will be marked as such in their
   documentation.
 
-- Support [SASL PLAIN authentication for Kafka sources](/sql/create-source/kafka/#sasl).
+- Support [SASL PLAIN authentication for Kafka sources](/sql/create-source/avro-kafka/#connecting-to-a-kafka-broker-using-sasl-authentication).
   Notably, this allows Materialize to connect to Kafka clusters hosted by
   Confluent Cloud.
 
@@ -1828,7 +1480,7 @@ a problem with PostgreSQL JDBC 42.3.0.
   created if you had used [`CREATE MATERIALIZED VIEW`].
 
 - Permit control over the timestamp selection logic on a per-Kafka-source basis
-  via three new [`WITH` options](https://materialize.com/docs/sql/create-source/kafka#with-options):
+  via three new [`WITH` options](https://materialize.com/docs/sql/create-source/avro-kafka/#with-options):
     - `timestamp_frequency_ms`
     - `max_timestamp_batch_size`
     - `topic_metadata_refresh_interval_ms`
@@ -1837,7 +1489,7 @@ a problem with PostgreSQL JDBC 42.3.0.
   in a `SELECT` query, as in:
 
   ```sql
-  SELECT col1_alias, col2_alias FROM rel AS rel_alias (col1_alias, col2_alias);
+  SELECT col1_alias, col2_alias FROM rel AS rel_alias (col1_alias, col2_alias)
   ```
 
 - Add the [`abs`](/sql/functions/#numbers-func) function for the
@@ -1892,14 +1544,14 @@ a problem with PostgreSQL JDBC 42.3.0.
   across the partitions.
 
 - Infer primary keys based on the key schema for [Kafka Avro sources that use
-  the Debezium envelope](/sql/create-source/kafka/#using-debezium)
+  the Debezium envelope](/sql/create-source/avro-kafka/#debezium-envelope-details)
   to facilitate query optimization. This corrects a regression
   in v0.2.2.
 
-  The new [`ignore_source_keys` option](/sql/create-source/kafka#with-options)
+  The new [`ignore_source_keys` option](/sql/create-source/avro-kafka/#with-options)
   can be set to `true` to explicitly disable this behavior.
 
-- In [Avro sources that use the Debezium envelope](/sql/create-source/kafka/#using-debezium),
+- In [Avro sources that use the Debezium envelope](/sql/create-source/avro-kafka/#debezium-envelope-details),
   automatically filter out duplicate records generated by Debezium's MySQL
   connector.
 
@@ -1907,7 +1559,7 @@ a problem with PostgreSQL JDBC 42.3.0.
   other Debezium connectors (e.g., PostgreSQL).
 
 - Automatically refresh
-  [AWS credentials for Kinesis sources](/sql/create-source/kinesis/#aws-credentials)
+  [AWS credentials for Kinesis sources](/sql/create-source/json-kinesis/#with-options)
   when credentials are sourced from an IAM instance or container profile
   {{% gh 2928 %}}.
 
@@ -1935,12 +1587,12 @@ a problem with PostgreSQL JDBC 42.3.0.
 
 - Introduce an "upsert" envelope for sources that follow the Kafka key–value
   convention for representing inserts, upserts, and deletes. See the [Upsert
-  envelope](/sql/create-source/kafka/#handling-upserts) section of
+  envelope](/sql/create-source/avro-kafka/#upsert-envelope-details) section of
   the `CREATE SOURCE` docs for details.
 
 - Enable connections to Kafka brokers using either
-  [SSL authentication](/sql/create-source/kafka/#ssl)
-  or [Kerberos authentication](/sql/create-source/kafka/#saslgssapi-kerberos).
+  [SSL authentication](/sql/create-source/avro-kafka/#ssl-encrypted-kafka-details)
+  or [Kerberos authentication](/sql/create-source/avro-kafka/#kerberized-kafka-details).
   This includes support for SSL authentication with Confluent Schema Registries.
 
 - Introduce the [`AS OF`](/sql/tail/#as-of) and
@@ -1954,7 +1606,7 @@ a problem with PostgreSQL JDBC 42.3.0.
   partitions evenly, rather than processing partitions sequentially, one after
   the next. {{% gh 2936 %}}
 
-- Add two [`WITH` options](/sql/create-source/kafka#with-options)
+- Add two [`WITH` options](/sql/create-source/avro-kafka/#with-options)
   to Kafka sources:
   - The `group_id_prefix` option affords some control over the consumer group
     ID Materialize uses when consuming from Kafka.
@@ -2008,7 +1660,7 @@ a problem with PostgreSQL JDBC 42.3.0.
   - [SHOW COLUMNS](/sql/show-index)
 
 - Support reading from Kinesis streams with multiple shards. For details, about
-  Kinesis sources, see [CREATE SOURCE: Kinesis Data Streams](/sql/create-source/kinesis).
+  Kinesis sources, see [CREATE SOURCE: JSON over Kinesis](/sql/create-source/json-kinesis).
 
 {{% version-header v0.2.0 %}}
 
@@ -2024,11 +1676,11 @@ a problem with PostgreSQL JDBC 42.3.0.
   strings `NaN`, and `[+-]Infinity` are accepted as input, to select the special
   not-a-number and infinity states, respectively,  of floating-point numbers.
 
-- Allow CSV-formatted sources
+- Allow [CSV-formatted sources](/sql/create-source/csv-file/#csv-format-details)
   to include a header row (`CREATE SOURCE ... FORMAT CSV WITH HEADER`).
 
-- Provide the option to name columns in sources (e.g. `CREATE SOURCE foo
-  (col_foo, col_bar)...`).
+- Provide the option to name columns in sources (e.g. [`CREATE SOURCE foo
+  (col_foo, col_bar)...`](/sql/create-source/csv-file/#creating-a-source-from-a-dynamic-csv)).
 
 - Support [offsets](/sql/create-source/) for partitions on Kafka sources {{% gh 2169 %}}.
 
@@ -2057,7 +1709,7 @@ a problem with PostgreSQL JDBC 42.3.0.
 
 {{% version-header v0.1.3 %}}
 
-- Support [Amazon Kinesis Data Streams sources](/sql/create-source/kinesis).
+- Support [Amazon Kinesis Data Stream sources](/sql/create-source/json-kinesis/).
 
 - Support the number functions `round(x: N)` and `round(x: N, y: N)`, which
   round `x` to the `y`th digit after the decimal. (Default 0).
@@ -2108,7 +1760,6 @@ a problem with PostgreSQL JDBC 42.3.0.
 
 [`array`]: /sql/types/array/
 [`bigint`]: /sql/types/integer#bigint-info
-[`boolean`]: /sql/types/boolean
 [`bytea`]: /sql/types/bytea
 [`ALTER INDEX`]: /sql/alter-index
 [`COPY FROM`]: /sql/copy-from
@@ -2119,12 +1770,9 @@ a problem with PostgreSQL JDBC 42.3.0.
 [compatibility function]: /sql/functions#postgresql-compatibility-func
 [`date`]: /sql/types/date
 [`double precision`]: /sql/types/float8
-[experimental mode]: /cli/#experimental-mode
 [`interval`]: /sql/types/interval
 [`list`]: /sql/types/list/
 [`map`]: /sql/types/map/
-[`mz_logical_timestamp`]: /sql/functions/#date-and-time-func
-[`numeric`]: /sql/types/numeric
 [`oid`]: /sql/types/oid/
 [`real`]: /sql/types/float4
 [`pgcrypto`]: https://www.postgresql.org/docs/current/pgcrypto.html
@@ -2135,9 +1783,8 @@ a problem with PostgreSQL JDBC 42.3.0.
 [`time`]: /sql/types/time
 [`timestamp`]: /sql/types/timestamp
 [`timestamp with time zone`]: /sql/types/timestamptz
-[Apache Superset]: https://superset.apache.org
-[Postgres sources]: /sql/create-source/postgres
 [pg-copy]: https://www.postgresql.org/docs/current/sql-copy.html
 [pgwire-simple]: https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.4
 [pgwire-extended]: https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
 [PgJDBC]: https://jdbc.postgresql.org
+[Protobuf sources]: /sql/create-source/protobuf-kinesis/#protobuf-format-details

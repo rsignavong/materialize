@@ -21,15 +21,14 @@ use timely::dataflow::operators::{Concat, Map, OkErr};
 use timely::dataflow::operators::{Delay, Operator};
 use timely::dataflow::{Scope, Stream};
 use timely::progress::Antichain;
-use tracing::trace;
 
-use crate::client::{StreamReadHandle, StreamWriteHandle};
+use crate::indexed::runtime::{StreamReadHandle, StreamWriteHandle};
 use crate::operators::replay::Replay;
 use crate::operators::split_ok_err;
 use crate::operators::stream::Persist;
 use crate::operators::stream::RetractUnsealed;
 
-use mz_persist_types::Codec;
+use persist_types::Codec;
 
 /// Extension trait for [`Stream`].
 pub trait PersistentUpsert<G, K: Codec, V: Codec, T> {
@@ -68,7 +67,10 @@ pub trait PersistentUpsert<G, K: Codec, V: Codec, T> {
         name: &str,
         as_of_frontier: Antichain<u64>,
         persist_config: PersistentUpsertConfig<K, V>,
-    ) -> (Stream<G, ((K, V), u64, i64)>, Stream<G, (String, u64, i64)>)
+    ) -> (
+        Stream<G, ((K, V), u64, isize)>,
+        Stream<G, (String, u64, isize)>,
+    )
     where
         G: Scope<Timestamp = u64>;
 }
@@ -113,18 +115,18 @@ where
         name: &str,
         as_of_frontier: Antichain<u64>,
         persist_config: PersistentUpsertConfig<K, V>,
-    ) -> (Stream<G, ((K, V), u64, i64)>, Stream<G, (String, u64, i64)>)
+    ) -> (
+        Stream<G, ((K, V), u64, isize)>,
+        Stream<G, (String, u64, isize)>,
+    )
     where
         G: Scope<Timestamp = u64>,
     {
         let operator_name = format!("persistent_upsert({})", name);
 
-        let (restored_upsert_oks, state_errs) = {
+        let (restored_upsert_oks, _state_errs) = {
             let snapshot = persist_config.read_handle.snapshot();
-            let (restored_oks, restored_errs) = self
-                .scope()
-                .replay(snapshot, &as_of_frontier)
-                .ok_err(split_ok_err);
+            let (restored_oks, restored_errs) = self.scope().replay(snapshot).ok_err(split_ok_err);
             let (restored_upsert_oks, retract_errs) = restored_oks.retract_unsealed(
                 name,
                 persist_config.write_handle.clone(),
@@ -165,7 +167,11 @@ where
                     state_input.for_each(|_time, data| {
                         data.swap(&mut state_input_buffer);
                         for state_update in state_input_buffer.drain(..) {
-                            trace!("In {}, restored upsert: {:?}", operator_name, state_update);
+                            log::trace!(
+                                "In {}, restored upsert: {:?}",
+                                operator_name,
+                                state_update
+                            );
 
                             differential_state_ingester
                                 .as_mut()
@@ -185,7 +191,7 @@ where
                             .finish();
                         current_values.extend(initial_state.into_iter());
 
-                        trace!(
+                        log::trace!(
                             "In {}, initial (restored) upsert state: {:?}",
                             operator_name,
                             current_values.iter().take(10).collect::<Vec<_>>()
@@ -288,7 +294,7 @@ where
 
         (
             new_upsert_oks.concat(&restored_upsert_oks),
-            new_upsert_persist_errs.concat(&state_errs),
+            new_upsert_persist_errs,
         )
     }
 }
@@ -296,7 +302,7 @@ where
 /// Ingests differential updates, consolidates them, and emits a final `HashMap` that contains the
 /// consolidated upsert state.
 struct DifferentialStateIngester<K, V> {
-    differential_state: HashMap<(K, V), i64>,
+    differential_state: HashMap<(K, V), isize>,
 }
 
 impl<K, V> DifferentialStateIngester<K, V>
@@ -310,7 +316,7 @@ where
         }
     }
 
-    fn add_update(&mut self, update: ((K, V), u64, i64)) {
+    fn add_update(&mut self, update: ((K, V), u64, isize)) {
         let ((k, v), _ts, diff) = update;
 
         *self.differential_state.entry((k, v)).or_default() += diff;
@@ -323,7 +329,7 @@ where
 
         for ((key, value), diff) in self.differential_state.into_iter() {
             // our state must be internally consistent
-            assert!(diff == 1, "i64 for ({:?}, {:?}) is {}", key, value, diff);
+            assert!(diff == 1, "Diff for ({:?}, {:?}) is {}", key, value, diff);
             match state.insert(key.clone(), value) {
                 None => (), // it's all good
                 // we must be internally consistent: there can only be one value per key in the

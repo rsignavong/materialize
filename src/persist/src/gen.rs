@@ -11,13 +11,12 @@
 
 #![allow(missing_docs)]
 
-include!(concat!(env!("OUT_DIR"), "/mod.rs"));
+include!(concat!(env!("OUT_DIR"), "/protobuf/mod.rs"));
 
 use std::io::Read;
 
-use bytes::BufMut;
 use md5::{Digest, Md5};
-use prost::Message;
+use protobuf::Message;
 
 use crate::error::Error;
 use crate::gen::persist::ProtoMeta;
@@ -40,12 +39,14 @@ impl ProtoMeta {
     /// The following is an EBNF-ish spec for the format:
     ///
     /// ```none
-    /// encoding = 11u8 v11_encoding
-    /// v11_encoding = proto_meta md5_checksum
+    /// encoding = 7u8 v7_encoding
+    /// v7_encoding = proto_meta md5_checksum
     /// proto_meta = u8* (the protobuf serialization of ProtoMeta)
     /// md5_checksum = u8 u8 u8 u8 (little endian, md5 of proto_meta)
     /// ```
-    pub const ENCODING_VERSION: u8 = 11;
+    // TODO: Once this gets bumped to 8, we can clean up:
+    // - The TODO in Blob::Cache.check_meta_build_version.
+    pub const ENCODING_VERSION: u8 = 7;
 
     /// The [Self::ENCODING_VERSION] of this previously encoded ProtoMeta.
     ///
@@ -69,26 +70,25 @@ impl ProtoMeta {
     }
 }
 
-impl mz_persist_types::Codec for ProtoMeta {
+impl persist_types::Codec for ProtoMeta {
     fn codec_name() -> String {
         "protobuf+md5[ProtoMeta]".into()
     }
 
-    fn encode<B>(&self, buf: &mut B)
-    where
-        B: BufMut,
-    {
+    fn encode<E: for<'a> Extend<&'a u8>>(&self, buf: &mut E) {
         // TODO: Move checksum to be a field on the proto instead. We can encode
         // the proto, checksum'ing as we go, and then manually append it onto
         // the end.
         //
         // TODO: Regardless of the above TODO, compute the checksum as we go and
         // avoid this temp Vec.
-        let temp = self.encode_to_vec();
-        buf.put_slice(&[Self::ENCODING_VERSION]);
-        buf.put_slice(&temp);
+        let temp = self
+            .write_to_bytes()
+            .expect("no required fields means no initialization errors");
+        buf.extend(&[Self::ENCODING_VERSION]);
+        buf.extend(temp.iter());
         let checksum = Self::md5_checksum(&temp);
-        buf.put_slice(&checksum);
+        buf.extend(&checksum);
     }
 
     fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
@@ -110,13 +110,14 @@ impl mz_persist_types::Codec for ProtoMeta {
             return Err("checksum mismatch".into());
         }
 
-        <Self as Message>::decode(buf).map_err(|err| err.to_string())
+        // TODO: Use parse_from_carllerche_bytes to save allocs?
+        Self::parse_from_bytes(buf).map_err(|err| err.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use mz_persist_types::Codec;
+    use persist_types::Codec;
 
     use super::*;
 
@@ -124,16 +125,16 @@ mod tests {
     fn checksum() {
         let meta = ProtoMeta::default();
         let mut encoded = Vec::new();
-        Codec::encode(&meta, &mut encoded);
+        meta.encode(&mut encoded);
 
         // Intact checksum matches.
-        assert_eq!(<ProtoMeta as Codec>::decode(&encoded), Ok(meta));
+        assert_eq!(ProtoMeta::decode(&encoded), Ok(meta));
 
         // Data has been mutated.
         let mut bad_data = encoded.clone();
         bad_data[1] += 1;
         assert_eq!(
-            <ProtoMeta as Codec>::decode(&bad_data),
+            ProtoMeta::decode(&bad_data),
             Err("checksum mismatch".into())
         );
 
@@ -141,7 +142,7 @@ mod tests {
         let mut bad_checksum = encoded.clone();
         *bad_checksum.last_mut().unwrap() += 1;
         assert_eq!(
-            <ProtoMeta as Codec>::decode(&bad_checksum),
+            ProtoMeta::decode(&bad_checksum),
             Err("checksum mismatch".into())
         );
     }
@@ -155,15 +156,15 @@ mod tests {
             ..Default::default()
         };
         let mut encoded = Vec::new();
-        Codec::encode(&meta, &mut encoded);
+        meta.encode(&mut encoded);
 
         // Sanity check that we don't just always return errors.
-        assert_eq!(<ProtoMeta as Codec>::decode(&encoded), Ok(meta));
+        assert_eq!(ProtoMeta::decode(&encoded), Ok(meta));
 
         // Every subset that's missing at least one byte should error, not panic
         // or succeed.
         for i in 0..encoded.len() - 1 {
-            assert!(<ProtoMeta as Codec>::decode(&encoded[..i]).is_err());
+            assert!(ProtoMeta::decode(&encoded[..i]).is_err());
         }
     }
 }

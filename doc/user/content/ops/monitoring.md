@@ -72,59 +72,42 @@ $ docker run -d \
 
 ### Observing local Materialize
 
-Since the dashboard runs inside a Docker container, using it to observe a Materialize
-instance running on the same machine is complicated by Docker networking isolation. The
-exact steps required to expose `materialized` to the dashboard process depends on exactly
-how you are running `materialized`.
+Using the dashboard to observe a Materialize instance running on the same
+machine as the dashboard is complicated by Docker. The solution depends upon
+your host platform.
 
-{{< tabs >}}
-
-{{< tab "Docker" >}}
+#### Inside Docker Compose or Kubernetes
 
 Local schedulers like Docker Compose (which we use for our demos) or Kubernetes will
-typically expose running containers to each other using the container's service name as a
-public DNS hostname, but _only_ within the network that the containers are running in.
+typically expose running containers to each other using their service name as a public
+DNS hostname, but _only_ within the network that they are running in.
 
 The easiest way to use the dashboard inside a scheduler is to tell the scheduler to run
 it. Check out the [example configuration for Docker Compose][dc-example].
 
-[dc-example]: https://github.com/MaterializeInc/materialize/blob/d793b112758c840c1240eefdd56ca6f7e4f484cf/demo/billing/mzcompose.yml#L60-L70
+#### On macOS, with Materialize running outside of Docker
 
-{{</ tab >}}
-{{< tab "macOS" >}}
-
-When our dashboard container is running inside of Docker via Docker for Mac and
-`materialized` is running on the host macOS system the `localhost` inside of the
-container does not refer to the macOS host machine's network.
-
-You must use `host.docker.internal` to refer to the host system:
+The problem with this is that `localhost` inside of Docker does not, on Docker for Mac,
+refer to the macOS network. So instead you must use `host.docker.internal`:
 
 ```
 docker run -p 3000:3000 -e MATERIALIZED_URL=host.docker.internal:6875 materialize/dashboard
 ```
 
-{{</ tab >}}
-{{< tab "Linux" >}}
+#### On Linux, with Materialize running outside of Docker
 
-When our dashboard container is running inside of a Docker container on a Linux machine
-we must override one of the isolation policies that Docker creates. Docker configures
-containers to use a different network than their host by default, but that is easy to
-override by using the `--network host` option:
+Docker containers use a different network than their host by default, but that is easy to
+override by using the `--network host` option. Using the host network means that ports will be
+allocated from the host, so the `-p` flag is no longer necessary:
 
 ```
 docker run --network host -e MATERIALIZED_URL=localhost:6875 materialize/dashboard
 ```
 
-Using the host network means that ports will be allocated from the host, so the `-p` flag
-is no longer necessary, with the above command the dashboard will be available on at
-`http://localhost:3000`.
-
-{{</ tab >}}
-{{</ tabs >}}
-
 [simplemon-hub]: https://hub.docker.com/repository/docker/materialize/dashboard
 [dashboard-json]: https://github.com/MaterializeInc/materialize/blob/main/misc/monitoring/dashboard/conf/grafana/dashboards/overview.json
 [graf-import]: https://grafana.com/docs/grafana/latest/reference/export_import/#importing-a-dashboard
+[dc-example]: https://github.com/MaterializeInc/materialize/blob/d793b112758c840c1240eefdd56ca6f7e4f484cf/demo/billing/mzcompose.yml#L60-L70
 
 ## Health check
 

@@ -10,12 +10,7 @@
 use std::borrow::Borrow;
 use std::fmt;
 
-use const_format::concatcp;
 use uncased::UncasedStr;
-
-use crate::catalog::builtin::{MZ_CATALOG_SCHEMA, MZ_TEMP_SCHEMA, PG_CATALOG_SCHEMA};
-use mz_ore::cast;
-use mz_sql::DEFAULT_SCHEMA;
 
 use crate::error::CoordError;
 use crate::session::EndTransactionAction;
@@ -27,23 +22,6 @@ macro_rules! static_uncased_str {
         unsafe { ::core::mem::transmute::<&'static str, &'static UncasedStr>($string) }
     }};
 }
-
-// We pretend to be Postgres v9.5.0, which is also what CockroachDB pretends to
-// be. Too new and some clients will emit a "server too new" warning. Too old
-// and some clients will fall back to legacy code paths. v9.5.0 empirically
-// seems to be a good compromise.
-
-/// The major version of PostgreSQL that Materialize claims to be.
-pub const SERVER_MAJOR_VERSION: u8 = 9;
-
-/// The minor version of PostgreSQL that Materialize claims to be.
-pub const SERVER_MINOR_VERSION: u8 = 5;
-
-/// The patch version of PostgreSQL that Materialize claims to be.
-pub const SERVER_PATCH_VERSION: u8 = 0;
-
-/// The name of the default database that Materialize uses.
-pub const DEFAULT_DATABASE_NAME: &str = "materialize";
 
 const APPLICATION_NAME: ServerVar<str> = ServerVar {
     name: static_uncased_str!("application_name"),
@@ -57,21 +35,9 @@ const CLIENT_ENCODING: ServerVar<str> = ServerVar {
     description: "Sets the client's character set encoding (PostgreSQL).",
 };
 
-const CLIENT_MIN_MESSAGES: ServerVar<ClientSeverity> = ServerVar {
-    name: static_uncased_str!("client_min_messages"),
-    value: &ClientSeverity::Notice,
-    description: "Sets the message levels that are sent to the client (PostgreSQL).",
-};
-
-const CLUSTER: ServerVar<str> = ServerVar {
-    name: static_uncased_str!("cluster"),
-    value: "default",
-    description: "Sets the current cluster (Materialize).",
-};
-
 const DATABASE: ServerVar<str> = ServerVar {
     name: static_uncased_str!("database"),
-    value: DEFAULT_DATABASE_NAME,
+    value: "materialize",
     description: "Sets the current database (CockroachDB).",
 };
 
@@ -108,33 +74,25 @@ const QGM_OPTIMIZATIONS: ServerVar<bool> = ServerVar {
 
 const SEARCH_PATH: ServerVar<[&str]> = ServerVar {
     name: static_uncased_str!("search_path"),
-    value: &[
-        MZ_CATALOG_SCHEMA,
-        PG_CATALOG_SCHEMA,
-        DEFAULT_SCHEMA,
-        MZ_TEMP_SCHEMA,
-    ],
+    value: &["mz_catalog", "pg_catalog", "public", "mz_temp"],
     description:
         "Sets the schema search order for names that are not schema-qualified (PostgreSQL).",
 };
 
 const SERVER_VERSION: ServerVar<str> = ServerVar {
     name: static_uncased_str!("server_version"),
-    value: concatcp!(
-        SERVER_MAJOR_VERSION,
-        ".",
-        SERVER_MINOR_VERSION,
-        ".",
-        SERVER_PATCH_VERSION
-    ),
+    // Pretend to be Postgres v9.5.0, which is also what CockroachDB pretends to
+    // be. Too new and some clients will emit a "server too new" warning. Too
+    // old and some clients will fall back to legacy code paths. v9.5.0
+    // empirically seems to be a good compromise.
+    value: "9.5.0",
     description: "Shows the server version (PostgreSQL).",
 };
 
 const SERVER_VERSION_NUM: ServerVar<i32> = ServerVar {
     name: static_uncased_str!("server_version_num"),
-    value: &((cast::u8_to_i32(SERVER_MAJOR_VERSION) * 10_000)
-        + (cast::u8_to_i32(SERVER_MINOR_VERSION) * 100)
-        + cast::u8_to_i32(SERVER_PATCH_VERSION)),
+    // See the comment on `SERVER_VERSION`.
+    value: &90500,
     description: "Shows the server version as an integer (PostgreSQL).",
 };
 
@@ -150,10 +108,10 @@ const STANDARD_CONFORMING_STRINGS: ServerVar<bool> = ServerVar {
     description: "Causes '...' strings to treat backslashes literally (PostgreSQL).",
 };
 
-const TIMEZONE: ServerVar<TimeZone> = ServerVar {
+const TIMEZONE: ServerVar<str> = ServerVar {
     // TimeZone has nonstandard capitalization for historical reasons.
     name: static_uncased_str!("TimeZone"),
-    value: &TimeZone::UTC,
+    value: "UTC",
     description: "Sets the time zone for displaying and interpreting time stamps (PostgreSQL).",
 };
 
@@ -191,8 +149,6 @@ const TRANSACTION_ISOLATION: ServerVar<str> = ServerVar {
 pub struct Vars {
     application_name: SessionVar<str>,
     client_encoding: ServerVar<str>,
-    client_min_messages: SessionVar<ClientSeverity>,
-    cluster: SessionVar<str>,
     database: SessionVar<str>,
     date_style: ServerVar<str>,
     extra_float_digits: SessionVar<i32>,
@@ -204,7 +160,7 @@ pub struct Vars {
     server_version_num: ServerVar<i32>,
     sql_safe_updates: SessionVar<bool>,
     standard_conforming_strings: ServerVar<bool>,
-    timezone: SessionVar<TimeZone>,
+    timezone: ServerVar<str>,
     transaction_isolation: ServerVar<str>,
 }
 
@@ -213,8 +169,6 @@ impl Default for Vars {
         Vars {
             application_name: SessionVar::new(&APPLICATION_NAME),
             client_encoding: CLIENT_ENCODING,
-            client_min_messages: SessionVar::new(&CLIENT_MIN_MESSAGES),
-            cluster: SessionVar::new(&CLUSTER),
             database: SessionVar::new(&DATABASE),
             date_style: DATE_STYLE,
             extra_float_digits: SessionVar::new(&EXTRA_FLOAT_DIGITS),
@@ -226,7 +180,7 @@ impl Default for Vars {
             server_version_num: SERVER_VERSION_NUM,
             sql_safe_updates: SessionVar::new(&SQL_SAFE_UPDATES),
             standard_conforming_strings: STANDARD_CONFORMING_STRINGS,
-            timezone: SessionVar::new(&TIMEZONE),
+            timezone: TIMEZONE,
             transaction_isolation: TRANSACTION_ISOLATION,
         }
     }
@@ -239,8 +193,6 @@ impl Vars {
         vec![
             &self.application_name as &dyn Var,
             &self.client_encoding,
-            &self.client_min_messages,
-            &self.cluster,
             &self.database,
             &self.date_style,
             &self.extra_float_digits,
@@ -288,10 +240,6 @@ impl Vars {
             Ok(&self.application_name)
         } else if name == CLIENT_ENCODING.name {
             Ok(&self.client_encoding)
-        } else if name == CLIENT_MIN_MESSAGES.name {
-            Ok(&self.client_min_messages)
-        } else if name == CLUSTER.name {
-            Ok(&self.cluster)
         } else if name == DATABASE.name {
             Ok(&self.database)
         } else if name == DATE_STYLE.name {
@@ -339,32 +287,14 @@ impl Vars {
         if name == APPLICATION_NAME.name {
             self.application_name.set(value, local)
         } else if name == CLIENT_ENCODING.name {
-            // Unfortunately, some orm's like Prisma set NAMES to UTF8, thats the only
-            // value we support, so we let is through
-            if UncasedStr::new(value) != CLIENT_ENCODING.value {
-                return Err(CoordError::FixedValueParameter(&CLIENT_ENCODING));
-            } else {
-                Ok(())
-            }
-        } else if name == CLIENT_MIN_MESSAGES.name {
-            if let Ok(_) = ClientSeverity::parse(value) {
-                self.client_min_messages.set(value, local)
-            } else {
-                return Err(CoordError::ConstrainedParameter {
-                    parameter: &CLIENT_MIN_MESSAGES,
-                    value: value.into(),
-                    valid_values: Some(ClientSeverity::valid_values()),
-                });
-            }
-        } else if name == CLUSTER.name {
-            self.cluster.set(value, local)
+            Err(CoordError::ReadOnlyParameter(&CLIENT_ENCODING))
         } else if name == DATABASE.name {
             self.database.set(value, local)
         } else if name == DATE_STYLE.name {
             for value in value.split(',') {
                 let value = UncasedStr::new(value.trim());
                 if value != "ISO" && value != "MDY" {
-                    return Err(CoordError::FixedValueParameter(&DATE_STYLE));
+                    return Err(CoordError::ConstrainedParameter(&DATE_STYLE));
                 }
             }
             Ok(())
@@ -411,24 +341,12 @@ impl Vars {
         } else if name == SQL_SAFE_UPDATES.name {
             self.sql_safe_updates.set(value, local)
         } else if name == STANDARD_CONFORMING_STRINGS.name {
-            match bool::parse(value) {
-                Ok(value) if value == *STANDARD_CONFORMING_STRINGS.value => Ok(()),
-                Ok(_) => Err(CoordError::FixedValueParameter(
-                    &STANDARD_CONFORMING_STRINGS,
-                )),
-                Err(()) => Err(CoordError::InvalidParameterType(
-                    &STANDARD_CONFORMING_STRINGS,
-                )),
-            }
+            Err(CoordError::ReadOnlyParameter(&STANDARD_CONFORMING_STRINGS))
         } else if name == TIMEZONE.name {
-            if let Ok(_) = TimeZone::parse(value) {
-                self.timezone.set(value, local)
+            if UncasedStr::new(value) != TIMEZONE.value {
+                return Err(CoordError::ConstrainedParameter(&TIMEZONE));
             } else {
-                return Err(CoordError::ConstrainedParameter {
-                    parameter: &TIMEZONE,
-                    value: value.into(),
-                    valid_values: None,
-                });
+                Ok(())
             }
         } else if name == TRANSACTION_ISOLATION.name {
             Err(CoordError::ReadOnlyParameter(&TRANSACTION_ISOLATION))
@@ -445,8 +363,6 @@ impl Vars {
         let Vars {
             application_name,
             client_encoding: _,
-            client_min_messages,
-            cluster: _,
             database,
             date_style: _,
             extra_float_digits,
@@ -462,7 +378,6 @@ impl Vars {
             transaction_isolation: _,
         } = self;
         application_name.end_transaction(action);
-        client_min_messages.end_transaction(action);
         database.end_transaction(action);
         qgm_optimizations.end_transaction(action);
         extra_float_digits.end_transaction(action);
@@ -477,16 +392,6 @@ impl Vars {
     /// Returns the value of the `client_encoding` configuration parameter.
     pub fn client_encoding(&self) -> &'static str {
         self.client_encoding.value
-    }
-
-    /// Returns the value of the `client_min_messages` configuration parameter.
-    pub fn client_min_messages(&self) -> &ClientSeverity {
-        self.client_min_messages.value()
-    }
-
-    /// Returns the value of the `cluster` configuration parameter.
-    pub fn cluster(&self) -> &str {
-        self.cluster.value()
     }
 
     /// Returns the value of the `DateStyle` configuration parameter.
@@ -541,8 +446,8 @@ impl Vars {
     }
 
     /// Returns the value of the `timezone` configuration parameter.
-    pub fn timezone(&self) -> &TimeZone {
-        self.timezone.value()
+    pub fn timezone(&self) -> &'static str {
+        self.timezone.value
     }
 
     /// Returns the value of the `transaction_isolation` configuration
@@ -755,148 +660,5 @@ impl Value for [&str] {
 
     fn format(&self) -> String {
         self.join(", ")
-    }
-}
-
-/// Severity levels can used to be used to filter which messages get sent
-/// to a client.
-///
-/// The ordering of severity levels used for client-level filtering differs from the
-/// one used for server-side logging in two aspects: INFO messages are always sent,
-/// and the LOG severity is considered as below NOTICE, while it is above ERROR for
-/// server-side logs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClientSeverity {
-    /// Sends only INFO, ERROR, FATAL and PANIC level messages.
-    Error,
-    /// Sends only WARNING, INFO, ERROR, FATAL and PANIC level messages.
-    Warning,
-    /// Sends only NOTICE, WARNING, INFO, ERROR, FATAL and PANIC level messages.
-    Notice,
-    /// Sends only LOG, NOTICE, WARNING, INFO, ERROR, FATAL and PANIC level messages.
-    Log,
-    /// Sends all messages to the client, since all DEBUG levels are treated as the same right now.
-    Debug1,
-    /// Sends all messages to the client, since all DEBUG levels are treated as the same right now.
-    Debug2,
-    /// Sends all messages to the client, since all DEBUG levels are treated as the same right now.
-    Debug3,
-    /// Sends all messages to the client, since all DEBUG levels are treated as the same right now.
-    Debug4,
-    /// Sends all messages to the client, since all DEBUG levels are treated as the same right now.
-    Debug5,
-    /// Sends only NOTICE, WARNING, INFO, ERROR, FATAL and PANIC level messages.
-    /// Not listed as a valid value, but accepted by Postgres
-    Info,
-}
-
-impl ClientSeverity {
-    fn as_str(&self) -> &'static str {
-        match self {
-            ClientSeverity::Error => "error",
-            ClientSeverity::Warning => "warning",
-            ClientSeverity::Notice => "notice",
-            ClientSeverity::Info => "info",
-            ClientSeverity::Log => "log",
-            ClientSeverity::Debug1 => "debug1",
-            ClientSeverity::Debug2 => "debug2",
-            ClientSeverity::Debug3 => "debug3",
-            ClientSeverity::Debug4 => "debug4",
-            ClientSeverity::Debug5 => "debug5",
-        }
-    }
-
-    fn valid_values() -> Vec<&'static str> {
-        // INFO left intentionally out, to match Postgres
-        vec![
-            ClientSeverity::Debug5.as_str(),
-            ClientSeverity::Debug4.as_str(),
-            ClientSeverity::Debug3.as_str(),
-            ClientSeverity::Debug2.as_str(),
-            ClientSeverity::Debug1.as_str(),
-            ClientSeverity::Log.as_str(),
-            ClientSeverity::Notice.as_str(),
-            ClientSeverity::Warning.as_str(),
-            ClientSeverity::Error.as_str(),
-        ]
-    }
-}
-
-impl Value for ClientSeverity {
-    const TYPE_NAME: &'static str = "string";
-
-    fn parse(s: &str) -> Result<Self::Owned, ()> {
-        let s = UncasedStr::new(s);
-
-        if s == ClientSeverity::Error.as_str() {
-            Ok(ClientSeverity::Error)
-        } else if s == ClientSeverity::Warning.as_str() {
-            Ok(ClientSeverity::Warning)
-        } else if s == ClientSeverity::Notice.as_str() {
-            Ok(ClientSeverity::Notice)
-        } else if s == ClientSeverity::Info.as_str() {
-            Ok(ClientSeverity::Info)
-        } else if s == ClientSeverity::Log.as_str() {
-            Ok(ClientSeverity::Log)
-        } else if s == ClientSeverity::Debug1.as_str() {
-            Ok(ClientSeverity::Debug1)
-        // Postgres treats `debug` as an input as equivalent to `debug2`
-        } else if s == ClientSeverity::Debug2.as_str() || s == "debug" {
-            Ok(ClientSeverity::Debug2)
-        } else if s == ClientSeverity::Debug3.as_str() {
-            Ok(ClientSeverity::Debug3)
-        } else if s == ClientSeverity::Debug4.as_str() {
-            Ok(ClientSeverity::Debug4)
-        } else if s == ClientSeverity::Debug5.as_str() {
-            Ok(ClientSeverity::Debug5)
-        } else {
-            Err(())
-        }
-    }
-
-    fn format(&self) -> String {
-        self.as_str().into()
-    }
-}
-
-/// List of valid time zones.
-///
-/// Names are following the tz database, but only time zones equivalent
-/// to UTC±00:00 are supported.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TimeZone {
-    /// UTC
-    UTC,
-    /// Fixed offset from UTC, currently only "+00:00" is supported.
-    /// A string representation is kept here for compatibility with Postgres.
-    FixedOffset(&'static str),
-}
-
-impl TimeZone {
-    fn as_str(&self) -> &'static str {
-        match self {
-            TimeZone::UTC => "UTC",
-            TimeZone::FixedOffset(s) => s,
-        }
-    }
-}
-
-impl Value for TimeZone {
-    const TYPE_NAME: &'static str = "string";
-
-    fn parse(s: &str) -> Result<Self::Owned, ()> {
-        let s = UncasedStr::new(s);
-
-        if s == TimeZone::UTC.as_str() {
-            Ok(TimeZone::UTC)
-        } else if s == "+00:00" {
-            Ok(TimeZone::FixedOffset("+00:00"))
-        } else {
-            Err(())
-        }
-    }
-
-    fn format(&self) -> String {
-        self.as_str().into()
     }
 }

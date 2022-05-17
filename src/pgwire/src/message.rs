@@ -7,17 +7,23 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::convert::{TryFrom, TryInto};
+use std::io;
 
+use bytes::BytesMut;
+use csv::{ByteRecord, ReaderBuilder};
 use itertools::Itertools;
 use postgres::error::SqlState;
 
-use mz_coord::session::ClientSeverity as CoordClientSeverity;
-use mz_coord::session::TransactionStatus as CoordTransactionStatus;
-use mz_coord::{CoordError, StartupMessage};
-use mz_expr::EvalError;
-use mz_pgcopy::CopyErrorNotSupportedResponse;
-use mz_repr::{ColumnName, NotNullViolation, RelationDesc};
+use coord::session::TransactionStatus as CoordTransactionStatus;
+use coord::{CoordError, StartupMessage};
+use repr::adt::numeric::NUMERIC_DATUM_MAX_PRECISION;
+use repr::{
+    ColumnName, Datum, NotNullViolation, RelationDesc, RelationType, Row, RowArena, ScalarType,
+};
+use sql::plan::{CopyFormat, CopyParams};
 
 // Pgwire protocol versions are represented as 32-bit integers, where the
 // high 16 bits represent the major version and the low 16 bits represent the
@@ -135,12 +141,12 @@ pub enum FrontendMessage {
         /// prepared statement.
         statement_name: String,
         /// The formats used to encode the parameters in `raw_parameters`.
-        param_formats: Vec<mz_pgrepr::Format>,
+        param_formats: Vec<pgrepr::Format>,
         /// The value of each parameter, encoded using the formats described
         /// by `parameter_formats`.
         raw_params: Vec<Option<Vec<u8>>>,
         /// The desired formats for the columns in the result set.
-        result_formats: Vec<mz_pgrepr::Format>,
+        result_formats: Vec<pgrepr::Format>,
     },
 
     /// Execute a bound portal.
@@ -187,10 +193,6 @@ pub enum FrontendMessage {
     CopyDone,
 
     CopyFail(String),
-
-    Password {
-        password: String,
-    },
 }
 
 impl FrontendMessage {
@@ -210,7 +212,6 @@ impl FrontendMessage {
             FrontendMessage::CopyData(_) => "copy_data",
             FrontendMessage::CopyDone => "copy_done",
             FrontendMessage::CopyFail(_) => "copy_fail",
-            FrontendMessage::Password { .. } => "password",
         }
     }
 }
@@ -221,20 +222,19 @@ impl FrontendMessage {
 #[derive(Debug)]
 pub enum BackendMessage {
     AuthenticationOk,
-    AuthenticationCleartextPassword,
     CommandComplete {
         tag: String,
     },
     EmptyQueryResponse,
     ReadyForQuery(TransactionStatus),
     RowDescription(Vec<FieldDescription>),
-    DataRow(Vec<Option<mz_pgrepr::Value>>),
+    DataRow(Vec<Option<pgrepr::Value>>),
     ParameterStatus(&'static str, String),
     BackendKeyData {
         conn_id: u32,
         secret_key: u32,
     },
-    ParameterDescription(Vec<mz_pgrepr::Type>),
+    ParameterDescription(Vec<pgrepr::Type>),
     PortalSuspended,
     NoData,
     ParseComplete,
@@ -242,12 +242,12 @@ pub enum BackendMessage {
     CloseComplete,
     ErrorResponse(ErrorResponse),
     CopyInResponse {
-        overall_format: mz_pgrepr::Format,
-        column_formats: Vec<mz_pgrepr::Format>,
+        overall_format: pgrepr::Format,
+        column_formats: Vec<pgrepr::Format>,
     },
     CopyOutResponse {
-        overall_format: mz_pgrepr::Format,
-        column_formats: Vec<mz_pgrepr::Format>,
+        overall_format: pgrepr::Format,
+        column_formats: Vec<pgrepr::Format>,
     },
     CopyData(Vec<u8>),
     CopyDone,
@@ -270,9 +270,9 @@ pub enum TransactionStatus {
     Failed,
 }
 
-impl<T> From<&CoordTransactionStatus<T>> for TransactionStatus {
+impl From<&CoordTransactionStatus> for TransactionStatus {
     /// Convert from the Session's version
-    fn from(status: &CoordTransactionStatus<T>) -> TransactionStatus {
+    fn from(status: &CoordTransactionStatus) -> TransactionStatus {
         match status {
             CoordTransactionStatus::Default => TransactionStatus::Idle,
             CoordTransactionStatus::Started(_) => TransactionStatus::InTransaction,
@@ -322,27 +322,6 @@ impl ErrorResponse {
         ErrorResponse::new(Severity::Warning, code, message)
     }
 
-    pub fn info<S>(code: SqlState, message: S) -> ErrorResponse
-    where
-        S: Into<String>,
-    {
-        ErrorResponse::new(Severity::Info, code, message)
-    }
-
-    pub fn log<S>(code: SqlState, message: S) -> ErrorResponse
-    where
-        S: Into<String>,
-    {
-        ErrorResponse::new(Severity::Log, code, message)
-    }
-
-    pub fn debug<S>(code: SqlState, message: S) -> ErrorResponse
-    where
-        S: Into<String>,
-    {
-        ErrorResponse::new(Severity::Debug, code, message)
-    }
-
     fn new<S>(severity: Severity, code: SqlState, message: S) -> ErrorResponse
     where
         S: Into<String>,
@@ -366,32 +345,19 @@ impl ErrorResponse {
             CoordError::InvalidAlterOnDisabledIndex(_) => SqlState::INTERNAL_ERROR,
             CoordError::Catalog(_) => SqlState::INTERNAL_ERROR,
             CoordError::ChangedPlan => SqlState::FEATURE_NOT_SUPPORTED,
-            CoordError::ConstrainedParameter { .. } => SqlState::INVALID_PARAMETER_VALUE,
+            CoordError::ConstrainedParameter(_) => SqlState::INVALID_PARAMETER_VALUE,
             CoordError::AutomaticTimestampFailure { .. } => SqlState::INTERNAL_ERROR,
             CoordError::DuplicateCursor(_) => SqlState::DUPLICATE_CURSOR,
-            CoordError::Eval(EvalError::CharacterNotValidForEncoding(_)) => {
-                SqlState::PROGRAM_LIMIT_EXCEEDED
-            }
-            CoordError::Eval(EvalError::CharacterTooLargeForEncoding(_)) => {
-                SqlState::PROGRAM_LIMIT_EXCEEDED
-            }
-            CoordError::Eval(EvalError::NullCharacterNotPermitted) => {
-                SqlState::PROGRAM_LIMIT_EXCEEDED
-            }
             CoordError::Eval(_) => SqlState::INTERNAL_ERROR,
-            CoordError::FixedValueParameter(_) => SqlState::INVALID_PARAMETER_VALUE,
             CoordError::IdExhaustionError => SqlState::INTERNAL_ERROR,
-            CoordError::Internal(_) => SqlState::INTERNAL_ERROR,
-            CoordError::InvalidRematerialization { .. } => SqlState::FEATURE_NOT_SUPPORTED,
+            CoordError::IncompleteTimestamp(_) => SqlState::SQL_STATEMENT_NOT_YET_COMPLETE,
             CoordError::InvalidParameterType(_) => SqlState::INVALID_PARAMETER_VALUE,
             CoordError::InvalidParameterValue { .. } => SqlState::INVALID_PARAMETER_VALUE,
             CoordError::InvalidTableMutationSelection => SqlState::INVALID_TRANSACTION_STATE,
             CoordError::ConstraintViolation(NotNullViolation(_)) => SqlState::NOT_NULL_VIOLATION,
             CoordError::OperationProhibitsTransaction(_) => SqlState::ACTIVE_SQL_TRANSACTION,
             CoordError::OperationRequiresTransaction(_) => SqlState::NO_ACTIVE_SQL_TRANSACTION,
-            CoordError::Persistence(_) => SqlState::INTERNAL_ERROR,
             CoordError::PreparedStatementExists(_) => SqlState::DUPLICATE_PSTATEMENT,
-            CoordError::QGM(_) => SqlState::INTERNAL_ERROR,
             CoordError::ReadOnlyTransaction => SqlState::READ_ONLY_SQL_TRANSACTION,
             CoordError::ReadOnlyParameter(_) => SqlState::CANT_CHANGE_RUNTIME_PARAM,
             CoordError::RecursionLimit(_) => SqlState::INTERNAL_ERROR,
@@ -401,10 +367,9 @@ impl ErrorResponse {
             CoordError::TailOnlyTransaction => SqlState::INVALID_TRANSACTION_STATE,
             CoordError::Transform(_) => SqlState::INTERNAL_ERROR,
             CoordError::UnknownCursor(_) => SqlState::INVALID_CURSOR_NAME,
-            CoordError::UnknownParameter(_) => SqlState::UNDEFINED_OBJECT,
+            CoordError::UnknownParameter(_) => SqlState::INVALID_SQL_STATEMENT_NAME,
             CoordError::UnknownPreparedStatement(_) => SqlState::UNDEFINED_PSTATEMENT,
             CoordError::UnknownLoginRole(_) => SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
-            CoordError::UnmaterializableFunction(_) => SqlState::FEATURE_NOT_SUPPORTED,
             CoordError::Unsupported(..) => SqlState::FEATURE_NOT_SUPPORTED,
             CoordError::Unstructured(_) => SqlState::INTERNAL_ERROR,
             // It's not immediately clear which error code to use here because a
@@ -437,12 +402,6 @@ impl ErrorResponse {
     pub fn with_position(mut self, position: usize) -> ErrorResponse {
         self.position = Some(position);
         self
-    }
-}
-
-impl From<CopyErrorNotSupportedResponse> for ErrorResponse {
-    fn from(error: CopyErrorNotSupportedResponse) -> Self {
-        ErrorResponse::error(SqlState::FEATURE_NOT_SUPPORTED, error.message)
     }
 }
 
@@ -480,74 +439,6 @@ impl Severity {
             Severity::Log => "LOG",
         }
     }
-
-    /// Checks if a message of a given severity level should be sent to a client.
-    ///
-    /// The ordering of severity levels used for client-level filtering differs from the
-    /// one used for server-side logging in two aspects: INFO messages are always sent,
-    /// and the LOG severity is considered as below NOTICE, while it is above ERROR for
-    /// server-side logs.
-    ///
-    /// Postgres only considers the session setting after the client authentication
-    /// handshake is completed. Since this function is only called after client authentication
-    /// is done, we are not treating this case right now, but be aware if refactoring it.
-    pub fn should_output_to_client(&self, minimum_client_severity: &CoordClientSeverity) -> bool {
-        match (minimum_client_severity, self) {
-            // INFO messages are always sent
-            (_, Severity::Info) => true,
-            (CoordClientSeverity::Error, Severity::Error | Severity::Fatal | Severity::Panic) => {
-                true
-            }
-            (
-                CoordClientSeverity::Warning,
-                Severity::Error | Severity::Fatal | Severity::Panic | Severity::Warning,
-            ) => true,
-            (
-                CoordClientSeverity::Notice,
-                Severity::Error
-                | Severity::Fatal
-                | Severity::Panic
-                | Severity::Warning
-                | Severity::Notice,
-            ) => true,
-            (
-                CoordClientSeverity::Info,
-                Severity::Error
-                | Severity::Fatal
-                | Severity::Panic
-                | Severity::Warning
-                | Severity::Notice,
-            ) => true,
-            (
-                CoordClientSeverity::Log,
-                Severity::Error
-                | Severity::Fatal
-                | Severity::Panic
-                | Severity::Warning
-                | Severity::Notice
-                | Severity::Log,
-            ) => true,
-            (
-                CoordClientSeverity::Debug1
-                | CoordClientSeverity::Debug2
-                | CoordClientSeverity::Debug3
-                | CoordClientSeverity::Debug4
-                | CoordClientSeverity::Debug5,
-                _,
-            ) => true,
-
-            (
-                CoordClientSeverity::Error,
-                Severity::Warning | Severity::Notice | Severity::Log | Severity::Debug,
-            ) => false,
-            (CoordClientSeverity::Warning, Severity::Notice | Severity::Log | Severity::Debug) => {
-                false
-            }
-            (CoordClientSeverity::Notice, Severity::Log | Severity::Debug) => false,
-            (CoordClientSeverity::Info, Severity::Log | Severity::Debug) => false,
-            (CoordClientSeverity::Log, Severity::Debug) => false,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -557,25 +448,614 @@ pub struct FieldDescription {
     pub column_id: u16,
     pub type_oid: u32,
     pub type_len: i16,
+    // https://github.com/cockroachdb/cockroach/blob/3e8553e249a842e206aa9f4f8be416b896201f10/pkg/sql/pgwire/conn.go#L1115-L1123
     pub type_mod: i32,
-    pub format: mz_pgrepr::Format,
+    pub format: pgrepr::Format,
+}
+
+pub fn encode_copy_row_binary(
+    row: Row,
+    typ: &RelationType,
+    out: &mut Vec<u8>,
+) -> Result<(), io::Error> {
+    const NULL_BYTES: [u8; 4] = (-1i32).to_be_bytes();
+
+    // 16-bit int of number of tuples.
+    let count = i16::try_from(typ.column_types.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "column count does not fit into an i16",
+        )
+    })?;
+
+    out.extend(&count.to_be_bytes());
+    let mut buf = BytesMut::new();
+    for (field, typ) in row
+        .iter()
+        .zip(&typ.column_types)
+        .map(|(datum, typ)| (pgrepr::Value::from_datum(datum, &typ.scalar_type), typ))
+    {
+        match field {
+            None => out.extend(&NULL_BYTES),
+            Some(field) => {
+                buf.clear();
+                field.encode_binary(&pgrepr::Type::from(&typ.scalar_type), &mut buf)?;
+                out.extend(
+                    &i32::try_from(buf.len())
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::Other,
+                                "field length does not fit into an i32",
+                            )
+                        })?
+                        .to_be_bytes(),
+                );
+                out.extend(&buf);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn encode_copy_row_text(
+    row: Row,
+    typ: &RelationType,
+    out: &mut Vec<u8>,
+) -> Result<(), io::Error> {
+    let delim = b'\t';
+    let null = b"\\N";
+    let mut buf = BytesMut::new();
+    for (idx, field) in pgrepr::values_from_row(row, typ).into_iter().enumerate() {
+        if idx > 0 {
+            out.push(delim);
+        }
+        match field {
+            None => out.extend(null),
+            Some(field) => {
+                buf.clear();
+                field.encode_text(&mut buf);
+                for b in &buf {
+                    match b {
+                        b'\\' => out.extend(b"\\\\"),
+                        b'\n' => out.extend(b"\\n"),
+                        b'\r' => out.extend(b"\\r"),
+                        b'\t' => out.extend(b"\\t"),
+                        _ => out.push(*b),
+                    }
+                }
+            }
+        }
+    }
+    out.push(b'\n');
+    Ok(())
+}
+
+// This is equivalent to a backslash followed by a dot, i.e "\."
+static END_OF_COPY_MARKER: [u8; 2] = [92, 46];
+
+struct CopyTextFormatParser<'a> {
+    data: &'a [u8],
+    position: usize,
+    column_delimiter: &'a str,
+    null_string: &'a str,
+    buffer: Vec<u8>,
+}
+
+impl<'a> CopyTextFormatParser<'a> {
+    fn new(data: &'a [u8], column_delimiter: &'a str, null_string: &'a str) -> Self {
+        Self {
+            data,
+            position: 0,
+            column_delimiter,
+            null_string,
+            buffer: Vec::new(),
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        if self.position < self.data.len() {
+            Some(self.data[self.position])
+        } else {
+            None
+        }
+    }
+
+    fn consume_n(&mut self, n: usize) {
+        self.position = std::cmp::min(self.position + n, self.data.len());
+    }
+
+    fn is_eof(&self) -> bool {
+        self.peek().is_none() || self.is_end_of_copy_marker()
+    }
+
+    fn end_of_copy_marker() -> &'static [u8] {
+        &END_OF_COPY_MARKER
+    }
+
+    fn is_end_of_copy_marker(&self) -> bool {
+        self.check_bytes(Self::end_of_copy_marker())
+    }
+
+    fn is_end_of_line(&self) -> bool {
+        match self.peek() {
+            Some(b'\n') | None => true,
+            _ => false,
+        }
+    }
+
+    fn expect_end_of_line(&mut self) -> Result<(), io::Error> {
+        if self.is_end_of_line() {
+            self.consume_n(1);
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "extra data after last expected column",
+            ))
+        }
+    }
+
+    fn is_column_delimiter(&self) -> bool {
+        self.check_bytes(self.column_delimiter.as_bytes())
+    }
+
+    fn expect_column_delimiter(&mut self) -> Result<(), io::Error> {
+        if self.consume_bytes(self.column_delimiter.as_bytes()) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing data for column",
+            ))
+        }
+    }
+
+    fn check_bytes(&self, bytes: &[u8]) -> bool {
+        let remaining_bytes = self.data.len() - self.position;
+        remaining_bytes >= bytes.len()
+            && self.data[self.position..]
+                .iter()
+                .zip(bytes.iter())
+                .all(|(x, y)| x == y)
+    }
+
+    fn consume_bytes(&mut self, bytes: &[u8]) -> bool {
+        if self.check_bytes(bytes) {
+            self.consume_n(bytes.len());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consume_null_string(&mut self) -> bool {
+        if self.null_string.is_empty() {
+            // An empty NULL marker is supported. Look ahead to ensure that is followed by
+            // a column delimiter, an end of line or it is at the end of the data.
+            self.is_column_delimiter()
+                || self.is_end_of_line()
+                || self.is_end_of_copy_marker()
+                || self.is_eof()
+        } else {
+            self.consume_bytes(self.null_string.as_bytes())
+        }
+    }
+
+    fn consume_raw_value(&mut self) -> Result<Option<&[u8]>, io::Error> {
+        if self.consume_null_string() {
+            return Ok(None);
+        }
+
+        let mut start = self.position;
+
+        // buffer where unescaped data is accumulated
+        self.buffer.clear();
+
+        while !self.is_eof() && !self.is_end_of_copy_marker() {
+            if self.is_end_of_line() || self.is_column_delimiter() {
+                break;
+            }
+            match self.peek() {
+                Some(b'\\') => {
+                    // Add non-escaped data parsed so far
+                    self.buffer.extend(&self.data[start..self.position]);
+
+                    self.consume_n(1);
+                    match self.peek() {
+                        Some(b'b') => {
+                            self.consume_n(1);
+                            self.buffer.push(8);
+                        }
+                        Some(b'f') => {
+                            self.consume_n(1);
+                            self.buffer.push(12);
+                        }
+                        Some(b'n') => {
+                            self.consume_n(1);
+                            self.buffer.push(b'\n');
+                        }
+                        Some(b'r') => {
+                            self.consume_n(1);
+                            self.buffer.push(b'\r');
+                        }
+                        Some(b't') => {
+                            self.consume_n(1);
+                            self.buffer.push(b'\t');
+                        }
+                        Some(b'v') => {
+                            self.consume_n(1);
+                            self.buffer.push(11);
+                        }
+                        Some(b'x') => {
+                            self.consume_n(1);
+                            match self.peek() {
+                                Some(_c @ b'0'..=b'9')
+                                | Some(_c @ b'A'..=b'F')
+                                | Some(_c @ b'a'..=b'f') => {
+                                    let mut value: u8 = 0;
+                                    let decode_nibble = |b| match b {
+                                        Some(c @ b'a'..=b'f') => Some(c - b'a' + 10),
+                                        Some(c @ b'A'..=b'F') => Some(c - b'A' + 10),
+                                        Some(c @ b'0'..=b'9') => Some(c - b'0'),
+                                        _ => None,
+                                    };
+                                    for _ in 0..2 {
+                                        match decode_nibble(self.peek()) {
+                                            Some(c) => {
+                                                self.consume_n(1);
+                                                value = value << 4 | c;
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    self.buffer.push(value);
+                                }
+                                _ => {
+                                    self.buffer.push(b'x');
+                                }
+                            }
+                        }
+                        Some(_c @ b'0'..=b'7') => {
+                            let mut value: u8 = 0;
+                            for _ in 0..3 {
+                                match self.peek() {
+                                    Some(c @ b'0'..=b'7') => {
+                                        self.consume_n(1);
+                                        value = value << 3 | (c - b'0');
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            self.buffer.push(value);
+                        }
+                        Some(c) => {
+                            self.consume_n(1);
+                            self.buffer.push(c);
+                        }
+                        None => {
+                            self.buffer.push(b'\\');
+                        }
+                    }
+
+                    start = self.position;
+                }
+                Some(_) => {
+                    self.consume_n(1);
+                }
+                None => {}
+            }
+        }
+
+        // Return a slice of the original buffer if no escaped characters where processed
+        if self.buffer.is_empty() {
+            Ok(Some(&self.data[start..self.position]))
+        } else {
+            // ... otherwise, add the remaining non-escaped data to the decoding buffer
+            // and return a pointer to it
+            self.buffer.extend(&self.data[start..self.position]);
+            Ok(Some(&self.buffer[..]))
+        }
+    }
+}
+
+/// `CopyFormatParams` expresses valid conversions from [`CopyParams`] to the
+/// parameters supported by different `COPY FROM...WITH (FORMAT...)` options.
+///
+/// The circuitous path the conversions take let us error when executing the
+/// statement for the first time, before we've received any of the data.
+pub enum CopyFormatParams<'a> {
+    Text(CopyTextFormatParams<'a>),
+    Csv(CopyCsvFormatParams<'a>),
+}
+
+impl<'a> TryFrom<CopyParams> for CopyFormatParams<'a> {
+    type Error = ErrorResponse;
+
+    fn try_from(params: CopyParams) -> Result<CopyFormatParams<'a>, Self::Error> {
+        match params.format {
+            CopyFormat::Text => {
+                let params: CopyTextFormatParams = params.try_into()?;
+                Ok(CopyFormatParams::Text(params))
+            }
+            CopyFormat::Csv => {
+                let params: CopyCsvFormatParams = params.try_into()?;
+                Ok(CopyFormatParams::Csv(params))
+            }
+            CopyFormat::Binary => unreachable!(),
+        }
+    }
+}
+
+pub fn decode_copy_format<'a>(
+    data: &[u8],
+    column_types: &[pgrepr::Type],
+    params: CopyFormatParams<'a>,
+) -> Result<Vec<Row>, io::Error> {
+    match params {
+        CopyFormatParams::Text(params) => decode_copy_format_text(data, column_types, params),
+        CopyFormatParams::Csv(params) => decode_copy_format_csv(data, column_types, params),
+    }
+}
+
+pub struct CopyTextFormatParams<'a> {
+    null: Cow<'a, str>,
+    delimiter: Cow<'a, str>,
+}
+
+impl<'a> TryFrom<CopyParams> for CopyTextFormatParams<'a> {
+    type Error = ErrorResponse;
+
+    fn try_from(
+        CopyParams {
+            format,
+            null,
+            delimiter,
+            quote,
+            escape,
+            header,
+        }: CopyParams,
+    ) -> Result<Self, Self::Error> {
+        fn only_available_with_csv<T>(option: Option<T>, param: &str) -> Result<(), ErrorResponse> {
+            match option {
+                Some(..) => Err(ErrorResponse::error(
+                    SqlState::FEATURE_NOT_SUPPORTED,
+                    format!("COPY {} only available in CSV mode", param),
+                )),
+                None => Ok(()),
+            }
+        }
+
+        assert_eq!(format, CopyFormat::Text);
+        only_available_with_csv(quote, "quote")?;
+        only_available_with_csv(escape, "escape")?;
+        only_available_with_csv(header, "header")?;
+        let null = match null {
+            Some(null) => Cow::from(null),
+            None => Cow::from("\\N"),
+        };
+        let delimiter = match delimiter {
+            Some(delimiter) => {
+                if delimiter.len() > 1 {
+                    return Err(ErrorResponse::error(
+                        SqlState::FEATURE_NOT_SUPPORTED,
+                        "COPY delimiter must be a single one-byte character".to_string(),
+                    ));
+                }
+                Cow::from(delimiter)
+            }
+            None => Cow::from("\t"),
+        };
+
+        Ok(CopyTextFormatParams { null, delimiter })
+    }
+}
+
+pub fn decode_copy_format_text(
+    data: &[u8],
+    column_types: &[pgrepr::Type],
+    CopyTextFormatParams { null, delimiter }: CopyTextFormatParams,
+) -> Result<Vec<Row>, io::Error> {
+    let mut rows = Vec::new();
+
+    let mut parser = CopyTextFormatParser::new(data, &delimiter, &null);
+    while !parser.is_eof() && !parser.is_end_of_copy_marker() {
+        let mut row = Vec::new();
+        let buf = RowArena::new();
+        for (col, typ) in column_types.iter().enumerate() {
+            if col > 0 {
+                parser.expect_column_delimiter()?;
+            }
+            let raw_value = parser.consume_raw_value()?;
+            if let Some(raw_value) = raw_value {
+                match pgrepr::Value::decode_text(&typ, raw_value) {
+                    Ok(value) => row.push(value.into_datum(&buf, &typ).0),
+                    Err(err) => {
+                        let msg = format!("unable to decode column: {}", err);
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+                    }
+                }
+            } else {
+                row.push(Datum::Null);
+            }
+        }
+        parser.expect_end_of_line()?;
+        rows.push(Row::pack(row));
+    }
+    // Note that if there is any junk data after the end of copy marker, we drop
+    // it on the floor as PG does.
+    Ok(rows)
+}
+
+pub struct CopyCsvFormatParams<'a> {
+    delimiter: u8,
+    quote: u8,
+    escape: u8,
+    header: bool,
+    null: Cow<'a, str>,
+}
+
+impl<'a> TryFrom<CopyParams> for CopyCsvFormatParams<'a> {
+    type Error = ErrorResponse;
+
+    fn try_from(
+        CopyParams {
+            format,
+            null,
+            delimiter,
+            quote,
+            escape,
+            header,
+        }: CopyParams,
+    ) -> Result<Self, Self::Error> {
+        assert_eq!(format, CopyFormat::Csv);
+
+        fn extract_byte_param_value(
+            v: Option<String>,
+            default: u8,
+            param_name: &str,
+        ) -> Result<u8, ErrorResponse> {
+            Ok(match v {
+                Some(v) if v.len() == 1 => v.as_bytes()[0],
+                Some(..) => {
+                    return Err(ErrorResponse::error(
+                        SqlState::FEATURE_NOT_SUPPORTED,
+                        format!("COPY {} must be a single one-byte character", param_name),
+                    ))
+                }
+                None => default,
+            })
+        }
+
+        let null = match null {
+            Some(null) => Cow::from(null),
+            None => Cow::from(""),
+        };
+        let delimiter = extract_byte_param_value(delimiter, b',', "delimiter")?;
+        let quote = extract_byte_param_value(quote, b'"', "quote")?;
+        let escape = extract_byte_param_value(escape, quote, "escape")?;
+        let header = header.unwrap_or(false);
+
+        if delimiter == quote {
+            return Err(ErrorResponse::error(
+                SqlState::FEATURE_NOT_SUPPORTED,
+                "COPY delimiter and quote must be different".to_string(),
+            ));
+        }
+
+        Ok(CopyCsvFormatParams {
+            delimiter,
+            quote,
+            escape,
+            null,
+            header,
+        })
+    }
+}
+
+pub fn decode_copy_format_csv(
+    data: &[u8],
+    column_types: &[pgrepr::Type],
+    CopyCsvFormatParams {
+        delimiter,
+        quote,
+        escape,
+        null,
+        header,
+    }: CopyCsvFormatParams,
+) -> Result<Vec<Row>, io::Error> {
+    let mut rows = Vec::new();
+
+    let (double_quote, escape) = if quote == escape {
+        (true, None)
+    } else {
+        (false, Some(escape))
+    };
+
+    let mut rdr = ReaderBuilder::new()
+        .delimiter(delimiter)
+        .quote(quote)
+        .has_headers(header)
+        .double_quote(double_quote)
+        .escape(escape)
+        // Must be flexible to accept end of copy marker, which will always be 1
+        // field.
+        .flexible(true)
+        .from_reader(data);
+
+    let null_as_bytes = null.as_bytes();
+
+    let mut record = ByteRecord::new();
+
+    while rdr.read_byte_record(&mut record)? {
+        if record.len() == 1 && record.iter().next() == Some(&END_OF_COPY_MARKER) {
+            break;
+        }
+
+        match record.len().cmp(&column_types.len()) {
+            std::cmp::Ordering::Less => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing data for column",
+            )),
+            std::cmp::Ordering::Greater => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "extra data after last expected column",
+            )),
+            std::cmp::Ordering::Equal => Ok(()),
+        }?;
+
+        let mut row = Vec::new();
+        let buf = RowArena::new();
+
+        for (typ, raw_value) in column_types.iter().zip(record.iter()) {
+            if raw_value == null_as_bytes {
+                row.push(Datum::Null);
+            } else {
+                match pgrepr::Value::decode_text(typ, raw_value) {
+                    Ok(value) => row.push(value.into_datum(&buf, &typ).0),
+                    Err(err) => {
+                        let msg = format!("unable to decode column: {}", err);
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+                    }
+                }
+            }
+        }
+        rows.push(Row::pack(row));
+    }
+
+    Ok(rows)
 }
 
 pub fn encode_row_description(
     desc: &RelationDesc,
-    formats: &[mz_pgrepr::Format],
+    formats: &[pgrepr::Format],
 ) -> Vec<FieldDescription> {
     desc.iter()
         .zip_eq(formats)
         .map(|((name, typ), format)| {
-            let pg_type = mz_pgrepr::Type::from(&typ.scalar_type);
+            let pg_type = pgrepr::Type::from(&typ.scalar_type);
             FieldDescription {
                 name: name.clone(),
                 table_id: 0,
                 column_id: 0,
                 type_oid: pg_type.oid(),
                 type_len: pg_type.typlen(),
-                type_mod: pg_type.typmod(),
+                type_mod: match &typ.scalar_type {
+                    // NUMERIC types pack their precision and size into the
+                    // type_mod field. The high order bits store the precision
+                    // while the low order bits store the scale + 4 (!).
+                    //
+                    // https://github.com/postgres/postgres/blob/e435c1e7d/src/backend/utils/adt/numeric.c#L6364-L6367
+                    ScalarType::Numeric { scale } => match scale {
+                        // -1 represents default typemod, which allows values of differing scales
+                        None => -1i32,
+                        Some(scale) => {
+                            ((i32::try_from(NUMERIC_DATUM_MAX_PRECISION).unwrap() << 16)
+                                | i32::from(*scale))
+                                + 4
+                        }
+                    },
+                    _ => -1,
+                },
                 format: *format,
             }
         })
@@ -587,39 +1067,164 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_output_to_client() {
-        #[rustfmt::skip]
-        let test_cases = [
-            (CoordClientSeverity::Debug1, vec![Severity::Debug, Severity::Log, Severity::Notice, Severity::Warning, Severity::Error, Severity::Fatal, Severity:: Panic, Severity::Info], true),
-            (CoordClientSeverity::Debug2, vec![Severity::Debug, Severity::Log, Severity::Notice, Severity::Warning, Severity::Error, Severity::Fatal, Severity:: Panic, Severity::Info], true),
-            (CoordClientSeverity::Debug3, vec![Severity::Debug, Severity::Log, Severity::Notice, Severity::Warning, Severity::Error, Severity::Fatal, Severity:: Panic, Severity::Info], true),
-            (CoordClientSeverity::Debug4, vec![Severity::Debug, Severity::Log, Severity::Notice, Severity::Warning, Severity::Error, Severity::Fatal, Severity:: Panic, Severity::Info], true),
-            (CoordClientSeverity::Debug5, vec![Severity::Debug, Severity::Log, Severity::Notice, Severity::Warning, Severity::Error, Severity::Fatal, Severity:: Panic, Severity::Info], true),
-            (CoordClientSeverity::Log, vec![Severity::Notice, Severity::Warning, Severity::Error, Severity::Fatal, Severity:: Panic, Severity::Info], true),
-            (CoordClientSeverity::Log, vec![Severity::Debug], false),
-            (CoordClientSeverity::Info, vec![Severity::Notice, Severity::Warning, Severity::Error, Severity::Fatal, Severity:: Panic, Severity::Info], true),
-            (CoordClientSeverity::Info, vec![Severity::Debug, Severity::Log], false),
-            (CoordClientSeverity::Notice, vec![Severity::Notice, Severity::Warning, Severity::Error, Severity::Fatal, Severity:: Panic, Severity::Info], true),
-            (CoordClientSeverity::Notice, vec![Severity::Debug, Severity::Log], false),
-            (CoordClientSeverity::Warning, vec![Severity::Warning, Severity::Error, Severity::Fatal, Severity:: Panic, Severity::Info], true),
-            (CoordClientSeverity::Warning, vec![Severity::Debug, Severity::Log, Severity::Notice], false),
-            (CoordClientSeverity::Error, vec![Severity::Error, Severity::Fatal, Severity:: Panic, Severity::Info], true),
-            (CoordClientSeverity::Error, vec![Severity::Debug, Severity::Log, Severity::Notice, Severity::Warning], false),
+    fn test_copy_format_text_parser() {
+        let text = "\t\\nt e\t\\N\t\n\\x60\\xA\\x7D\\x4a\n\\44\\044\\123".as_bytes();
+        let mut parser = CopyTextFormatParser::new(text, "\t", "\\N");
+        assert!(parser.is_column_delimiter());
+        parser
+            .expect_column_delimiter()
+            .expect("expected column delimiter");
+        assert_eq!(
+            parser
+                .consume_raw_value()
+                .expect("unexpected error")
+                .expect("unexpected empty result"),
+            "\nt e".as_bytes()
+        );
+        parser
+            .expect_column_delimiter()
+            .expect("expected column delimiter");
+        // null value
+        assert!(parser
+            .consume_raw_value()
+            .expect("unexpected error")
+            .is_none());
+        parser
+            .expect_column_delimiter()
+            .expect("expected column delimiter");
+        assert!(parser.is_end_of_line());
+        parser.expect_end_of_line().expect("expected eol");
+        // hex value
+        assert_eq!(
+            parser
+                .consume_raw_value()
+                .expect("unexpected error")
+                .expect("unexpected empty result"),
+            "`\n}J".as_bytes()
+        );
+        parser.expect_end_of_line().expect("expected eol");
+        // octal value
+        assert_eq!(
+            parser
+                .consume_raw_value()
+                .expect("unexpected error")
+                .expect("unexpected empty result"),
+            "$$S".as_bytes()
+        );
+        assert!(parser.is_eof());
+    }
+
+    #[test]
+    fn test_copy_format_text_empty_null_string() {
+        let text = "\t\n10\t20\n30\t\n40\t".as_bytes();
+        let expect = vec![
+            vec![None, None],
+            vec![Some("10"), Some("20")],
+            vec![Some("30"), None],
+            vec![Some("40"), None],
+        ];
+        let mut parser = CopyTextFormatParser::new(text, "\t", "");
+        for line in expect {
+            for (i, value) in line.iter().enumerate() {
+                if i > 0 {
+                    parser
+                        .expect_column_delimiter()
+                        .expect("expected column delimiter");
+                }
+                match value {
+                    Some(s) => {
+                        assert!(!parser.consume_null_string());
+                        assert_eq!(
+                            parser
+                                .consume_raw_value()
+                                .expect("unexpected error")
+                                .expect("unexpected empty result"),
+                            s.as_bytes()
+                        );
+                    }
+                    None => {
+                        assert!(parser.consume_null_string());
+                    }
+                }
+            }
+            parser.expect_end_of_line().expect("expected eol");
+        }
+    }
+
+    #[test]
+    fn test_copy_format_text_parser_escapes() {
+        struct TestCase {
+            input: &'static str,
+            expect: &'static [u8],
+        }
+        let tests = vec![
+            TestCase {
+                input: "simple",
+                expect: b"simple",
+            },
+            TestCase {
+                input: r#"new\nline"#,
+                expect: b"new\nline",
+            },
+            TestCase {
+                input: r#"\b\f\n\r\t\v\\"#,
+                expect: b"\x08\x0c\n\r\t\x0b\\",
+            },
+            TestCase {
+                input: r#"\0\12\123"#,
+                expect: &[0, 0o12, 0o123],
+            },
+            TestCase {
+                input: r#"\x1\xaf"#,
+                expect: &[0x01, 0xaf],
+            },
+            TestCase {
+                input: r#"T\n\07\xEV\x0fA\xb2C\1"#,
+                expect: b"T\n\x07\x0eV\x0fA\xb2C\x01",
+            },
+            TestCase {
+                input: r#"\\\""#,
+                expect: b"\\\"",
+            },
+            TestCase {
+                input: r#"\x"#,
+                expect: b"x",
+            },
+            TestCase {
+                input: r#"\xg"#,
+                expect: b"xg",
+            },
+            TestCase {
+                input: r#"\"#,
+                expect: b"\\",
+            },
+            TestCase {
+                input: r#"\8"#,
+                expect: b"8",
+            },
+            TestCase {
+                input: r#"\a"#,
+                expect: b"a",
+            },
+            TestCase {
+                input: r#"\x\xg\8\xH\x32\s\"#,
+                expect: b"xxg8xH2s\\",
+            },
         ];
 
-        for test_case in test_cases {
-            run_test(test_case)
-        }
-
-        fn run_test(test_case: (CoordClientSeverity, Vec<Severity>, bool)) {
-            let client_min_messages_setting = test_case.0;
-            let expected = test_case.2;
-            for message_severity in test_case.1 {
-                assert!(
-                    message_severity.should_output_to_client(&client_min_messages_setting)
-                        == expected
-                )
-            }
+        for test in tests {
+            let mut parser = CopyTextFormatParser::new(test.input.as_bytes(), "\t", "\\N");
+            assert_eq!(
+                parser
+                    .consume_raw_value()
+                    .expect("unexpected error")
+                    .expect("unexpected empty result"),
+                test.expect,
+                "input: {}, expect: {:?}",
+                test.input,
+                std::str::from_utf8(test.expect),
+            );
+            assert!(parser.is_eof());
         }
     }
 }

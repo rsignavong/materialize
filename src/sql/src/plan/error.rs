@@ -12,17 +12,14 @@ use std::fmt;
 use std::num::ParseIntError;
 use std::num::TryFromIntError;
 
-use mz_expr::EvalError;
-use mz_ore::stack::RecursionLimitError;
-use mz_ore::str::StrExt;
-use mz_repr::adt::char::InvalidCharLengthError;
-use mz_repr::adt::numeric::InvalidNumericMaxScaleError;
-use mz_repr::adt::varchar::InvalidVarCharMaxLengthError;
-use mz_repr::strconv::ParseError;
-use mz_repr::ColumnName;
+use expr::EvalError;
+use ore::stack::RecursionLimitError;
+use ore::str::StrExt;
+use repr::strconv::ParseError;
+use repr::ColumnName;
 
 use crate::catalog::CatalogError;
-use crate::names::PartialObjectName;
+use crate::names::PartialName;
 use crate::plan::plan_utils::JoinSide;
 use crate::plan::scope::ScopeItem;
 
@@ -33,19 +30,19 @@ pub enum PlanError {
         issue_no: Option<usize>,
     },
     UnknownColumn {
-        table: Option<PartialObjectName>,
+        table: Option<PartialName>,
         column: ColumnName,
     },
     UngroupedColumn {
-        table: Option<PartialObjectName>,
+        table: Option<PartialName>,
         column: ColumnName,
     },
     WrongJoinTypeForLateralColumn {
-        table: Option<PartialObjectName>,
+        table: Option<PartialName>,
         column: ColumnName,
     },
     AmbiguousColumn(ColumnName),
-    AmbiguousTable(PartialObjectName),
+    AmbiguousTable(PartialName),
     UnknownColumnInUsingClause {
         column: ColumnName,
         join_side: JoinSide,
@@ -65,10 +62,6 @@ pub enum PlanError {
     Parse(ParseError),
     Catalog(CatalogError),
     UpsertSinkWithoutKey,
-    InvalidNumericMaxScale(InvalidNumericMaxScaleError),
-    InvalidCharLength(InvalidCharLengthError),
-    InvalidVarCharMaxLength(InvalidVarCharMaxLengthError),
-    InvalidTemporarySchema,
     // TODO(benesch): eventually all errors should be structured.
     Unstructured(String),
 }
@@ -153,13 +146,7 @@ impl fmt::Display for PlanError {
             Self::Parse(e) => write!(f, "{}", e),
             Self::Catalog(e) => write!(f, "{}", e),
             Self::UpsertSinkWithoutKey => write!(f, "upsert sinks must specify a key"),
-            Self::InvalidNumericMaxScale(e) => e.fmt(f),
-            Self::InvalidCharLength(e) => e.fmt(f),
-            Self::InvalidVarCharMaxLength(e) => e.fmt(f),
             Self::Unstructured(e) => write!(f, "{}", e),
-            Self::InvalidTemporarySchema => {
-                write!(f, "cannot create temporary item in non-temporary schema")
-            }
         }
     }
 }
@@ -181,24 +168,6 @@ impl From<ParseError> for PlanError {
 impl From<RecursionLimitError> for PlanError {
     fn from(e: RecursionLimitError) -> PlanError {
         PlanError::RecursionLimit(e)
-    }
-}
-
-impl From<InvalidNumericMaxScaleError> for PlanError {
-    fn from(e: InvalidNumericMaxScaleError) -> PlanError {
-        PlanError::InvalidNumericMaxScale(e)
-    }
-}
-
-impl From<InvalidCharLengthError> for PlanError {
-    fn from(e: InvalidCharLengthError) -> PlanError {
-        PlanError::InvalidCharLength(e)
-    }
-}
-
-impl From<InvalidVarCharMaxLengthError> for PlanError {
-    fn from(e: InvalidVarCharMaxLengthError) -> PlanError {
-        PlanError::InvalidVarCharMaxLength(e)
     }
 }
 
@@ -227,7 +196,7 @@ impl From<EvalError> for PlanError {
 }
 
 struct ColumnDisplay<'a> {
-    table: &'a Option<PartialObjectName>,
+    table: &'a Option<PartialName>,
     column: &'a ColumnName,
 }
 

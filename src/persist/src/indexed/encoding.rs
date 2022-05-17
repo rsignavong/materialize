@@ -13,16 +13,15 @@
 // Ditto for Log* and the Log. The others are used internally in these top-level
 // structs.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::io::Cursor;
 use std::ops::Range;
+use std::{fmt, io};
 
-use bytes::BufMut;
 use differential_dataflow::trace::Description;
-use mz_ore::cast::CastFrom;
-use mz_persist_types::Codec;
-use prost::Message;
+use ore::cast::CastFrom;
+use persist_types::Codec;
+use protobuf::MessageField;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
@@ -30,17 +29,11 @@ use timely::PartialOrder;
 
 use crate::error::Error;
 use crate::gen::persist::{
-    proto_batch_inline, ProtoArrangement, ProtoBatchFormat, ProtoBatchInline, ProtoMeta,
-    ProtoStreamRegistration, ProtoTraceBatchMeta, ProtoTraceBatchPartInline, ProtoU64Antichain,
-    ProtoU64Description, ProtoUnsealedBatchInline, ProtoUnsealedBatchMeta,
+    ProtoArrangement, ProtoMeta, ProtoStreamRegistration, ProtoTraceBatchMeta, ProtoU64Antichain,
+    ProtoU64Description, ProtoUnsealedBatchMeta,
 };
-use crate::indexed::cache::{BlobCache, CacheHint};
-use crate::indexed::columnar::parquet::{
-    decode_trace_parquet, decode_unsealed_parquet, encode_trace_parquet, encode_unsealed_parquet,
-};
-use crate::indexed::columnar::ColumnarRecords;
-use crate::indexed::snapshot::UnsealedSnapshot;
-use crate::location::{BlobRead, SeqNo};
+use crate::indexed::ColumnarRecords;
+use crate::storage::SeqNo;
 
 /// An internally unique id for a persisted stream. External users identify
 /// streams with a string, which is then mapped internally to this.
@@ -48,7 +41,7 @@ use crate::location::{BlobRead, SeqNo};
 pub struct Id(pub u64);
 
 /// The structure serialized and stored as an entry in a
-/// [crate::location::Log].
+/// [crate::storage::Log].
 ///
 /// Invariants:
 /// - The updates field is non-empty.
@@ -58,10 +51,10 @@ pub struct LogEntry {
     //
     // We could require that each Id is included at most once, but at the
     // moment, there's no particular reason we'd need to.
-    pub updates: Vec<(Id, Vec<((Vec<u8>, Vec<u8>), u64, i64)>)>,
+    pub updates: Vec<(Id, Vec<((Vec<u8>, Vec<u8>), u64, isize)>)>,
 }
 
-/// The structure serialized and stored as a value in [crate::location::Blob]
+/// The structure serialized and stored as a value in [crate::storage::Blob]
 /// storage for metadata keys.
 ///
 /// Invariants:
@@ -126,6 +119,7 @@ pub struct StreamRegistration {
 /// Invariants:
 /// - The unsealed_batch SeqNo ranges are sorted and non-overlapping.
 /// - The trace_batch Descriptions are sorted, non-overlapping, and contiguous.
+/// - The since frontier is either 0 or < the trace's sealed frontier.
 /// - Every batch's since frontier is <= the overall trace's since frontier.
 /// - The compaction level of trace_batches is weakly decreasing when iterating
 ///   from oldest to most recent time intervals.
@@ -156,8 +150,6 @@ pub struct ArrangementMeta {
 pub struct UnsealedBatchMeta {
     /// The key to retrieve the [BlobUnsealedBatch] from blob storage.
     pub key: String,
-    /// The format of the stored batch data.
-    pub format: ProtoBatchFormat,
     /// Half-open interval [lower, upper) of sequence numbers that this batch
     /// contains updates for.
     pub desc: Range<SeqNo>,
@@ -169,22 +161,15 @@ pub struct UnsealedBatchMeta {
     pub size_bytes: u64,
 }
 
-/// The metadata necessary to reconstruct a list of [BlobTraceBatchPart]s.
+/// The metadata necessary to reconstruct a [BlobTraceBatch].
 ///
 /// Invariants:
 /// - The Description's time interval is non-empty.
-/// - Keys for all trace batch parts are unique.
-/// - Keys for all trace batch parts are stored in index order.
-/// - The data in all of the trace batch parts is sorted and consolidated.
-/// - All of the trace batch parts have the same desc as the metadata.
+/// - TODO: key invariants?
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraceBatchMeta {
-    /// The keys to retrieve the batch's data from the blob store.
-    ///
-    /// The set of keys can be empty to denote an empty batch.
-    pub keys: Vec<String>,
-    /// The format of the stored batch data.
-    pub format: ProtoBatchFormat,
+    /// The key to retrieve the batch's data from the blob store.
+    pub key: String,
     /// The half-open time interval `[lower, upper)` this batch contains data
     /// for.
     pub desc: Description<u64>,
@@ -194,48 +179,26 @@ pub struct TraceBatchMeta {
     pub size_bytes: u64,
 }
 
-/// The metadata necessary to reconstruct an [UnsealedSnapshot].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnsealedSnapshotMeta {
-    /// A closed lower bound on the times of contained updates.
-    pub ts_lower: Antichain<u64>,
-    /// An open upper bound on the times of the contained updates.
-    pub ts_upper: Antichain<u64>,
-    /// The batches making up the snapshot.
-    pub batches: Vec<UnsealedBatchMeta>,
-}
-
-impl UnsealedSnapshotMeta {
-    /// Creates an UnsealedSnapshot by kicking off the necessary blob fetches.
-    pub fn fetch<B: BlobRead>(self, blob: &BlobCache<B>) -> UnsealedSnapshot {
-        let batches = self
-            .batches
-            .into_iter()
-            .map(|x| blob.get_unsealed_batch_async(&x.key, CacheHint::MaybeAdd))
-            .collect();
-        UnsealedSnapshot {
-            ts_lower: self.ts_lower,
-            ts_upper: self.ts_upper,
-            batches,
-        }
-    }
-}
-
-/// The structure serialized and stored as a value in [crate::location::Blob]
+/// The structure serialized and stored as a value in [crate::storage::Blob]
 /// storage for data keys corresponding to unsealed data.
 ///
 /// Invariants:
 /// - The [lower, upper) interval of sequence numbers in desc is non-empty.
 /// - The updates field is non-empty.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlobUnsealedBatch {
     /// Which updates are included in this batch.
     pub desc: Range<SeqNo>,
     /// The updates themselves.
+    ///
+    /// TODO: ideally, these would be a single ColumnarRecords instead of multiple.
+    /// We are keeping it this way for now because it is a optimization on the latency
+    /// sensitive fast path to avoid allocating one large ColumnarRecords and copying
+    /// everything into it.
     pub updates: Vec<ColumnarRecords>,
 }
 
-/// The structure serialized and stored as a value in [crate::location::Blob]
+/// The structure serialized and stored as a value in [crate::storage::Blob]
 /// storage for data keys corresponding to trace data.
 ///
 /// This batch represents the data that was originally written at some time in
@@ -256,20 +219,19 @@ pub struct BlobUnsealedBatch {
 /// - The values in updates are "consolidated", i.e. (key, value, time) is
 ///   unique.
 /// - All entries have a non-zero diff.
+/// - (Intentionally no invariant around update non-emptiness because we might
+///   need empty batches to make the timestamps line up.)
 ///
-/// TODO: disallow empty trace batch parts in the future so there is one unique way
-/// to represent an empty trace batch.
-#[derive(Clone, Debug)]
-pub struct BlobTraceBatchPart {
+/// TODO: This probably wants to be a different level of abstraction, so we can
+/// put multiple small batches in a single blob but also break a very large
+/// batch over multiple blobs. We also may want to break the latter into chunks
+/// for checksum and encryption?
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlobTraceBatch {
     /// Which updates are included in this batch.
-    ///
-    /// There may be other parts for the batch that also contain updates within
-    /// the specified [lower, upper) range.
     pub desc: Description<u64>,
-    /// Index of this part in the list of parts that form the batch.
-    pub index: u64,
     /// The updates themselves.
-    pub updates: Vec<ColumnarRecords>,
+    pub updates: Vec<((Vec<u8>, Vec<u8>), u64, isize)>,
 }
 
 impl LogEntry {
@@ -293,6 +255,19 @@ impl Default for BlobMeta {
             graveyard: Vec::new(),
             arrangements: Vec::new(),
         }
+    }
+}
+
+struct ExtendWriteAdapter<'e, E>(&'e mut E);
+
+impl<'e, E: for<'a> Extend<&'a u8>> io::Write for ExtendWriteAdapter<'e, E> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
+        self.0.extend(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<(), io::Error> {
+        Ok(())
     }
 }
 
@@ -396,12 +371,10 @@ impl BlobMeta {
                 batch_keys.insert(batch.key.clone());
             }
             for batch in a.trace_batches.iter() {
-                for key in batch.keys.iter() {
-                    if batch_keys.contains(key) {
-                        return Err(format!("duplicate batch key found in trace: {}", key).into());
-                    }
-                    batch_keys.insert(key.clone());
+                if batch_keys.contains(&batch.key) {
+                    return Err(format!("duplicate batch key found in trace: {}", batch.key).into());
                 }
+                batch_keys.insert(batch.key.clone());
             }
         }
 
@@ -457,6 +430,17 @@ impl ArrangementMeta {
                 }
             }
             unsealed_prev = Some(&meta)
+        }
+
+        let trace_upper = self.trace_ts_upper();
+        let min = Antichain::from_elem(Timestamp::minimum());
+
+        if self.since != min && !PartialOrder::less_than(&self.since, &self.seal) {
+            return Err(format!(
+                "invalid trace since {:?} at or in advance of trace seal {:?}",
+                self.since, trace_upper
+            )
+            .into());
         }
 
         let mut trace_prev: Option<&TraceBatchMeta> = None;
@@ -547,48 +531,6 @@ impl TraceBatchMeta {
 
         Ok(())
     }
-
-    /// Assert that all of the [BlobTraceBatchPart]'s obey the required invariants.
-    pub fn validate_data<B: BlobRead>(&self, cache: &BlobCache<B>) -> Result<(), Error> {
-        let mut batches = vec![];
-        for (idx, key) in self.keys.iter().enumerate() {
-            let batch = cache
-                .get_trace_batch_async(key, CacheHint::NeverAdd)
-                .recv()?;
-            if batch.desc != self.desc {
-                return Err(format!(
-                    "invalid trace batch part desc expected {:?} got {:?}",
-                    &self.desc, &batch.desc
-                )
-                .into());
-            }
-
-            if batch.index != u64::cast_from(idx) {
-                return Err(format!(
-                    "invalid index for blob trace batch part at key {} expected {} got {}",
-                    key, idx, batch.index
-                )
-                .into());
-            }
-
-            batch.validate()?;
-            batches.push(batch);
-        }
-
-        for update in batches
-            .iter()
-            .flat_map(|batch| batch.updates.iter().flat_map(|u| u.iter()))
-        {
-            let ((_key, _val), _ts, diff) = update;
-
-            // Check data invariants.
-            if diff == 0 {
-                return Err(format!("update with 0 diff: {:?}", PrettyRecord(update)).into());
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl BlobUnsealedBatch {
@@ -616,22 +558,22 @@ impl BlobUnsealedBatch {
 // interface for this.
 impl Codec for BlobUnsealedBatch {
     fn codec_name() -> String {
-        "parquet[UnsealedBatch]".into()
+        "bincode[BlobUnsealedBatch]".into()
     }
 
-    fn encode<B>(&self, buf: &mut B)
-    where
-        B: BufMut,
-    {
-        encode_unsealed_parquet(&mut buf.writer(), &self).expect("writes to BufMut are infallible");
+    fn encode<E: for<'a> Extend<&'a u8>>(&self, buf: &mut E) {
+        // See https://github.com/bincode-org/bincode/issues/293 for why this is
+        // infallible.
+        bincode::serialize_into(&mut ExtendWriteAdapter(buf), self)
+            .expect("infallible for BlobUnsealedBatch");
     }
 
     fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
-        decode_unsealed_parquet(&mut Cursor::new(&buf)).map_err(|err| err.to_string())
+        bincode::deserialize(buf).map_err(|err| err.to_string())
     }
 }
 
-impl BlobTraceBatchPart {
+impl BlobTraceBatch {
     /// Asserts the documented invariants, returning an error if any are
     /// violated.
     pub fn validate(&self) -> Result<(), Error> {
@@ -642,10 +584,11 @@ impl BlobTraceBatchPart {
             return Err(format!("invalid desc: {:?}", &self.desc).into());
         }
 
-        for update in self.updates.iter().flat_map(|u| u.iter()) {
-            let ((_key, _val), ts, diff) = update;
+        let mut prev: Option<(PrettyBytes<'_>, PrettyBytes<'_>, &u64)> = None;
+        for update in self.updates.iter() {
+            let ((key, val), ts, diff) = update;
             // Check ts against desc.
-            if !self.desc.lower().less_equal(&ts) {
+            if !self.desc.lower().less_equal(ts) {
                 return Err(format!(
                     "timestamp {} is less than the batch lower: {:?}",
                     ts, self.desc
@@ -654,14 +597,14 @@ impl BlobTraceBatchPart {
             }
 
             if PartialOrder::less_than(self.desc.since(), self.desc.upper()) {
-                if self.desc.upper().less_equal(&ts) {
+                if self.desc.upper().less_equal(ts) {
                     return Err(format!(
                         "timestamp {} is greater than or equal to the batch upper: {:?}",
                         ts, self.desc
                     )
                     .into());
                 }
-            } else if self.desc.since().less_than(&ts) {
+            } else if self.desc.since().less_than(ts) {
                 return Err(format!(
                     "timestamp {} is greater than the batch since: {:?}",
                     ts, self.desc,
@@ -669,8 +612,21 @@ impl BlobTraceBatchPart {
                 .into());
             }
 
+            // Check ordering.
+            let this = (PrettyBytes(key), PrettyBytes(val), ts);
+            if let Some(prev) = prev {
+                match prev.cmp(&this) {
+                    Ordering::Less => {} // Correct.
+                    Ordering::Equal => return Err(format!("unconsolidated: {:?}", this).into()),
+                    Ordering::Greater => {
+                        return Err(format!("unsorted: {:?} was before {:?}", prev, this).into())
+                    }
+                }
+            }
+            prev = Some(this);
+
             // Check data invariants.
-            if diff == 0 {
+            if *diff == 0 {
                 return Err(format!("update with 0 diff: {:?}", PrettyRecord(update)).into());
             }
         }
@@ -678,23 +634,23 @@ impl BlobTraceBatchPart {
     }
 }
 
-// BlobTraceBatchPart doesn't really need to implement Codec (it's never stored as a
+// BlobTraceBatch doesn't really need to implement Codec (it's never stored as a
 // key or value in a persisted record) but it's nice to have a common interface
 // for this.
-impl Codec for BlobTraceBatchPart {
+impl Codec for BlobTraceBatch {
     fn codec_name() -> String {
-        "parquet[TraceBatch]".into()
+        "bincode[BlobTraceBatch]".into()
     }
 
-    fn encode<B>(&self, buf: &mut B)
-    where
-        B: BufMut,
-    {
-        encode_trace_parquet(&mut buf.writer(), self).expect("writes to BufMut are infallible");
+    fn encode<E: for<'a> Extend<&'a u8>>(&self, buf: &mut E) {
+        // See https://github.com/bincode-org/bincode/issues/293 for why this is
+        // infallible.
+        bincode::serialize_into(&mut ExtendWriteAdapter(buf), self)
+            .expect("infallible for BlobTraceBatch");
     }
 
     fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
-        decode_trace_parquet(&mut Cursor::new(&buf)).map_err(|err| err.to_string())
+        bincode::deserialize(buf).map_err(|err| err.to_string())
     }
 }
 
@@ -710,7 +666,7 @@ impl fmt::Debug for PrettyBytes<'_> {
     }
 }
 
-struct PrettyRecord<'a>(((&'a [u8], &'a [u8]), u64, i64));
+struct PrettyRecord<'a>(&'a ((Vec<u8>, Vec<u8>), u64, isize));
 
 impl fmt::Debug for PrettyRecord<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -742,9 +698,11 @@ impl From<(u64, ProtoArrangement)> for ArrangementMeta {
             id: Id(id),
             seal: x
                 .seal
+                .into_option()
                 .map_or_else(|| Antichain::from_elem(u64::minimum()), |x| x.into()),
             since: x
                 .since
+                .into_option()
                 .map_or_else(|| Antichain::from_elem(u64::minimum()), |x| x.into()),
             unsealed_batches: x.unsealed_batches.into_iter().map(|x| x.into()).collect(),
             trace_batches: x.trace_batches.into_iter().map(|x| x.into()).collect(),
@@ -767,7 +725,6 @@ impl From<(u64, ProtoStreamRegistration)> for StreamRegistration {
 impl From<ProtoUnsealedBatchMeta> for UnsealedBatchMeta {
     fn from(x: ProtoUnsealedBatchMeta) -> Self {
         UnsealedBatchMeta {
-            format: x.format(),
             key: x.key,
             desc: SeqNo(x.seqno_lower)..SeqNo(x.seqno_upper),
             ts_upper: x.ts_upper,
@@ -780,9 +737,8 @@ impl From<ProtoUnsealedBatchMeta> for UnsealedBatchMeta {
 impl From<ProtoTraceBatchMeta> for TraceBatchMeta {
     fn from(x: ProtoTraceBatchMeta) -> Self {
         TraceBatchMeta {
-            format: x.format(),
-            keys: x.keys.clone(),
-            desc: x.desc.map_or_else(
+            key: x.key,
+            desc: x.desc.into_option().map_or_else(
                 || {
                     Description::new(
                         Antichain::from_elem(u64::minimum()),
@@ -802,10 +758,13 @@ impl From<ProtoU64Description> for Description<u64> {
     fn from(x: ProtoU64Description) -> Self {
         Description::new(
             x.lower
+                .into_option()
                 .map_or_else(|| Antichain::from_elem(u64::minimum()), |x| x.into()),
             x.upper
+                .into_option()
                 .map_or_else(|| Antichain::from_elem(u64::minimum()), |x| x.into()),
             x.since
+                .into_option()
                 .map_or_else(|| Antichain::from_elem(u64::minimum()), |x| x.into()),
         )
     }
@@ -826,6 +785,8 @@ impl From<(&BlobMeta, &Version)> for ProtoMeta {
             id_mapping: x.id_mapping.iter().map(|x| (x.id.0, x.into())).collect(),
             graveyard: x.graveyard.iter().map(|x| (x.id.0, x.into())).collect(),
             arrangements: x.arrangements.iter().map(|x| (x.id.0, x.into())).collect(),
+            unknown_fields: Default::default(),
+            cached_size: Default::default(),
         }
     }
 }
@@ -833,10 +794,12 @@ impl From<(&BlobMeta, &Version)> for ProtoMeta {
 impl From<&ArrangementMeta> for ProtoArrangement {
     fn from(x: &ArrangementMeta) -> Self {
         ProtoArrangement {
-            since: Some((&x.since).into()),
-            seal: Some((&x.seal).into()),
+            since: MessageField::some((&x.since).into()),
+            seal: MessageField::some((&x.seal).into()),
             unsealed_batches: x.unsealed_batches.iter().map(|x| x.into()).collect(),
             trace_batches: x.trace_batches.iter().map(|x| x.into()).collect(),
+            unknown_fields: Default::default(),
+            cached_size: Default::default(),
         }
     }
 }
@@ -847,6 +810,8 @@ impl From<&StreamRegistration> for ProtoStreamRegistration {
             name: x.name.clone(),
             key_codec_name: x.key_codec_name.clone(),
             val_codec_name: x.val_codec_name.clone(),
+            unknown_fields: Default::default(),
+            cached_size: Default::default(),
         }
     }
 }
@@ -855,12 +820,13 @@ impl From<&UnsealedBatchMeta> for ProtoUnsealedBatchMeta {
     fn from(x: &UnsealedBatchMeta) -> Self {
         ProtoUnsealedBatchMeta {
             key: x.key.clone(),
-            format: x.format.into(),
             seqno_upper: x.desc.end.0,
             seqno_lower: x.desc.start.0,
             ts_upper: x.ts_upper,
             ts_lower: x.ts_lower,
             size_bytes: x.size_bytes,
+            unknown_fields: Default::default(),
+            cached_size: Default::default(),
         }
     }
 }
@@ -868,11 +834,12 @@ impl From<&UnsealedBatchMeta> for ProtoUnsealedBatchMeta {
 impl From<&TraceBatchMeta> for ProtoTraceBatchMeta {
     fn from(x: &TraceBatchMeta) -> Self {
         ProtoTraceBatchMeta {
-            keys: x.keys.clone(),
-            format: x.format.into(),
-            desc: Some((&x.desc).into()),
+            key: x.key.clone(),
+            desc: MessageField::some((&x.desc).into()),
             level: x.level,
             size_bytes: x.size_bytes,
+            unknown_fields: Default::default(),
+            cached_size: Default::default(),
         }
     }
 }
@@ -881,6 +848,8 @@ impl From<&Antichain<u64>> for ProtoU64Antichain {
     fn from(x: &Antichain<u64>) -> Self {
         ProtoU64Antichain {
             elements: x.elements().to_vec(),
+            unknown_fields: Default::default(),
+            cached_size: Default::default(),
         }
     }
 }
@@ -888,96 +857,27 @@ impl From<&Antichain<u64>> for ProtoU64Antichain {
 impl From<&Description<u64>> for ProtoU64Description {
     fn from(x: &Description<u64>) -> Self {
         ProtoU64Description {
-            lower: Some(x.lower().into()),
-            upper: Some(x.upper().into()),
-            since: Some(x.since().into()),
+            lower: MessageField::some(x.lower().into()),
+            upper: MessageField::some(x.upper().into()),
+            since: MessageField::some(x.since().into()),
+            unknown_fields: Default::default(),
+            cached_size: Default::default(),
         }
-    }
-}
-
-/// Encodes the inline metadata for an unsealed batch into a base64 string.
-pub fn encode_unsealed_inline_meta(batch: &BlobUnsealedBatch, format: ProtoBatchFormat) -> String {
-    let inline = ProtoBatchInline {
-        batch_type: Some(proto_batch_inline::BatchType::Unsealed(
-            ProtoUnsealedBatchInline {
-                format: format.into(),
-                seqno_lower: batch.desc.start.0,
-                seqno_upper: batch.desc.end.0,
-            },
-        )),
-    };
-    let inline_encoded = inline.encode_to_vec();
-    base64::encode(inline_encoded)
-}
-
-/// Encodes the inline metadata for a trace batch into a base64 string.
-pub fn encode_trace_inline_meta(batch: &BlobTraceBatchPart, format: ProtoBatchFormat) -> String {
-    let inline = ProtoBatchInline {
-        batch_type: Some(proto_batch_inline::BatchType::Trace(
-            ProtoTraceBatchPartInline {
-                format: format.into(),
-                desc: Some((&batch.desc).into()),
-                index: batch.index,
-            },
-        )),
-    };
-    let inline_encoded = inline.encode_to_vec();
-    base64::encode(inline_encoded)
-}
-
-/// Decodes the inline metadata for an unsealed batch from a base64 string.
-pub fn decode_unsealed_inline_meta(
-    inline_base64: Option<&String>,
-) -> Result<(ProtoBatchFormat, ProtoUnsealedBatchInline), Error> {
-    let inline_base64 = inline_base64.ok_or("missing batch metadata")?;
-    let inline_encoded = base64::decode(&inline_base64).map_err(|err| err.to_string())?;
-    let inline = ProtoBatchInline::decode(&*inline_encoded).map_err(|err| err.to_string())?;
-    match inline.batch_type {
-        Some(proto_batch_inline::BatchType::Unsealed(x)) => {
-            let format = ProtoBatchFormat::from_i32(x.format)
-                .ok_or_else(|| Error::from(format!("unknown format: {}", x.format)))?;
-            Ok((format, x))
-        }
-        x => return Err(format!("incorrect batch type: {:?}", x).into()),
-    }
-}
-
-/// Decodes the inline metadata for a trace batch from a base64 string.
-pub fn decode_trace_inline_meta(
-    inline_base64: Option<&String>,
-) -> Result<(ProtoBatchFormat, ProtoTraceBatchPartInline), Error> {
-    let inline_base64 = inline_base64.ok_or("missing batch metadata")?;
-    let inline_encoded = base64::decode(&inline_base64).map_err(|err| err.to_string())?;
-    let inline = ProtoBatchInline::decode(&*inline_encoded).map_err(|err| err.to_string())?;
-    match inline.batch_type {
-        Some(proto_batch_inline::BatchType::Trace(x)) => {
-            let format = ProtoBatchFormat::from_i32(x.format)
-                .ok_or_else(|| Error::from(format!("unknown format: {}", x.format)))?;
-            Ok((format, x))
-        }
-        x => return Err(format!("incorrect batch type: {:?}", x).into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use tokio::runtime::Runtime as AsyncRuntime;
-
     use crate::error::Error;
-    use crate::indexed::columnar::ColumnarRecordsVec;
-    use crate::indexed::Metrics;
-    use crate::mem::MemRegistry;
     use crate::workload::DataGenerator;
 
     use super::*;
 
-    fn update_with_ts(ts: u64) -> ((Vec<u8>, Vec<u8>), u64, i64) {
+    fn update_with_ts(ts: u64) -> ((Vec<u8>, Vec<u8>), u64, isize) {
         (("".into(), "".into()), ts, 1)
     }
 
-    fn update_with_key(ts: u64, key: &'static str) -> ((Vec<u8>, Vec<u8>), u64, i64) {
+    fn update_with_key(ts: u64, key: &'static str) -> ((Vec<u8>, Vec<u8>), u64, isize) {
         ((key.into(), "".into()), ts, 1)
     }
 
@@ -991,8 +891,7 @@ mod tests {
 
     fn batch_meta(lower: u64, upper: u64) -> TraceBatchMeta {
         TraceBatchMeta {
-            keys: vec![],
-            format: ProtoBatchFormat::Unknown,
+            key: "".to_string(),
             desc: u64_desc(lower, upper),
             level: 1,
             size_bytes: 0,
@@ -1001,8 +900,7 @@ mod tests {
 
     fn batch_meta_full(lower: u64, upper: u64, since: u64, level: u64) -> TraceBatchMeta {
         TraceBatchMeta {
-            keys: vec![],
-            format: ProtoBatchFormat::Unknown,
+            key: "".to_string(),
             desc: u64_desc_since(lower, upper, since),
             level,
             size_bytes: 0,
@@ -1020,7 +918,6 @@ mod tests {
     fn unsealed_batch_meta(lower: u64, upper: u64) -> UnsealedBatchMeta {
         UnsealedBatchMeta {
             key: "".to_string(),
-            format: ProtoBatchFormat::Unknown,
             desc: SeqNo(lower)..SeqNo(upper),
             ts_upper: 0,
             ts_lower: 0,
@@ -1028,8 +925,8 @@ mod tests {
         }
     }
 
-    fn columnar_records(updates: Vec<((Vec<u8>, Vec<u8>), u64, i64)>) -> Vec<ColumnarRecords> {
-        updates.iter().collect::<ColumnarRecordsVec>().into_inner()
+    fn columnar_records(updates: Vec<((Vec<u8>, Vec<u8>), u64, isize)>) -> Vec<ColumnarRecords> {
+        vec![updates.iter().collect::<ColumnarRecords>()]
     }
 
     impl From<(&'_ str, Id)> for StreamRegistration {
@@ -1097,26 +994,23 @@ mod tests {
     #[test]
     fn trace_batch_validate() {
         // Normal case
-        let b = BlobTraceBatchPart {
+        let b = BlobTraceBatch {
             desc: u64_desc(0, 2),
-            index: 0,
-            updates: columnar_records(vec![update_with_key(0, "0"), update_with_key(1, "1")]),
+            updates: vec![update_with_key(0, "0"), update_with_key(1, "1")],
         };
         assert_eq!(b.validate(), Ok(()));
 
         // Empty
-        let b: BlobTraceBatchPart = BlobTraceBatchPart {
+        let b: BlobTraceBatch = BlobTraceBatch {
             desc: u64_desc(0, 2),
-            index: 0,
-            updates: columnar_records(vec![]),
+            updates: vec![],
         };
         assert_eq!(b.validate(), Ok(()));
 
         // Invalid desc
-        let b: BlobTraceBatchPart = BlobTraceBatchPart {
+        let b: BlobTraceBatch = BlobTraceBatch {
             desc: u64_desc(2, 0),
-            index: 0,
-            updates: columnar_records(vec![]),
+            updates: vec![],
         };
         assert_eq!(
             b.validate(),
@@ -1126,10 +1020,9 @@ mod tests {
         );
 
         // Empty desc
-        let b: BlobTraceBatchPart = BlobTraceBatchPart {
+        let b: BlobTraceBatch = BlobTraceBatch {
             desc: u64_desc(0, 0),
-            index: 0,
-            updates: columnar_records(vec![]),
+            updates: vec![],
         };
         assert_eq!(
             b.validate(),
@@ -1138,51 +1031,67 @@ mod tests {
             ))
         );
 
+        // Not sorted by key
+        let b = BlobTraceBatch {
+            desc: u64_desc(0, 2),
+            updates: vec![update_with_key(0, "1"), update_with_key(1, "0")],
+        };
+        assert_eq!(
+            b.validate(),
+            Err(Error::from(
+                "unsorted: (\"1\", \"\", 0) was before (\"0\", \"\", 1)"
+            ))
+        );
+
+        // Not consolidated
+        let b = BlobTraceBatch {
+            desc: u64_desc(0, 2),
+            updates: vec![update_with_key(0, "0"), update_with_key(0, "0")],
+        };
+        assert_eq!(
+            b.validate(),
+            Err(Error::from("unconsolidated: (\"0\", \"\", 0)"))
+        );
+
         // Update "before" desc
-        let b = BlobTraceBatchPart {
+        let b = BlobTraceBatch {
             desc: u64_desc(1, 2),
-            index: 0,
-            updates: columnar_records(vec![update_with_key(0, "0")]),
+            updates: vec![update_with_key(0, "0")],
         };
         assert_eq!(b.validate(), Err(Error::from("timestamp 0 is less than the batch lower: Description { lower: Antichain { elements: [1] }, upper: Antichain { elements: [2] }, since: Antichain { elements: [0] } }")));
 
         // Update "after" desc
-        let b = BlobTraceBatchPart {
+        let b = BlobTraceBatch {
             desc: u64_desc(1, 2),
-            index: 0,
-            updates: columnar_records(vec![update_with_key(2, "0")]),
+            updates: vec![update_with_key(2, "0")],
         };
         assert_eq!(b.validate(), Err(Error::from("timestamp 2 is greater than or equal to the batch upper: Description { lower: Antichain { elements: [1] }, upper: Antichain { elements: [2] }, since: Antichain { elements: [0] } }")));
 
         // Normal case: update "after" desc and within since
-        let b = BlobTraceBatchPart {
+        let b = BlobTraceBatch {
             desc: u64_desc_since(1, 2, 4),
-            index: 0,
-            updates: columnar_records(vec![update_with_key(2, "0")]),
+            updates: vec![update_with_key(2, "0")],
         };
         assert_eq!(b.validate(), Ok(()));
 
         // Normal case: update "after" desc and at since
-        let b = BlobTraceBatchPart {
+        let b = BlobTraceBatch {
             desc: u64_desc_since(1, 2, 4),
-            index: 0,
-            updates: columnar_records(vec![update_with_key(4, "0")]),
+            updates: vec![update_with_key(4, "0")],
         };
         assert_eq!(b.validate(), Ok(()));
 
         // Update "after" desc since
-        let b = BlobTraceBatchPart {
+        let b = BlobTraceBatch {
             desc: u64_desc_since(1, 2, 4),
-            index: 0,
-            updates: columnar_records(vec![update_with_key(5, "0")]),
+            updates: vec![update_with_key(5, "0")],
         };
         assert_eq!(b.validate(), Err(Error::from("timestamp 5 is greater than the batch since: Description { lower: Antichain { elements: [1] }, upper: Antichain { elements: [2] }, since: Antichain { elements: [4] } }")));
 
         // Invalid update
-        let b: BlobTraceBatchPart = BlobTraceBatchPart {
+        let b: BlobTraceBatch = BlobTraceBatch {
             desc: u64_desc(0, 1),
-            index: 0,
-            updates: columnar_records(vec![(("0".into(), "0".into()), 0, 0)]),
+            updates: vec![(("0".into(), "0".into()), 0, 0)],
         };
         assert_eq!(
             b.validate(),
@@ -1211,95 +1120,6 @@ mod tests {
                 "invalid desc: Description { lower: Antichain { elements: [2] }, upper: Antichain { elements: [0] }, since: Antichain { elements: [0] } }"
             )),
         );
-    }
-
-    #[test]
-    fn trace_batch_meta_validate_data() -> Result<(), Error> {
-        let async_runtime = Arc::new(AsyncRuntime::new()?);
-        let blob = BlobCache::new(
-            mz_build_info::DUMMY_BUILD_INFO,
-            Arc::new(Metrics::default()),
-            async_runtime,
-            MemRegistry::new().blob_no_reentrance()?,
-            None,
-        );
-        let format = ProtoBatchFormat::ParquetKvtd;
-
-        let batch_desc = u64_desc_since(0, 3, 0);
-        let batch0 = BlobTraceBatchPart {
-            desc: batch_desc.clone(),
-            index: 0,
-            updates: vec![
-                (("k".as_bytes(), "v".as_bytes()), 2, 1),
-                (("k3".as_bytes(), "v3".as_bytes()), 2, 1),
-            ]
-            .iter()
-            .collect::<ColumnarRecordsVec>()
-            .into_inner(),
-        };
-        let batch1 = BlobTraceBatchPart {
-            desc: batch_desc.clone(),
-            index: 1,
-            updates: vec![
-                (("k4".as_bytes(), "v4".as_bytes()), 2, 1),
-                (("k5".as_bytes(), "v5".as_bytes()), 2, 1),
-            ]
-            .iter()
-            .collect::<ColumnarRecordsVec>()
-            .into_inner(),
-        };
-
-        let batch0_size_bytes = blob.set_trace_batch("b0".into(), batch0, format)?;
-        let batch1_size_bytes = blob.set_trace_batch("b1".into(), batch1, format)?;
-        let size_bytes = batch0_size_bytes + batch1_size_bytes;
-        let batch_meta = TraceBatchMeta {
-            keys: vec!["b0".into(), "b1".into()],
-            format,
-            desc: batch_desc.clone(),
-            level: 0,
-            size_bytes,
-        };
-
-        // Normal case:
-        assert_eq!(batch_meta.validate_data(&blob), Ok(()));
-
-        // Incorrect desc
-        let batch_meta = TraceBatchMeta {
-            keys: vec!["b0".into(), "b1".into()],
-            format,
-            desc: u64_desc_since(1, 3, 0),
-            level: 0,
-            size_bytes,
-        };
-        assert_eq!(batch_meta.validate_data(&blob), Err(Error::from("invalid trace batch part desc expected Description { lower: Antichain { elements: [1] }, upper: Antichain { elements: [3] }, since: Antichain { elements: [0] } } got Description { lower: Antichain { elements: [0] }, upper: Antichain { elements: [3] }, since: Antichain { elements: [0] } }")));
-        // Key with no corresponding batch part
-        let batch_meta = TraceBatchMeta {
-            keys: vec!["b0".into(), "b1".into(), "b2".into()],
-            format,
-            desc: batch_desc.clone(),
-            level: 0,
-            size_bytes,
-        };
-        assert_eq!(
-            batch_meta.validate_data(&blob),
-            Err(Error::from("no blob for trace batch at key: b2"))
-        );
-        // Batch parts not in index order
-        let batch_meta = TraceBatchMeta {
-            keys: vec!["b1".into(), "b0".into()],
-            format,
-            desc: batch_desc,
-            level: 0,
-            size_bytes,
-        };
-        assert_eq!(
-            batch_meta.validate_data(&blob),
-            Err(Error::from(
-                "invalid index for blob trace batch part at key b1 expected 0 got 1"
-            ))
-        );
-
-        Ok(())
     }
 
     #[test]
@@ -1362,7 +1182,7 @@ mod tests {
             seal: Antichain::from_elem(3),
             ..Default::default()
         };
-        assert_eq!(b.validate(), Ok(()));
+        assert_eq!(b.validate(), Err(Error::from("invalid trace since Antichain { elements: [3] } at or in advance of trace seal Antichain { elements: [3] }")));
 
         // Trace since in advance of nonzero trace seal
         let b = ArrangementMeta {
@@ -1372,7 +1192,7 @@ mod tests {
             seal: Antichain::from_elem(3),
             ..Default::default()
         };
-        assert_eq!(b.validate(), Ok(()));
+        assert_eq!(b.validate(), Err(Error::from("invalid trace since Antichain { elements: [4] } at or in advance of trace seal Antichain { elements: [3] }")));
 
         // Normal case: batch since at or before trace since
         let b = ArrangementMeta {
@@ -1692,27 +1512,19 @@ mod tests {
             Err(Error::from("duplicate batch key found in unsealed: "))
         );
 
-        let trace_meta = TraceBatchMeta {
-            keys: vec!["duplicate".to_string()],
-            format: ProtoBatchFormat::Unknown,
-            desc: u64_desc(0, 1),
-            level: 1,
-            size_bytes: 0,
-        };
-
         let b = BlobMeta {
             id_mapping: vec![("0", Id(0)).into(), ("1", Id(1)).into()],
             arrangements: vec![
                 ArrangementMeta {
                     id: Id(0),
-                    trace_batches: vec![trace_meta.clone()],
+                    trace_batches: vec![batch_meta(0, 1)],
                     since: Antichain::from_elem(0),
                     seal: Antichain::from_elem(1),
                     ..Default::default()
                 },
                 ArrangementMeta {
                     id: Id(1),
-                    trace_batches: vec![trace_meta],
+                    trace_batches: vec![batch_meta(0, 1)],
                     since: Antichain::from_elem(0),
                     seal: Antichain::from_elem(1),
                     ..Default::default()
@@ -1723,7 +1535,7 @@ mod tests {
 
         assert_eq!(
             b.validate(),
-            Err(Error::from("duplicate batch key found in trace: duplicate"))
+            Err(Error::from("duplicate batch key found in trace: "))
         );
     }
 
@@ -1734,14 +1546,13 @@ mod tests {
                 desc: SeqNo(0)..SeqNo(1),
                 updates: data.batches().collect(),
             };
-            let trace = BlobTraceBatchPart {
+            let trace = BlobTraceBatch {
                 desc: Description::new(
                     Antichain::from_elem(0),
                     Antichain::from_elem(1),
                     Antichain::from_elem(0),
                 ),
-                index: 0,
-                updates: data.batches().collect(),
+                updates: data.records().collect(),
             };
             let (mut unsealed_buf, mut trace_buf) = (Vec::new(), Vec::new());
             unsealed.encode(&mut unsealed_buf);
@@ -1760,7 +1571,7 @@ mod tests {
                 sizes(DataGenerator::new(1_000, record_size_bytes, 1_000)),
                 sizes(DataGenerator::new(1_000, record_size_bytes, 1_000 / 100)),
             ),
-            "1/1=(947, 967) 25/1=(2695, 2715) 1000/1=(72930, 72950) 1000/100=(105058, 105078)"
+            "1/1=(176, 136) 25/1=(2096, 2056) 1000/1=(80096, 80056) 1000/100=(87224, 80056)"
         );
     }
 }

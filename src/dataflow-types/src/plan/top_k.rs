@@ -17,11 +17,11 @@
 //! * A [MonotonicTopKPlan] maintains up to K rows per key and is suitable for monotonic inputs.
 //! * A [BasicTopKPlan] maintains up to K rows per key and can handle retractions.
 
-use mz_expr::ColumnOrder;
+use expr::ColumnOrder;
 use serde::{Deserialize, Serialize};
 
 /// A plan encapsulating different variants to compute a TopK operation.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TopKPlan {
     /// A plan for Top1 for monotonic inputs.
     MonotonicTop1(MonotonicTop1Plan),
@@ -97,21 +97,21 @@ impl TopKPlan {
 /// differential's semantics. (2) is especially interesting because Kafka is
 /// monotonic with an ENVELOPE of NONE, which is the default for ENVELOPE in
 /// Materialize and commonly used by users.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonotonicTop1Plan {
     /// The columns that form the key for each group.
     pub group_key: Vec<usize>,
     /// Ordering that is used within each group.
-    pub order_key: Vec<mz_expr::ColumnOrder>,
+    pub order_key: Vec<expr::ColumnOrder>,
 }
 
 /// A plan for monotonic TopKs with an offset of 0 and an arbitrary limit.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonotonicTopKPlan {
     /// The columns that form the key for each group.
     pub group_key: Vec<usize>,
     /// Ordering that is used within each group.
-    pub order_key: Vec<mz_expr::ColumnOrder>,
+    pub order_key: Vec<expr::ColumnOrder>,
     /// Optionally, an upper bound on the per-group ordinal position of the
     /// records to produce from each group.
     pub limit: Option<usize>,
@@ -120,12 +120,12 @@ pub struct MonotonicTopKPlan {
 }
 
 /// A plan for generic TopKs that don't fit any more specific category.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BasicTopKPlan {
     /// The columns that form the key for each group.
     pub group_key: Vec<usize>,
     /// Ordering that is used within each group.
-    pub order_key: Vec<mz_expr::ColumnOrder>,
+    pub order_key: Vec<expr::ColumnOrder>,
     /// Optionally, an upper bound on the per-group ordinal position of the
     /// records to produce from each group.
     pub limit: Option<usize>,

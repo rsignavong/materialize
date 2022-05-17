@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-# Regression test for https://github.com/MaterializeInc/materialize/issues/9027
+# Regression test for https://github.com/MaterializeInc/materialize/issues/8713
 mode cockroach
 
 statement ok
@@ -59,26 +59,6 @@ WHERE
  OR l_commitdate = o_orderdate - ' 7 DAY '
  );
 ----
-Source materialize.public.orders (u1):
-{
-  "predicates": [],
-  "projection": [
-    0,
-    4
-  ]
-}
-
-Source materialize.public.lineitem (u2):
-{
-  "predicates": [],
-  "projection": [
-    0,
-    11,
-    12
-  ]
-}
-
-Query:
 {
   "Let": {
     "id": 0,
@@ -91,13 +71,61 @@ Query:
                 "Get": {
                   "id": {
                     "Global": {
-                      "User": 2
+                      "User": 3
                     }
                   },
-                  "keys": {
-                    "raw": true,
-                    "arranged": []
-                  },
+                  "keys": [
+                    [
+                      {
+                        "Column": 0
+                      },
+                      {
+                        "Column": 1
+                      },
+                      {
+                        "Column": 2
+                      },
+                      {
+                        "Column": 3
+                      },
+                      {
+                        "Column": 4
+                      },
+                      {
+                        "Column": 5
+                      },
+                      {
+                        "Column": 6
+                      },
+                      {
+                        "Column": 7
+                      },
+                      {
+                        "Column": 8
+                      },
+                      {
+                        "Column": 9
+                      },
+                      {
+                        "Column": 10
+                      },
+                      {
+                        "Column": 11
+                      },
+                      {
+                        "Column": 12
+                      },
+                      {
+                        "Column": 13
+                      },
+                      {
+                        "Column": 14
+                      },
+                      {
+                        "Column": 15
+                      }
+                    ]
+                  ],
                   "mfp": {
                     "expressions": [],
                     "predicates": [],
@@ -109,29 +137,20 @@ Query:
                   "key_val": null
                 }
               },
-              "forms": {
-                "raw": true,
-                "arranged": [
-                  [
-                    [],
-                    {
-                      "0": 0
-                    },
-                    [
+              "ensure_arrangements": [
+                [
+                  [],
+                  {
+                    "key_arity": 0,
+                    "permutation": [
                       0
                     ]
+                  },
+                  [
+                    0
                   ]
                 ]
-              },
-              "input_key": null,
-              "input_mfp": {
-                "expressions": [],
-                "predicates": [],
-                "projection": [
-                  0
-                ],
-                "input_arity": 1
-              }
+              ]
             }
           },
           {
@@ -141,10 +160,37 @@ Query:
                   "User": 1
                 }
               },
-              "keys": {
-                "raw": true,
-                "arranged": []
-              },
+              "keys": [
+                [
+                  {
+                    "Column": 0
+                  },
+                  {
+                    "Column": 1
+                  },
+                  {
+                    "Column": 2
+                  },
+                  {
+                    "Column": 3
+                  },
+                  {
+                    "Column": 4
+                  },
+                  {
+                    "Column": 5
+                  },
+                  {
+                    "Column": 6
+                  },
+                  {
+                    "Column": 7
+                  },
+                  {
+                    "Column": 8
+                  }
+                ]
+              ],
               "mfp": {
                 "expressions": [],
                 "predicates": [],
@@ -158,14 +204,26 @@ Query:
         "plan": {
           "Linear": {
             "source_relation": 1,
-            "source_key": null,
             "initial_closure": null,
             "stage_plans": [
               {
                 "lookup_relation": 0,
                 "stream_key": [],
+                "stream_permutation": {
+                  "key_arity": 0,
+                  "permutation": []
+                },
                 "stream_thinning": [],
                 "lookup_key": [],
+                "lookup_permutation": {
+                  "key_arity": 0,
+                  "permutation": [
+                    0
+                  ]
+                },
+                "lookup_thinning": [
+                  0
+                ],
                 "closure": {
                   "ready_equivalences": [],
                   "before": {
@@ -194,10 +252,7 @@ Query:
               "id": {
                 "Local": 0
               },
-              "keys": {
-                "raw": true,
-                "arranged": []
-              },
+              "keys": [],
               "mfp": {
                 "expressions": [],
                 "predicates": [],
@@ -222,13 +277,61 @@ Query:
                               "Get": {
                                 "id": {
                                   "Global": {
-                                    "User": 2
+                                    "User": 3
                                   }
                                 },
-                                "keys": {
-                                  "raw": true,
-                                  "arranged": []
-                                },
+                                "keys": [
+                                  [
+                                    {
+                                      "Column": 0
+                                    },
+                                    {
+                                      "Column": 1
+                                    },
+                                    {
+                                      "Column": 2
+                                    },
+                                    {
+                                      "Column": 3
+                                    },
+                                    {
+                                      "Column": 4
+                                    },
+                                    {
+                                      "Column": 5
+                                    },
+                                    {
+                                      "Column": 6
+                                    },
+                                    {
+                                      "Column": 7
+                                    },
+                                    {
+                                      "Column": 8
+                                    },
+                                    {
+                                      "Column": 9
+                                    },
+                                    {
+                                      "Column": 10
+                                    },
+                                    {
+                                      "Column": 11
+                                    },
+                                    {
+                                      "Column": 12
+                                    },
+                                    {
+                                      "Column": 13
+                                    },
+                                    {
+                                      "Column": 14
+                                    },
+                                    {
+                                      "Column": 15
+                                    }
+                                  ]
+                                ],
                                 "mfp": {
                                   "expressions": [],
                                   "predicates": [],
@@ -241,32 +344,22 @@ Query:
                                 "key_val": null
                               }
                             },
-                            "forms": {
-                              "raw": true,
-                              "arranged": [
-                                [
-                                  [],
-                                  {
-                                    "0": 0,
-                                    "1": 1
-                                  },
-                                  [
+                            "ensure_arrangements": [
+                              [
+                                [],
+                                {
+                                  "key_arity": 0,
+                                  "permutation": [
                                     0,
                                     1
                                   ]
+                                },
+                                [
+                                  0,
+                                  1
                                 ]
                               ]
-                            },
-                            "input_key": null,
-                            "input_mfp": {
-                              "expressions": [],
-                              "predicates": [],
-                              "projection": [
-                                0,
-                                1
-                              ],
-                              "input_arity": 2
-                            }
+                            ]
                           }
                         },
                         {
@@ -278,10 +371,7 @@ Query:
                                     "id": {
                                       "Local": 0
                                     },
-                                    "keys": {
-                                      "raw": true,
-                                      "arranged": []
-                                    },
+                                    "keys": [],
                                     "mfp": {
                                       "expressions": [],
                                       "predicates": [],
@@ -314,38 +404,30 @@ Query:
                                   }
                                 },
                                 "plan": "Distinct",
-                                "input_key": null
+                                "permutation": {
+                                  "key_arity": 1,
+                                  "permutation": [
+                                    0
+                                  ]
+                                }
                               }
                             },
-                            "forms": {
-                              "raw": false,
-                              "arranged": [
+                            "ensure_arrangements": [
+                              [
                                 [
-                                  [
-                                    {
-                                      "Column": 0
-                                    }
-                                  ],
                                   {
-                                    "0": 0
-                                  },
-                                  []
-                                ]
+                                    "Column": 0
+                                  }
+                                ],
+                                {
+                                  "key_arity": 1,
+                                  "permutation": [
+                                    0
+                                  ]
+                                },
+                                []
                               ]
-                            },
-                            "input_key": [
-                              {
-                                "Column": 0
-                              }
-                            ],
-                            "input_mfp": {
-                              "expressions": [],
-                              "predicates": [],
-                              "projection": [
-                                0
-                              ],
-                              "input_arity": 1
-                            }
+                            ]
                           }
                         },
                         {
@@ -357,10 +439,37 @@ Query:
                                     "User": 1
                                   }
                                 },
-                                "keys": {
-                                  "raw": true,
-                                  "arranged": []
-                                },
+                                "keys": [
+                                  [
+                                    {
+                                      "Column": 0
+                                    },
+                                    {
+                                      "Column": 1
+                                    },
+                                    {
+                                      "Column": 2
+                                    },
+                                    {
+                                      "Column": 3
+                                    },
+                                    {
+                                      "Column": 4
+                                    },
+                                    {
+                                      "Column": 5
+                                    },
+                                    {
+                                      "Column": 6
+                                    },
+                                    {
+                                      "Column": 7
+                                    },
+                                    {
+                                      "Column": 8
+                                    }
+                                  ]
+                                ],
                                 "mfp": {
                                   "expressions": [],
                                   "predicates": [
@@ -394,59 +503,32 @@ Query:
                                 "key_val": null
                               }
                             },
-                            "forms": {
-                              "raw": true,
-                              "arranged": [
+                            "ensure_arrangements": [
+                              [
                                 [
-                                  [
-                                    {
-                                      "Column": 0
-                                    }
-                                  ],
                                   {
-                                    "0": 0,
-                                    "1": 1
-                                  },
-                                  [
+                                    "Column": 0
+                                  }
+                                ],
+                                {
+                                  "key_arity": 1,
+                                  "permutation": [
+                                    0,
                                     1
                                   ]
+                                },
+                                [
+                                  1
                                 ]
                               ]
-                            },
-                            "input_key": null,
-                            "input_mfp": {
-                              "expressions": [],
-                              "predicates": [],
-                              "projection": [
-                                0,
-                                1
-                              ],
-                              "input_arity": 2
-                            }
+                            ]
                           }
                         }
                       ],
                       "plan": {
                         "Linear": {
                           "source_relation": 1,
-                          "source_key": [
-                            {
-                              "Column": 0
-                            }
-                          ],
-                          "initial_closure": {
-                            "ready_equivalences": [],
-                            "before": {
-                              "mfp": {
-                                "expressions": [],
-                                "predicates": [],
-                                "projection": [
-                                  0
-                                ],
-                                "input_arity": 1
-                              }
-                            }
-                          },
+                          "initial_closure": null,
                           "stage_plans": [
                             {
                               "lookup_relation": 2,
@@ -455,11 +537,27 @@ Query:
                                   "Column": 0
                                 }
                               ],
+                              "stream_permutation": {
+                                "key_arity": 1,
+                                "permutation": [
+                                  0
+                                ]
+                              },
                               "stream_thinning": [],
                               "lookup_key": [
                                 {
                                   "Column": 0
                                 }
+                              ],
+                              "lookup_permutation": {
+                                "key_arity": 1,
+                                "permutation": [
+                                  0,
+                                  1
+                                ]
+                              },
+                              "lookup_thinning": [
+                                1
                               ],
                               "closure": {
                                 "ready_equivalences": [],
@@ -469,9 +567,9 @@ Query:
                                     "predicates": [],
                                     "projection": [
                                       0,
-                                      1
+                                      2
                                     ],
-                                    "input_arity": 2
+                                    "input_arity": 3
                                   }
                                 }
                               }
@@ -479,11 +577,29 @@ Query:
                             {
                               "lookup_relation": 0,
                               "stream_key": [],
+                              "stream_permutation": {
+                                "key_arity": 0,
+                                "permutation": [
+                                  0,
+                                  1
+                                ]
+                              },
                               "stream_thinning": [
                                 0,
                                 1
                               ],
                               "lookup_key": [],
+                              "lookup_permutation": {
+                                "key_arity": 0,
+                                "permutation": [
+                                  0,
+                                  1
+                                ]
+                              },
+                              "lookup_thinning": [
+                                0,
+                                1
+                              ],
                               "closure": {
                                 "ready_equivalences": [],
                                 "before": {
@@ -506,7 +622,7 @@ Query:
                                                     {
                                                       "Ok": {
                                                         "data": [
-                                                          10,
+                                                          8,
                                                           205,
                                                           7,
                                                           0,
@@ -550,14 +666,18 @@ Query:
                                                         {
                                                           "Ok": {
                                                             "data": [
-                                                              14,
+                                                              12,
                                                               0,
                                                               0,
                                                               0,
                                                               0,
-                                                              7,
                                                               0,
                                                               0,
+                                                              41,
+                                                              249,
+                                                              15,
+                                                              38,
+                                                              2,
                                                               0,
                                                               0,
                                                               0,
@@ -619,45 +739,36 @@ Query:
                     }
                   },
                   "plan": "Distinct",
-                  "input_key": null
+                  "permutation": {
+                    "key_arity": 1,
+                    "permutation": [
+                      0
+                    ]
+                  }
                 }
               },
-              "forms": {
-                "raw": false,
-                "arranged": [
+              "ensure_arrangements": [
+                [
                   [
-                    [
-                      {
-                        "Column": 0
-                      }
-                    ],
                     {
-                      "0": 0
-                    },
-                    []
-                  ]
+                      "Column": 0
+                    }
+                  ],
+                  {
+                    "key_arity": 1,
+                    "permutation": [
+                      0
+                    ]
+                  },
+                  []
                 ]
-              },
-              "input_key": [
-                {
-                  "Column": 0
-                }
-              ],
-              "input_mfp": {
-                "expressions": [],
-                "predicates": [],
-                "projection": [
-                  0
-                ],
-                "input_arity": 1
-              }
+              ]
             }
           }
         ],
         "plan": {
           "Linear": {
             "source_relation": 0,
-            "source_key": null,
             "initial_closure": null,
             "stage_plans": [
               {
@@ -667,12 +778,25 @@ Query:
                     "Column": 0
                   }
                 ],
+                "stream_permutation": {
+                  "key_arity": 1,
+                  "permutation": [
+                    0
+                  ]
+                },
                 "stream_thinning": [],
                 "lookup_key": [
                   {
                     "Column": 0
                   }
                 ],
+                "lookup_permutation": {
+                  "key_arity": 1,
+                  "permutation": [
+                    0
+                  ]
+                },
+                "lookup_thinning": [],
                 "closure": {
                   "ready_equivalences": [],
                   "before": {
@@ -680,7 +804,7 @@ Query:
                       "expressions": [],
                       "predicates": [],
                       "projection": [],
-                      "input_arity": 1
+                      "input_arity": 2
                     }
                   }
                 }

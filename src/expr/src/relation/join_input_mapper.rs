@@ -15,7 +15,7 @@ use itertools::Itertools;
 use crate::MirRelationExpr;
 use crate::MirScalarExpr;
 
-use mz_repr::RelationType;
+use repr::RelationType;
 
 /// Any column in a join expression exists in two contexts:
 /// 1) It has a position relative to the result of the join (global)
@@ -44,24 +44,25 @@ impl JoinInputMapper {
     /// Creates a new `JoinInputMapper` and calculates the mapping of global context
     /// columns to local context columns.
     pub fn new(inputs: &[MirRelationExpr]) -> Self {
-        Self::new_from_input_arities(inputs.iter().map(|i| i.arity()))
+        Self::new_from_input_arities(inputs.iter().map(|i| i.arity()).collect::<Vec<_>>())
     }
 
     /// Creates a new `JoinInputMapper` and calculates the mapping of global context
     /// columns to local context columns. Using this method saves is more
     /// efficient if input types have been pre-calculated
     pub fn new_from_input_types(types: &[RelationType]) -> Self {
-        Self::new_from_input_arities(types.iter().map(|t| t.column_types.len()))
+        let arities = types
+            .iter()
+            .map(|t| t.column_types.len())
+            .collect::<Vec<_>>();
+
+        Self::new_from_input_arities(arities)
     }
 
     /// Creates a new `JoinInputMapper` and calculates the mapping of global context
     /// columns to local context columns. Using this method saves is more
     /// efficient if input arities have been pre-calculated
-    pub fn new_from_input_arities<I>(arities: I) -> Self
-    where
-        I: Iterator<Item = usize>,
-    {
-        let arities = arities.collect::<Vec<usize>>();
+    pub fn new_from_input_arities(arities: Vec<usize>) -> Self {
         let mut offset = 0;
         let mut prior_arities = Vec::new();
         for input in 0..arities.len() {
@@ -249,8 +250,8 @@ impl JoinInputMapper {
     /// # Examples
     ///
     /// ```
-    /// use mz_repr::{Datum, ColumnType, RelationType, ScalarType};
-    /// use mz_expr::{JoinInputMapper, MirRelationExpr, MirScalarExpr};
+    /// use repr::{Datum, ColumnType, RelationType, ScalarType};
+    /// use expr::{JoinInputMapper, MirRelationExpr, MirScalarExpr};
     ///
     /// // A two-column schema common to each of the three inputs
     /// let schema = RelationType::new(vec![
@@ -351,7 +352,7 @@ impl JoinInputMapper {
 mod tests {
     use super::*;
     use crate::{BinaryFunc, MirScalarExpr, UnaryFunc};
-    use mz_repr::{Datum, ScalarType};
+    use repr::{Datum, ScalarType};
 
     #[test]
     fn try_map_to_input_with_bound_expr_test() {

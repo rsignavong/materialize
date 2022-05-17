@@ -13,10 +13,10 @@ use std::collections::HashMap;
 
 use itertools::Itertools;
 
-use mz_expr::{func, EvalError, MirRelationExpr, MirScalarExpr, UnaryFunc, RECURSION_LIMIT};
-use mz_ore::stack::{CheckedRecursion, RecursionGuard};
-use mz_repr::{ColumnType, RelationType, ScalarType};
-use mz_repr::{Datum, Row};
+use expr::{func, EvalError, MirRelationExpr, MirScalarExpr, UnaryFunc, RECURSION_LIMIT};
+use ore::stack::{CheckedRecursion, RecursionGuard};
+use repr::{ColumnType, RelationType, ScalarType};
+use repr::{Datum, Row};
 
 use crate::TransformArgs;
 
@@ -60,7 +60,7 @@ impl ColumnKnowledge {
     fn harvest(
         &self,
         expr: &mut MirRelationExpr,
-        knowledge: &mut HashMap<mz_expr::Id, Vec<DatumKnowledge>>,
+        knowledge: &mut HashMap<expr::Id, Vec<DatumKnowledge>>,
         knowledge_stack: &mut Vec<DatumKnowledge>,
     ) -> Result<Vec<DatumKnowledge>, crate::TransformError> {
         self.checked_recur(|_| {
@@ -91,11 +91,11 @@ impl ColumnKnowledge {
                 MirRelationExpr::Let { id, value, body } => {
                     let value_knowledge = self.harvest(value, knowledge, knowledge_stack)?;
                     let prior_knowledge =
-                        knowledge.insert(mz_expr::Id::Local(id.clone()), value_knowledge);
+                        knowledge.insert(expr::Id::Local(id.clone()), value_knowledge);
                     let body_knowledge = self.harvest(body, knowledge, knowledge_stack)?;
-                    knowledge.remove(&mz_expr::Id::Local(id.clone()));
+                    knowledge.remove(&expr::Id::Local(id.clone()));
                     if let Some(prior_knowledge) = prior_knowledge {
-                        knowledge.insert(mz_expr::Id::Local(id.clone()), prior_knowledge);
+                        knowledge.insert(expr::Id::Local(id.clone()), prior_knowledge);
                     }
                     Ok(body_knowledge)
                 }
@@ -136,7 +136,7 @@ impl ColumnKnowledge {
                     for predicate in predicates.iter() {
                         // Equality tests allow us to unify the column knowledge of each input.
                         if let MirScalarExpr::CallBinary { func, expr1, expr2 } = predicate {
-                            if func == &mz_expr::BinaryFunc::Eq {
+                            if func == &expr::BinaryFunc::Eq {
                                 // Collect knowledge about the inputs (for columns and literals).
                                 let mut knowledge = DatumKnowledge::default();
                                 if let MirScalarExpr::Column(c) = &**expr1 {
@@ -240,7 +240,7 @@ impl ColumnKnowledge {
                         .map(|k| optimize(k, &input_typ, &input_knowledge[..], knowledge_stack))
                         .collect::<Vec<_>>();
                     for aggregate in aggregates.iter_mut() {
-                        use mz_expr::AggregateFunc;
+                        use expr::AggregateFunc;
                         let knowledge = optimize(
                             &mut aggregate.expr,
                             &input_typ,
@@ -299,6 +299,9 @@ impl ColumnKnowledge {
                 MirRelationExpr::Threshold { input } => {
                     self.harvest(input, knowledge, knowledge_stack)
                 }
+                MirRelationExpr::DeclareKeys { input, .. } => {
+                    self.harvest(input, knowledge, knowledge_stack)
+                }
                 MirRelationExpr::Union { base, inputs } => {
                     let mut know = self.harvest(base, knowledge, knowledge_stack)?;
                     for input in inputs {
@@ -322,7 +325,7 @@ impl ColumnKnowledge {
 #[derive(Clone, Debug)]
 pub struct DatumKnowledge {
     /// If set, a specific value for the column.
-    value: Option<(Result<mz_repr::Row, EvalError>, ColumnType)>,
+    value: Option<(Result<repr::Row, EvalError>, ColumnType)>,
     /// If false, the value is not `Datum::Null`.
     nullable: bool,
 }
@@ -411,7 +414,7 @@ pub fn optimize(
                     }
                     column_knowledge[index].clone()
                 }
-                MirScalarExpr::Literal(_, _) | MirScalarExpr::CallUnmaterializable(_) => {
+                MirScalarExpr::Literal(_, _) | MirScalarExpr::CallNullary(_) => {
                     DatumKnowledge::from(&*e)
                 }
                 MirScalarExpr::CallUnary { func, expr: _ } => {

@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use enum_kinds::EnumKind;
 
 use crate::ast::display::{self, AstDisplay, AstFormatter};
-use crate::ast::{AstInfo, Expr, Ident, SqlOption, UnresolvedObjectName, WithOption};
+use crate::ast::{AstInfo, DataType, Expr, Ident, SqlOption, UnresolvedObjectName, WithOption};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Schema {
@@ -324,7 +324,6 @@ pub enum SourceIncludeMetadataType {
     Partition,
     Topic,
     Offset,
-    Headers,
 }
 
 impl AstDisplay for SourceIncludeMetadataType {
@@ -335,7 +334,6 @@ impl AstDisplay for SourceIncludeMetadataType {
             SourceIncludeMetadataType::Partition => f.write_str("PARTITION"),
             SourceIncludeMetadataType::Topic => f.write_str("TOPIC"),
             SourceIncludeMetadataType::Offset => f.write_str("OFFSET"),
-            SourceIncludeMetadataType::Headers => f.write_str("HEADERS"),
         }
     }
 }
@@ -489,8 +487,6 @@ pub enum CreateSourceConnector {
         publication: String,
         /// The replication slot name that will be created upstream
         slot: Option<String>,
-        /// Hex encoded string of binary serialization of `dataflow_types::PostgresSourceDetails`
-        details: Option<String>,
     },
     PubNub {
         /// PubNub's subscribe key
@@ -553,7 +549,6 @@ impl AstDisplay for CreateSourceConnector {
                 conn,
                 publication,
                 slot,
-                details,
             } => {
                 f.write_str("POSTGRES CONNECTION '");
                 f.write_str(&display::escape_single_quote_string(conn));
@@ -562,10 +557,6 @@ impl AstDisplay for CreateSourceConnector {
                 if let Some(slot) = slot {
                     f.write_str("' SLOT '");
                     f.write_str(&display::escape_single_quote_string(slot));
-                }
-                if let Some(details) = details {
-                    f.write_str("' DETAILS '");
-                    f.write_str(&display::escape_single_quote_string(details));
                 }
                 f.write_str("'");
             }
@@ -744,7 +735,7 @@ pub enum TableConstraint<T: AstInfo> {
     ForeignKey {
         name: Option<Ident>,
         columns: Vec<Ident>,
-        foreign_table: T::ObjectName,
+        foreign_table: UnresolvedObjectName,
         referred_columns: Vec<Ident>,
     },
     /// `[ CONSTRAINT <name> ] CHECK (<expr>)`
@@ -824,7 +815,7 @@ impl_display!(KeyConstraint);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnDef<T: AstInfo> {
     pub name: Ident,
-    pub data_type: T::DataType,
+    pub data_type: DataType<T>,
     pub collation: Option<UnresolvedObjectName>,
     pub options: Vec<ColumnOptionDef<T>>,
 }

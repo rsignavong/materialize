@@ -30,7 +30,9 @@ def rev_count(rev: str) -> int:
         count: The number of commits in the Git repository starting from the
             initial commit and ending with the specified commit, inclusive.
     """
-    return int(spawn.capture(["git", "rev-list", "--count", rev, "--"]).strip())
+    return int(
+        spawn.capture(["git", "rev-list", "--count", rev, "--"], unicode=True).strip()
+    )
 
 
 def rev_parse(rev: str, *, abbrev: bool = False) -> str:
@@ -48,7 +50,7 @@ def rev_parse(rev: str, *, abbrev: bool = False) -> str:
             error if there is no abbrev.
     """
     a = ["--abbrev-ref"] if abbrev else []
-    out = spawn.capture(["git", "rev-parse", *a, "--verify", rev]).strip()
+    out = spawn.capture(["git", "rev-parse", *a, "--verify", rev], unicode=True).strip()
     if not out:
         raise RuntimeError(f"No parsed rev for {rev}")
     return out
@@ -72,6 +74,7 @@ def expand_globs(root: Path, *specs: Union[Path, str]) -> Set[str]:
     diff_files = spawn.capture(
         ["git", "diff", "--name-only", "-z", empty_tree, "--", *specs],
         cwd=root,
+        unicode=True,
     )
 
     # `git ls-files --others --exclude-standard` surfaces any non-ignored,
@@ -79,6 +82,7 @@ def expand_globs(root: Path, *specs: Union[Path, str]) -> Set[str]:
     ls_files = spawn.capture(
         ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", *specs],
         cwd=root,
+        unicode=True,
     )
 
     return set(f for f in (diff_files + ls_files).split("\0") if f.strip() != "")
@@ -93,7 +97,7 @@ def get_version_tags(*, fetch: bool = True) -> List[semver.version.Version]:
     if fetch:
         _fetch()
     tags = []
-    for t in spawn.capture(["git", "tag"]).splitlines():
+    for t in spawn.capture(["git", "tag"], unicode=True).splitlines():
         try:
             tags.append(semver.version.Version.parse(t.lstrip("v")))
         except ValueError as e:
@@ -120,7 +124,7 @@ def is_dirty() -> bool:
 
 def first_remote_matching(pattern: str) -> Optional[str]:
     """Get the name of the remote that matches the pattern"""
-    remotes = spawn.capture(["git", "remote", "-v"])
+    remotes = spawn.capture(["git", "remote", "-v"], unicode=True)
     for remote in remotes.splitlines():
         if pattern in remote:
             return remote.split()[0]
@@ -130,12 +134,12 @@ def first_remote_matching(pattern: str) -> Optional[str]:
 
 def describe() -> str:
     """Describe the relationship between the current commit and the most recent tag"""
-    return spawn.capture(["git", "describe"]).strip()
+    return spawn.capture(["git", "describe"], unicode=True).strip()
 
 
 def fetch() -> str:
     """Fetch from all configured default fetch remotes"""
-    return spawn.capture(["git", "fetch", "--tags"]).strip()
+    return spawn.capture(["git", "fetch", "--tags"], unicode=True).strip()
 
 
 _fetch = fetch  # renamed because an argument shadows the fetch name in get_tags

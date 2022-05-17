@@ -14,11 +14,11 @@ use std::env::{self, VarError};
 use std::io::Write;
 use std::mem::size_of;
 
-use mz_ore::cast::CastFrom;
+use ore::cast::CastFrom;
 
-use crate::client::StreamWriteHandle;
 use crate::error::Error;
 use crate::indexed::columnar::{ColumnarRecords, ColumnarRecordsBuilder};
+use crate::indexed::runtime::StreamWriteHandle;
 
 /// A configurable data generator for benchmarking.
 #[derive(Clone, Debug)]
@@ -47,7 +47,7 @@ const DEFAULT_BATCH_MAX_COUNT: usize = (8 * 1024 * 1024) / DEFAULT_RECORD_SIZE_B
 // round-ish number.
 const DEFAULT_RECORD_COUNT: usize = 819_200;
 
-const TS_DIFF_GOODPUT_SIZE: usize = size_of::<u64>() + size_of::<i64>();
+const TS_DIFF_GOODPUT_SIZE: usize = size_of::<u64>() + size_of::<isize>();
 
 fn read_env_usize(key: &str, default: usize) -> usize {
     match env::var(key) {
@@ -131,15 +131,12 @@ impl DataGenerator {
             0,
         );
         for record_idx in batch_start..batch_end {
-            assert!(
-                batch.push(self.gen_record(record_idx)),
-                "generator exceeded batch size; smaller batches needed"
-            );
+            batch.push(self.gen_record(record_idx));
         }
         Some(batch.finish())
     }
 
-    fn gen_record(&mut self, record_idx: usize) -> ((&[u8], &[u8]), u64, i64) {
+    fn gen_record(&mut self, record_idx: usize) -> ((&[u8], &[u8]), u64, isize) {
         assert!(record_idx < self.record_count);
         assert!(self.record_size_bytes > TS_DIFF_GOODPUT_SIZE);
 
@@ -171,7 +168,7 @@ impl DataGenerator {
     }
 
     /// Returns an [Iterator] of all records.
-    pub fn records(&self) -> impl Iterator<Item = ((Vec<u8>, Vec<u8>), u64, i64)> {
+    pub fn records(&self) -> impl Iterator<Item = ((Vec<u8>, Vec<u8>), u64, isize)> {
         let mut config = self.clone();
         (0..self.record_count).map(move |record_idx| {
             let ((k, v), t, d) = config.gen_record(record_idx);
@@ -232,22 +229,6 @@ pub fn load(
         seal.recv()?;
     }
     Ok(data.goodput_bytes())
-}
-
-/// Encodes the given data into a flat buffer that is exactly
-/// `data.goodput_bytes()` long.
-pub fn flat_blob(data: &DataGenerator) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(usize::cast_from(data.goodput_bytes()));
-    for batch in data.batches() {
-        for ((k, v), t, d) in batch.iter() {
-            buf.extend_from_slice(k);
-            buf.extend_from_slice(v);
-            buf.extend_from_slice(&t.to_le_bytes());
-            buf.extend_from_slice(&d.to_le_bytes());
-        }
-    }
-    assert_eq!(buf.len(), usize::cast_from(data.goodput_bytes()));
-    buf
 }
 
 #[cfg(test)]

@@ -112,7 +112,7 @@ namespace csharp
             // The tail won't end until we send a cancel request.
             reader.Cancel();
 
-            // Ensure the COPY has ended after being canceled.
+            // Ensure the COPY has ended after being cancelled.
             Assert.Throws<OperationCanceledException>(delegate { reader.StartRow(); });
 
             new NpgsqlCommand("DROP TABLE t", conn).ExecuteNonQuery();

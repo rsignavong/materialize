@@ -272,10 +272,6 @@ EOF
 query T multiline
 EXPLAIN TYPED OPTIMIZED PLAN FOR SELECT * FROM ordered ORDER BY y asc, x desc LIMIT 5
 ----
-Source materialize.public.ordered (u2):
-| Project (#0, #1)
-
-Query:
 %0 =
 | Get materialize.public.ordered (u2)
 | | types = (integer?, text?)
@@ -291,10 +287,6 @@ CREATE VIEW ordered_view AS SELECT * FROM ordered ORDER BY y asc, x desc LIMIT 5
 query T multiline
 EXPLAIN TYPED OPTIMIZED PLAN FOR VIEW ordered_view
 ----
-Source materialize.public.ordered (u2):
-| Project (#0, #1)
-
-Query:
 %0 =
 | Get materialize.public.ordered (u2)
 | | types = (integer?, text?)
@@ -319,16 +311,6 @@ EOF
 query T multiline
 EXPLAIN PHYSICAL PLAN FOR SELECT * FROM ordered
 ----
-Source materialize.public.ordered (u2):
-{
-  "predicates": [],
-  "projection": [
-    0,
-    1
-  ]
-}
-
-Query:
 {
   "Get": {
     "id": {
@@ -336,10 +318,16 @@ Query:
         "User": 2
       }
     },
-    "keys": {
-      "raw": true,
-      "arranged": []
-    },
+    "keys": [
+      [
+        {
+          "Column": 0
+        },
+        {
+          "Column": 1
+        }
+      ]
+    ],
     "mfp": {
       "expressions": [],
       "predicates": [],
@@ -358,16 +346,6 @@ EOF
 query T multiline
 EXPLAIN TYPED PHYSICAL PLAN FOR SELECT * FROM ordered
 ----
-Source materialize.public.ordered (u2):
-{
-  "predicates": [],
-  "projection": [
-    0,
-    1
-  ]
-}
-
-Query:
 {
   "Get": {
     "id": {
@@ -375,10 +353,16 @@ Query:
         "User": 2
       }
     },
-    "keys": {
-      "raw": true,
-      "arranged": []
-    },
+    "keys": [
+      [
+        {
+          "Column": 0
+        },
+        {
+          "Column": 1
+        }
+      ]
+    ],
     "mfp": {
       "expressions": [],
       "predicates": [],
@@ -397,16 +381,6 @@ EOF
 query T multiline
 EXPLAIN PHYSICAL PLAN FOR VIEW ordered_view
 ----
-Source materialize.public.ordered (u2):
-{
-  "predicates": [],
-  "projection": [
-    0,
-    1
-  ]
-}
-
-Query:
 {
   "TopK": {
     "input": {
@@ -416,10 +390,16 @@ Query:
             "User": 2
           }
         },
-        "keys": {
-          "raw": true,
-          "arranged": []
-        },
+        "keys": [
+          [
+            {
+              "Column": 0
+            },
+            {
+              "Column": 1
+            }
+          ]
+        ],
         "mfp": {
           "expressions": [],
           "predicates": [],
@@ -458,16 +438,6 @@ EOF
 query T multiline
 EXPLAIN TYPED PHYSICAL PLAN FOR VIEW ordered_view
 ----
-Source materialize.public.ordered (u2):
-{
-  "predicates": [],
-  "projection": [
-    0,
-    1
-  ]
-}
-
-Query:
 {
   "TopK": {
     "input": {
@@ -477,10 +447,16 @@ Query:
             "User": 2
           }
         },
-        "keys": {
-          "raw": true,
-          "arranged": []
-        },
+        "keys": [
+          [
+            {
+              "Column": 0
+            },
+            {
+              "Column": 1
+            }
+          ]
+        ],
         "mfp": {
           "expressions": [],
           "predicates": [],
@@ -519,16 +495,6 @@ EOF
 query T multiline
 EXPLAIN PHYSICAL PLAN FOR SELECT * FROM ordered ORDER BY y asc, x desc LIMIT 5
 ----
-Source materialize.public.ordered (u2):
-{
-  "predicates": [],
-  "projection": [
-    0,
-    1
-  ]
-}
-
-Query:
 {
   "Get": {
     "id": {
@@ -536,10 +502,16 @@ Query:
         "User": 2
       }
     },
-    "keys": {
-      "raw": true,
-      "arranged": []
-    },
+    "keys": [
+      [
+        {
+          "Column": 0
+        },
+        {
+          "Column": 1
+        }
+      ]
+    ],
     "mfp": {
       "expressions": [],
       "predicates": [],
@@ -560,16 +532,6 @@ EOF
 query T multiline
 EXPLAIN TYPED PHYSICAL PLAN FOR SELECT * FROM ordered ORDER BY y asc, x desc LIMIT 5
 ----
-Source materialize.public.ordered (u2):
-{
-  "predicates": [],
-  "projection": [
-    0,
-    1
-  ]
-}
-
-Query:
 {
   "Get": {
     "id": {
@@ -577,10 +539,16 @@ Query:
         "User": 2
       }
     },
-    "keys": {
-      "raw": true,
-      "arranged": []
-    },
+    "keys": [
+      [
+        {
+          "Column": 0
+        },
+        {
+          "Column": 1
+        }
+      ]
+    ],
     "mfp": {
       "expressions": [],
       "predicates": [],

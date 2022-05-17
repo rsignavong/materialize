@@ -32,11 +32,9 @@ pub mod strconv;
 pub mod util;
 
 pub use datum_vec::{DatumVec, DatumVecBorrow};
-pub mod proto;
 pub use relation::{ColumnName, ColumnType, NotNullViolation, RelationDesc, RelationType};
 pub use row::{
-    datum_list_size, datum_size, datums_size, row_size, DatumList, DatumMap, Row, RowArena,
-    RowPacker, RowRef,
+    datum_list_size, datum_size, datums_size, row_size, DatumList, DatumMap, Row, RowArena, RowRef,
 };
 pub use scalar::{AsColumnType, Datum, DatumType, ScalarBaseType, ScalarType};
 
@@ -44,7 +42,7 @@ pub use scalar::{AsColumnType, Datum, DatumType, ScalarBaseType, ScalarType};
 /// System-wide timestamp type.
 pub type Timestamp = u64;
 /// System-wide record count difference type.
-pub type Diff = i64;
+pub type Diff = isize;
 
 use serde::{Deserialize, Serialize};
 // This probably logically belongs in `dataflow`, but source caching looks at it,
@@ -52,24 +50,18 @@ use serde::{Deserialize, Serialize};
 /// The payload delivered by a source connector; either bytes or an EOF marker.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub enum MessagePayload {
-    /// Data from the source connector.
-    // TODO(guswynn): Determine if `Vec` needs to be non-empty.
+    /// Data from the source connector
     Data(Vec<u8>),
     /// Forces the decoder to consider this a delimiter.
     ///
     /// For example, CSV records are normally terminated by a newline,
     /// but files might not be newline-terminated; thus we need
     /// the decoder to emit a CSV record when the end of a file is seen.
-    ///
-    // Note that the ordering here matters for the PartialOrd impl
     EOF,
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    #[test]
-    fn test_message_payload_ordering() {
-        assert!(MessagePayload::Data(vec![]) < MessagePayload::EOF);
+impl Default for MessagePayload {
+    fn default() -> Self {
+        Self::Data(vec![])
     }
 }

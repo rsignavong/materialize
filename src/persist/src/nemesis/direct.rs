@@ -105,11 +105,12 @@ use timely::dataflow::operators::Probe;
 use timely::dataflow::ProbeHandle;
 use timely::progress::Antichain;
 
-use crate::client::{
-    DecodedSnapshot, MultiWriteHandle, RuntimeClient, StreamReadHandle, StreamWriteHandle,
-};
 use crate::error::Error;
-use crate::location::SeqNo;
+use crate::indexed::encoding::Id;
+use crate::indexed::runtime::{
+    self, DecodedSnapshot, MultiWriteHandle, RuntimeClient, StreamReadHandle, StreamWriteHandle,
+};
+use crate::indexed::SnapshotExt;
 use crate::nemesis::progress::{DataflowProgress, DataflowProgressHandle};
 use crate::nemesis::{
     AllowCompactionReq, FutureRes, FutureStep, Input, ReadOutputEvent, ReadOutputReq,
@@ -119,6 +120,7 @@ use crate::nemesis::{
 };
 use crate::operators::source::PersistedSource;
 use crate::pfuture::PFuture;
+use crate::storage::SeqNo;
 use crate::unreliable::UnreliableHandle;
 
 /// A handle to the "ingestd" (input) side of a persisted collection.
@@ -126,13 +128,14 @@ use crate::unreliable::UnreliableHandle;
 struct Ingest {
     write: StreamWriteHandle<String, ()>,
     read: StreamReadHandle<String, ()>,
+    stream_id: Id,
     progress_rx: DataflowProgress,
 }
 
 /// A handle to the "dataflowd" (output) side of a persisted collection.
 #[derive(Debug)]
 struct Dataflow {
-    output: Receiver<TimelyCaptureEvent<u64, (Result<(String, ()), String>, u64, i64)>>,
+    output: Receiver<TimelyCaptureEvent<u64, (Result<(String, ()), String>, u64, isize)>>,
     workers: TimelyWorkers,
     progress_tx: DataflowProgressHandle,
 }
@@ -146,9 +149,6 @@ struct DirectCore {
 }
 
 impl DirectCore {
-    // Selected to be a small prime number.
-    const OUTPUTS_PER_YIELD: usize = 3;
-
     fn stream(&mut self, name: &str) -> Result<Ingest, Error> {
         match self.streams.entry(name.to_owned()) {
             Entry::Occupied(x) => {
@@ -157,8 +157,7 @@ impl DirectCore {
             }
             Entry::Vacant(x) => {
                 let (write, read) = self.runtime.create_or_load(name);
-                // Error if the create_or_load wasn't successful.
-                let _ = write.stream_id()?;
+                let stream_id = write.stream_id()?;
                 let dataflow_read = read.clone();
                 let (output_tx, output_rx) = mpsc::channel();
                 let output_tx = Arc::new(Mutex::new(output_tx));
@@ -175,11 +174,7 @@ impl DirectCore {
                                 .lock()
                                 .expect("clone doesn't panic and poison lock")
                                 .clone();
-                            let data = scope.persisted_source_yield(
-                                dataflow_read,
-                                &Antichain::from_elem(0),
-                                Self::OUTPUTS_PER_YIELD,
-                            );
+                            let data = scope.persisted_source(dataflow_read);
                             data.probe_with(&mut probe).capture_into(output_tx);
                         });
                         while worker.step_or_park(None) {
@@ -193,6 +188,7 @@ impl DirectCore {
                 let input = Ingest {
                     write,
                     read,
+                    stream_id,
                     progress_rx,
                 };
                 let output = Dataflow {
@@ -354,7 +350,7 @@ impl Runtime for Direct {
 
     fn add_worker(&mut self) -> DirectWorker {
         self.workers += 1;
-        DirectWorker::new(Arc::clone(&self.shared))
+        DirectWorker::new(self.shared.clone())
     }
 
     fn finish(self) {
@@ -484,19 +480,17 @@ impl DirectWorker {
     }
 
     fn write_multi(&mut self, req: WriteReqMulti) -> Result<PFuture<SeqNo>, Error> {
+        let mut write_handles = Vec::new();
         let mut updates = Vec::new();
         for req in req.writes {
             let stream = self.stream(&req.stream)?;
-            updates.push((stream.write.clone(), vec![req.update]));
+            updates.push((stream.stream_id, vec![req.update]));
+            write_handles.push(stream.write.clone());
         }
-        let multi = MultiWriteHandle::new_from_streams(updates.iter().map(|(x, _)| x))?;
+        let write_handles = write_handles.iter().collect::<Vec<_>>();
+        let multi = MultiWriteHandle::new(&write_handles)?;
 
-        Ok(multi.write_atomic(|builder| {
-            for (handle, updates) in updates {
-                builder.add_write(&handle, updates.iter())?;
-            }
-            Ok(())
-        }))
+        Ok(multi.write_atomic(updates))
     }
 
     fn seal(&mut self, req: SealReq) -> Result<PFuture<SeqNo>, Error> {
@@ -563,19 +557,16 @@ impl TimelyWorkers {
 
 #[cfg(test)]
 mod tests {
-    use mz_ore::metrics::MetricsRegistry;
+    use ore::metrics::MetricsRegistry;
     use tempfile::TempDir;
-    use tokio::runtime::Runtime as AsyncRuntime;
 
-    use crate::error::ErrorLog;
     use crate::file::{FileBlob, FileLog};
-    use crate::location::Blob;
+    use crate::indexed::runtime::RuntimeConfig;
     use crate::mem::MemRegistry;
+    use crate::nemesis;
     use crate::nemesis::generator::GeneratorConfig;
-    use crate::runtime::RuntimeConfig;
-    use crate::s3::{S3Blob, S3BlobConfig};
+    use crate::storage::Blob;
     use crate::unreliable::{UnreliableBlob, UnreliableLog};
-    use crate::{nemesis, runtime};
 
     use super::*;
 
@@ -604,7 +595,7 @@ mod tests {
                 RuntimeConfig::for_tests(),
                 log,
                 blob,
-                mz_build_info::DUMMY_BUILD_INFO,
+                build_info::DUMMY_BUILD_INFO,
                 &MetricsRegistry::new(),
                 None,
             )
@@ -619,37 +610,6 @@ mod tests {
         // second, so run this one for fewer steps than the other tests. Revisit
         // once we pipeline write calls in Log.
         nemesis::run(10, GeneratorConfig::default(), direct);
-    }
-
-    impl StartRuntime for (Arc<AsyncRuntime>, S3BlobConfig) {
-        fn start_runtime(&mut self, unreliable: UnreliableHandle) -> Result<RuntimeClient, Error> {
-            let (runtime, config) = self;
-            let (runtime, config) = (Arc::clone(runtime), config.clone());
-            let guard = runtime.enter();
-            let blob = S3Blob::open_exclusive(config, ("reentrance0", "direct_s3").into())?;
-            drop(guard);
-            let blob = UnreliableBlob::from_handle(blob, unreliable);
-            runtime::start(
-                RuntimeConfig::for_tests(),
-                ErrorLog,
-                blob,
-                mz_build_info::DUMMY_BUILD_INFO,
-                &MetricsRegistry::new(),
-                Some(runtime),
-            )
-        }
-    }
-
-    #[test]
-    fn direct_s3() {
-        let runtime = Arc::new(AsyncRuntime::new().expect("failed to create async runtime"));
-        let config = runtime
-            .block_on(S3BlobConfig::new_for_test())
-            .expect("loading s3 config failed");
-        if let Some(config) = config {
-            let direct = Direct::new((runtime, config)).expect("initial start failed");
-            nemesis::run(10, GeneratorConfig::default(), direct);
-        }
     }
 
     // A variant with a traffic pattern vaguely like production usage of

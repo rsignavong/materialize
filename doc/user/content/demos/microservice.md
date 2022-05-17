@@ -6,8 +6,6 @@ menu:
     parent: 'demos'
 ---
 
-{{% demos-warning %}}
-
 **tl;dr** Using Materialize, you can easily create transformation-oriented
 microservices.
 
@@ -415,7 +413,7 @@ In a future iteration, we'll make this demo more interactive.
 
     ```shell
     cd materialize/demo/billing
-    ./mzcompose run default
+    ./mzcompose run demo
     ```
 
    Note that downloading the Docker images necessary for the demo can take quite

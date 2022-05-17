@@ -7,10 +7,9 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 
-use crate::action::{Action, ControlFlow, State};
+use crate::action::{Action, State};
 use crate::parser::BuiltinCommand;
 use crate::util::postgres::postgres_client;
 
@@ -19,7 +18,7 @@ pub struct ExecuteAction {
     queries: Vec<String>,
 }
 
-pub fn build_execute(mut cmd: BuiltinCommand) -> Result<ExecuteAction, anyhow::Error> {
+pub fn build_execute(mut cmd: BuiltinCommand) -> Result<ExecuteAction, String> {
     let connection = cmd.args.string("connection")?;
     cmd.args.done()?;
     Ok(ExecuteAction {
@@ -30,11 +29,11 @@ pub fn build_execute(mut cmd: BuiltinCommand) -> Result<ExecuteAction, anyhow::E
 
 #[async_trait]
 impl Action for ExecuteAction {
-    async fn undo(&self, _: &mut State) -> Result<(), anyhow::Error> {
+    async fn undo(&self, _: &mut State) -> Result<(), String> {
         Ok(())
     }
 
-    async fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+    async fn redo(&self, state: &mut State) -> Result<(), String> {
         let client;
         let client = if self.connection.starts_with("postgres://") {
             client = postgres_client(&self.connection).await?;
@@ -43,7 +42,7 @@ impl Action for ExecuteAction {
             state
                 .postgres_clients
                 .get(&self.connection)
-                .ok_or_else(|| anyhow!("connection '{}' not found", &self.connection))?
+                .ok_or(format!("connection '{}' not found", &self.connection))?
         };
 
         for query in &self.queries {
@@ -51,9 +50,9 @@ impl Action for ExecuteAction {
             client
                 .batch_execute(query)
                 .await
-                .context("executing postgres query")?;
+                .map_err(|e| format!("executing postgres query: {}", e))?;
         }
 
-        Ok(ControlFlow::Continue)
+        Ok(())
     }
 }

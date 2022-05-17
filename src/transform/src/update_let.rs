@@ -13,12 +13,12 @@
 use std::collections::HashMap;
 
 use crate::TransformArgs;
-use mz_expr::{Id, LocalId, MirRelationExpr, RECURSION_LIMIT};
-use mz_ore::{
+use expr::{Id, LocalId, MirRelationExpr, RECURSION_LIMIT};
+use ore::{
     id_gen::IdGen,
     stack::{CheckedRecursion, RecursionGuard},
 };
-use mz_repr::RelationType;
+use repr::RelationType;
 
 /// Refreshes identifiers and types for local let bindings.
 ///

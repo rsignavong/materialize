@@ -10,8 +10,6 @@
 > SHOW ALL
 application_name            ""                                         "Sets the application name to be reported in statistics and logs (PostgreSQL)."
 client_encoding             UTF8                                       "Sets the client's character set encoding (PostgreSQL)."
-client_min_messages         notice                                     "Sets the message levels that are sent to the client (PostgreSQL)."
-cluster                     default                                    "Sets the current cluster (Materialize)."
 database                    materialize                                "Sets the current database (CockroachDB)."
 extra_float_digits          3                                          "Adjusts the number of digits displayed for floating-point values (PostgreSQL)."
 failpoints                  ""                                         "Allows failpoints to be dynamically activated."
@@ -34,27 +32,7 @@ UTF8
 UTF8
 
 ! SET client_encoding = UTF9
-contains:parameter "client_encoding" can only be set to "UTF8"
-
-# if its utf8 we let it through
-> SET NAMES 'UTF8';
-
-# match the behavior of postgres as specified here: https://www.postgresql.org/docs/9.1/sql-set.html
-! SET NAMES = "something";
-contains:unrecognized configuration parameter "names"
-
-# standard_conforming_strings is constrained to true
-> SET standard_conforming_strings = ON;
-
-> SET standard_conforming_strings = true;
-
-> SET standard_conforming_strings TO TRUE;
-
-! SET standard_conforming_strings = OFF;
-contains:parameter "standard_conforming_strings" can only be set to "on"
-
-! SET standard_conforming_strings = typo;
-contains:parameter "standard_conforming_strings" requires a "boolean" value
+parameter "client_encoding" cannot be changed
 
 > SET sql_safe_updates = on
 > SHOW sql_safe_updates
@@ -78,18 +56,18 @@ off
 > SET DateStyle = 'MDY'
 > SET DateStyle = 'ISO,MDY'
 ! SET DateStyle = 'ooga booga'
-contains:parameter "DateStyle" can only be set to "ISO, MDY"
+parameter "DateStyle" can only be set to "ISO, MDY"
 
 # `search_path` is tested elsewhere.
 
 ! SET server_version = "9.6.0"
-contains:parameter "server_version" cannot be changed
+parameter "server_version" cannot be changed
 
 ! SET server_version_num = "90600"
-contains:parameter "server_version_num" cannot be changed
+parameter "server_version_num" cannot be changed
 
 ! SET TimeZone = 'nope'
-contains:invalid value for parameter "TimeZone": "nope"
+parameter "TimeZone" can only be set to "UTC"
 
 # The `transaction_isolation` variable has dedicated syntax as mandated by the
 # SQL standard.
@@ -97,39 +75,7 @@ contains:invalid value for parameter "TimeZone": "nope"
 serializable
 
 ! SET transaction_isolation = 'read committed'
-contains:parameter "transaction_isolation" cannot be changed
+parameter "transaction_isolation" cannot be changed
 
 ! SET integer_datetimes = false
-contains:parameter "integer_datetimes" cannot be changed
-
-> SET client_min_messages TO ERROR
-> SHOW client_min_messages
-error
-
-> SET client_min_messages = warning
-> SHOW client_min_messages
-warning
-
-> SET client_min_messages = 'Notice'
-> SHOW client_min_messages
-notice
-
-> SET client_min_messages = LoG
-> SHOW client_min_messages
-log
-
-> SET client_min_messages to 'debug4'
-> SHOW client_min_messages
-debug4
-
-# postgres behavior corner cases
-> SET client_min_messages to 'debug'
-> SHOW client_min_messages
-debug2
-
-> SET client_min_messages to 'info'
-> SHOW client_min_messages
-info
-
-! SET client_min_messages to invalid
-contains:invalid value for parameter "client_min_messages": "invalid"
+parameter "integer_datetimes" cannot be changed

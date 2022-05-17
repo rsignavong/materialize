@@ -44,10 +44,10 @@ INSERT INTO schema1.t1 SELECT * FROM schema1.t1;
 INSERT INTO schema2.t1 SELECT * FROM schema2.t1;
 
 ! CREATE VIEWS FROM SOURCE mz_source;
-contains:unknown schema 'schema1'
+unknown schema 'schema1'
 
 ! CREATE VIEWS FROM SOURCE mz_source (t1);
-contains:table t1 is ambiguous, consider specifying the schema
+table t1 is ambiguous, consider specifying the schema
 
 > DROP SCHEMA IF EXISTS schema1;
 

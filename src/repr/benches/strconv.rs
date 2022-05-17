@@ -12,7 +12,7 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
-use mz_repr::strconv;
+use repr::strconv;
 
 fn bench_parse_float32(c: &mut Criterion) {
     for s in &["-3.0", "9.7", "NaN", "inFiNiTy"] {
@@ -44,9 +44,8 @@ fn bench_format_list_simple(c: &mut Criterion) {
         b.iter(|| {
             let mut buf = String::new();
             strconv::format_list(&mut buf, black_box(&list), |lw, i| {
-                Ok::<_, ()>(strconv::format_int32(lw.nonnull_buffer(), *i))
+                strconv::format_int32(lw.nonnull_buffer(), *i)
             })
-            .unwrap()
         })
     });
 }
@@ -78,11 +77,10 @@ fn bench_format_list_nested(c: &mut Criterion) {
             strconv::format_list(&mut buf, black_box(&list), |lw, list| {
                 strconv::format_list(lw.nonnull_buffer(), list, |lw, list| {
                     strconv::format_list(lw.nonnull_buffer(), list, |lw, s| {
-                        Ok::<_, ()>(strconv::format_string(lw.nonnull_buffer(), s))
+                        strconv::format_string(lw.nonnull_buffer(), s)
                     })
                 })
-            })
-            .unwrap();
+            });
         })
     });
 }

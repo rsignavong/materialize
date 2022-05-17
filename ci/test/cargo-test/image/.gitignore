@@ -1,7 +1,4 @@
-/materialized
-/protobuf-install
-/protoc
 /shlib
+/tests
 /test-binaries.json
 /testdrive
-/tests

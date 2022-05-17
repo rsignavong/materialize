@@ -34,4 +34,4 @@
 f1 false integer
 
 ! INSERT INTO not_null VALUES (null)
-contains:null value in column "f1" violates not-null constraint
+null value in column "f1" violates not-null constraint

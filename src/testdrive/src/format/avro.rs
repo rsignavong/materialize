@@ -20,27 +20,30 @@
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 
-use anyhow::{anyhow, bail, Context};
+use mz_avro::types::AvroMap;
+use ore::result::ResultExt;
 use regex::Regex;
+
 use serde_json::Value as JsonValue;
 
 // Re-export components from the various other Avro libraries, so that other
 // testdrive modules can import just this one.
 
-pub use mz_avro::schema::{Schema, SchemaKind, SchemaNode, SchemaPiece, SchemaPieceOrNamed};
-pub use mz_avro::types::{AvroMap, DecimalValue, ToAvro, Value};
+pub use interchange::avro::parse_schema;
+use mz_avro::schema::SchemaKind;
+pub use mz_avro::schema::{Schema, SchemaNode, SchemaPiece, SchemaPieceOrNamed};
+pub use mz_avro::types::{DecimalValue, ToAvro, Value};
 pub use mz_avro::{from_avro_datum, to_avro_datum, Codec, Reader, Writer};
-pub use mz_interchange::avro::parse_schema;
 
 // This function is derived from code in the avro_rs project. Update the license
 // header on this file accordingly if you move it to a new home.
-pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, anyhow::Error> {
+pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> {
     match (json, schema.inner) {
         (JsonValue::Null, SchemaPiece::Null) => Ok(Value::Null),
         (JsonValue::Bool(b), SchemaPiece::Boolean) => Ok(Value::Boolean(*b)),
-        (JsonValue::Number(ref n), SchemaPiece::Int) => {
-            Ok(Value::Int(n.as_i64().unwrap().try_into()?))
-        }
+        (JsonValue::Number(ref n), SchemaPiece::Int) => Ok(Value::Int(
+            n.as_i64().unwrap().try_into().map_err_to_string()?,
+        )),
         (JsonValue::Number(ref n), SchemaPiece::Long) => Ok(Value::Long(n.as_i64().unwrap())),
         (JsonValue::Number(ref n), SchemaPiece::Float) => {
             Ok(Value::Float(n.as_f64().unwrap() as f32))
@@ -82,7 +85,7 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, anyhow::
                 .collect::<Option<Vec<u8>>>()
             {
                 Some(bytes) => bytes,
-                None => bail!("decimal was not represented by byte array"),
+                None => return Err("decimal was not represented by byte array".into()),
             };
             Ok(Value::Decimal(DecimalValue {
                 unscaled: bytes,
@@ -97,27 +100,31 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, anyhow::
                 .collect::<Option<Vec<u8>>>()
             {
                 Some(bytes) => bytes,
-                None => bail!("fixed was not represented by byte array"),
+                None => return Err("fixed was not represented by byte array".into()),
             };
             if *size != bytes.len() {
-                bail!("expected fixed size {}, got {}", *size, bytes.len())
+                Err(format!(
+                    "expected fixed size {}, got {}",
+                    *size,
+                    bytes.len()
+                ))
             } else {
                 Ok(Value::Fixed(*size, bytes))
             }
         }
         (JsonValue::String(s), SchemaPiece::Json) => {
-            let j = serde_json::from_str(s)?;
+            let j = serde_json::from_str(s).map_err_to_string()?;
             Ok(Value::Json(j))
         }
         (JsonValue::String(s), SchemaPiece::Uuid) => {
-            let u = uuid::Uuid::parse_str(&s)?;
+            let u = uuid::Uuid::parse_str(&s).map_err_to_string()?;
             Ok(Value::Uuid(u))
         }
         (JsonValue::String(s), SchemaPiece::Enum { symbols, .. }) => {
             if symbols.contains(s) {
                 Ok(Value::String(s.clone()))
             } else {
-                bail!("Unrecognized enum variant: {}", s)
+                Err(format!("Unrecognized enum variant: {}", s))
             }
         }
         (JsonValue::Object(items), SchemaPiece::Record { .. }) => {
@@ -126,7 +133,7 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, anyhow::
             for (key, val) in items {
                 let field = builder
                     .field_by_name(key)
-                    .ok_or_else(|| anyhow!("No such key in record: {}", key))?;
+                    .ok_or_else(|| format!("No such key in record: {}", key))?;
                 let val = from_json(val, schema.step(&field.schema))?;
                 builder.put(key, val);
             }
@@ -164,21 +171,20 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, anyhow::
                         null_variant,
                     })
                 } else {
-                    bail!("No `null` value in union schema.")
+                    Err("No `null` value in union schema.".to_string())
                 };
             }
             let items = match val {
                 JsonValue::Object(items) => items,
-                _ => bail!("Union schema element must be `null` or a map from type name to value; found {:?}", val),
+                _ => return Err(format!("Union schema element must be `null` or a map from type name to value; found {:?}", val))
             };
             let (name, val) = if items.len() == 1 {
                 (items.keys().next().unwrap(), items.values().next().unwrap())
             } else {
-                bail!(
+                return Err(format!(
                     "Expected one-element object to match union schema: {:?} vs {:?}",
-                    json,
-                    schema
-                );
+                    json, schema
+                ));
             };
             for (i, variant) in variants.iter().enumerate() {
                 let name_matches = match variant {
@@ -206,17 +212,15 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, anyhow::
                     }
                 }
             }
-            bail!(
+            Err(format!(
                 "Type not found in union: {}. variants: {:#?}",
-                name,
-                variants
-            )
+                name, variants
+            ))
         }
-        _ => bail!(
+        _ => Err(format!(
             "unable to match JSON value to schema: {:?} vs {:?}",
-            json,
-            schema
-        ),
+            json, schema
+        )),
     }
 }
 
@@ -227,31 +231,7 @@ pub fn validate_sink<I>(
     actual: &[(Option<Value>, Option<Value>)],
     regex: &Option<Regex>,
     regex_replacement: &String,
-) -> Result<(), anyhow::Error>
-where
-    I: IntoIterator,
-    I::Item: AsRef<str>,
-{
-    validate_sink_with_partial_search(
-        key_schema,
-        value_schema,
-        expected,
-        actual,
-        regex,
-        regex_replacement,
-        false,
-    )
-}
-
-pub fn validate_sink_with_partial_search<I>(
-    key_schema: Option<&Schema>,
-    value_schema: &Schema,
-    expected: I,
-    actual: &[(Option<Value>, Option<Value>)],
-    regex: &Option<Regex>,
-    regex_replacement: &String,
-    partial_search: bool,
-) -> Result<(), anyhow::Error>
+) -> Result<(), String>
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
@@ -262,9 +242,9 @@ where
             let mut deserializer = serde_json::Deserializer::from_str(v.as_ref()).into_iter();
             let key = if let Some(key_schema) = key_schema {
                 let key: serde_json::Value = match deserializer.next() {
-                    None => bail!("key missing in input line"),
-                    Some(r) => r?,
-                };
+                    None => Err("key missing in input line".to_string()),
+                    Some(r) => r.map_err(|e| format!("parsing json: {}", e)),
+                }?;
                 Some(from_json(&key, key_schema.top_node())?)
             } else {
                 None
@@ -272,23 +252,19 @@ where
             let value = match deserializer.next() {
                 None => None,
                 Some(r) => {
-                    let value = r.context("parsing json")?;
+                    let value = r.map_err(|e| format!("parsing json: {}", e))?;
                     Some(from_json(&value, value_schema.top_node())?)
                 }
             };
             Ok((key, value))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, String>>()?;
     let mut expected = expected.iter();
     let mut actual = actual.iter();
     let mut index = 0..;
-
-    let mut found_beginning = !partial_search;
-    let mut expected_item = expected.next();
-    let mut actual_item = actual.next();
     loop {
         let i = index.next().expect("known to exist");
-        match (expected_item, actual_item) {
+        match (expected.next(), actual.next()) {
             (Some(e), Some(a)) => {
                 let e_str = format!("{:#?}", e);
                 let a_str = match &regex {
@@ -299,38 +275,23 @@ where
                 };
 
                 if e_str != a_str {
-                    if found_beginning {
-                        bail!(
-                            "record {} did not match\nexpected:\n{}\n\nactual:\n{}",
-                            i,
-                            e_str,
-                            a_str
-                        );
-                    }
-                    actual_item = actual.next();
-                } else {
-                    found_beginning = true;
-                    expected_item = expected.next();
-                    actual_item = actual.next();
+                    return Err(format!(
+                        "record {} did not match\nexpected:\n{}\n\nactual:\n{}",
+                        i, e_str, a_str
+                    ));
                 }
             }
-            (Some(e), None) => bail!("missing record {}: {:#?}", i, e),
-            (None, Some(a)) => {
-                if !partial_search {
-                    bail!("extra record {}: {:#?}", i, a);
-                }
-                break;
-            }
+            (Some(e), None) => return Err(format!("missing record {}: {:#?}", i, e)),
+            (None, Some(a)) => return Err(format!("extra record {}: {:#?}", i, a)),
             (None, None) => break,
         }
     }
     let expected: Vec<_> = expected.map(|e| format!("{:#?}", e)).collect();
     let actual: Vec<_> = actual.map(|a| format!("{:#?}", a)).collect();
-
     if !expected.is_empty() {
-        bail!("missing records:\n{}", expected.join("\n"))
-    } else if !actual.is_empty() && !partial_search {
-        bail!("extra records:\n{}", actual.join("\n"))
+        Err(format!("missing records:\n{}", expected.join("\n")))
+    } else if !actual.is_empty() {
+        Err(format!("extra records:\n{}", actual.join("\n")))
     } else {
         Ok(())
     }

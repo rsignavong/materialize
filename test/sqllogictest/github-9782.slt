@@ -64,20 +64,8 @@ CREATE TAble table_f5_f6 (f5 INTEGER, f6 INTEGER);
 query T multiline
 EXPLAIN  SELECT *  FROM table_f1 , ( table_f4_f5_f6 AS a2 LEFT JOIN table_f5_f6 AS a3 USING ( f5 , f6  ) ) WHERE f5 = f6 AND  f4 = f6;
 ----
-Source materialize.public.table_f1 (u1):
-| Project (#0)
-
-Source materialize.public.table_f4_f5_f6 (u3):
-| Filter (#0 = #1), (#0 = #2), (#1 = #2)
-| Project (#0..=#2)
-
-Source materialize.public.table_f5_f6 (u4):
-| Filter (#0 = #1)
-| Project (#0, #1)
-
-Query:
 %0 = Let l0 =
-| Get materialize.public.table_f4_f5_f6 (u3)
+| Get materialize.public.table_f4_f5_f6 (u5)
 | Filter (#0 = #1), (#0 = #2), (#1 = #2)
 
 %1 =
@@ -85,14 +73,14 @@ Query:
 | ArrangeBy (#0)
 
 %2 =
-| Get materialize.public.table_f5_f6 (u4)
+| Get materialize.public.table_f5_f6 (u7)
 | Filter (#0 = #1)
 | Project (#0)
 
 %3 = Let l1 =
 | Join %1 %2 (= #0 #3)
 | | implementation = Differential %2 %1.(#0)
-| Project (#0..=#2)
+| Project (#0..#2)
 
 %4 =
 | Get materialize.public.table_f1 (u1)
@@ -118,7 +106,7 @@ Query:
 %9 =
 | Join %7 %8 (= #0 #3)
 | | implementation = Differential %8 %7.(#0)
-| Project (#0..=#2)
+| Project (#0..#2)
 
 %10 =
 | Union %3 %9

@@ -9,22 +9,22 @@
 
 //! AWS configuration.
 
-use aws_config::ConfigLoader;
+use std::sync::Arc;
+
+use aws_config::{Config, ConfigLoader};
 use aws_smithy_http::endpoint::Endpoint;
 use aws_types::credentials::{Credentials, CredentialsError, ProvideCredentials};
 use aws_types::region::Region;
-use aws_types::sdk_config::SdkConfig;
 
 /// Service agnostic configuration for AWS.
 ///
-/// This wraps the upstream [`SdkConfig`] type to allow additionally configuring
+/// This wraps the upstream [`Config`] type to allow additionally configuring
 /// a global endpoint (e.g., LocalStack) to be used for all services.
-// TODO(benesch): this entire type can get deleted if awslabs/aws-sdk-rust#396
-// gets resolved.
 #[derive(Debug, Clone)]
 pub struct AwsConfig {
     endpoint: Option<Endpoint>,
-    inner: SdkConfig,
+    // TODO(benesch): drop the `Arc` if awslabs/aws-sdk-rust#352 is resolved.
+    inner: Arc<Config>,
 }
 
 impl AwsConfig {
@@ -32,7 +32,7 @@ impl AwsConfig {
     pub async fn from_loader(loader: ConfigLoader) -> AwsConfig {
         AwsConfig {
             endpoint: None,
-            inner: loader.load().await,
+            inner: Arc::new(loader.load().await),
         }
     }
 
@@ -41,8 +41,8 @@ impl AwsConfig {
         AwsConfig::from_loader(aws_config::from_env()).await
     }
 
-    /// Returns the inner [`SdkConfig`] object.
-    pub fn inner(&self) -> &SdkConfig {
+    /// Returns the inner [`Config`] object.
+    pub fn inner(&self) -> &Config {
         &self.inner
     }
 

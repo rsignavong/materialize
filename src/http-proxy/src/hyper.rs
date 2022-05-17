@@ -13,25 +13,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Proxy adapters for [`hyper`](https://docs.rs/hyper).
+//! Proxy adapters for [`hyper`](hyper_dep).
 
+use std::error::Error;
+
+use hyper_dep::client::HttpConnector;
 use hyper_proxy::{Proxy, ProxyConnector};
+use hyper_tls::HttpsConnector;
 
 use crate::proxy::PROXY_CONFIG;
 
-/// Wraps a `hyper` connector in a new connector that obeys the system proxy
-/// configuration.
+/// A proxying HTTPS connector for hyper.
+pub type Connector = ProxyConnector<HttpsConnector<HttpConnector>>;
+
+/// Create a `hyper` connector that obeys the system proxy configuration.
 ///
 /// For details about the system proxy configuration, see the
 /// [crate documentation](crate).
-pub fn connector<C>(connector: C) -> ProxyConnector<C> {
-    // `ProxyConnector::new` only errors if creating a TLS context fails, but
-    // `hyper_tls::HttpsConnector::new()` panics in the same situation. So no
-    // point returning an error here instead of panicking. It's much more
-    // convenient downstream and more consistent with the rest of the Rust
-    // ecosystem if creating a connector is infallible.
-    let mut connector = ProxyConnector::new(connector)
-        .unwrap_or_else(|e| panic!("hyper_proxy::ProxyConnector::new failure: {}", e));
+pub fn connector() -> Result<Connector, Box<dyn Error + Send + Sync>> {
+    let mut connector = ProxyConnector::new(HttpsConnector::new())?;
 
     if let Some(http_proxy) = PROXY_CONFIG.http_proxy() {
         let matches = move |scheme: Option<&str>, host: Option<&str>, port| {
@@ -54,5 +54,5 @@ pub fn connector<C>(connector: C) -> ProxyConnector<C> {
         connector.add_proxy(Proxy::new(matches, all_proxy.clone()));
     }
 
-    connector
+    Ok(connector)
 }

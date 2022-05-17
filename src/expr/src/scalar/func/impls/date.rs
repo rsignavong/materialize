@@ -9,7 +9,7 @@
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
-use mz_repr::strconv;
+use repr::strconv;
 
 sqlfunc!(
     #[sqlname = "datetostr"]

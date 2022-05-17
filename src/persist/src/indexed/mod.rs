@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0.
 
 //! A persistent, compacting, indexed data structure of `(Key, Value, Time,
-//! i64)` updates.
+//! Diff)` updates.
 
 // NB: These really don't need to be public, but the public doc lint is nice.
 pub mod arrangement;
@@ -17,21 +17,22 @@ pub mod cache;
 pub mod columnar;
 pub mod encoding;
 pub mod metrics;
-pub mod snapshot;
+pub mod runtime;
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::Arc;
 use std::time::Instant;
 
-use mz_ore::cast::CastFrom;
+use differential_dataflow::trace::Description;
+use ore::cast::CastFrom;
 use timely::progress::Antichain;
-use tracing::{error, trace, warn};
+use timely::progress::Timestamp as TimelyTimestamp;
 
 use crate::error::Error;
-use crate::indexed::arrangement::Arrangement;
-use crate::indexed::background::{CompactTraceReq, CompactTraceRes, Maintainer};
+use crate::indexed::arrangement::{Arrangement, ArrangementSnapshot};
+use crate::indexed::background::Maintainer;
 use crate::indexed::cache::BlobCache;
 use crate::indexed::columnar::ColumnarRecords;
 use crate::indexed::encoding::{
@@ -39,178 +40,10 @@ use crate::indexed::encoding::{
     UnsealedBatchMeta,
 };
 use crate::indexed::metrics::Metrics;
-use crate::indexed::snapshot::ArrangementSnapshot;
-use crate::location::{Blob, BlobRead, Log, SeqNo};
 use crate::mem::MemBlob;
-use crate::pfuture::{PFuture, PFutureHandle};
+use crate::pfuture::PFutureHandle;
+use crate::storage::{Blob, Log, SeqNo};
 use crate::unreliable::UnreliableBlob;
-
-/// The description of a persisted stream.
-#[derive(Debug, Clone, PartialEq)]
-pub struct StreamDesc {
-    /// The external name of this stream.
-    pub name: String,
-    /// The upper of this stream.
-    pub upper: Antichain<u64>,
-    /// The since of this stream.
-    pub since: Antichain<u64>,
-}
-
-/// A read-only input to the persist state machine.
-#[derive(Debug)]
-pub enum CmdRead {
-    /// Loads the arrangement with the given external stream name, returning the
-    /// corresponding internal stream id.
-    Load(String, (String, String), PFutureHandle<Option<Id>>),
-    /// Returns the [StreamDesc] of every active (non-deleted) stream.
-    GetDescriptions(PFutureHandle<HashMap<Id, StreamDesc>>),
-    /// Returns a [crate::indexed::snapshot::Snapshot] for the given id.
-    Snapshot(Id, PFutureHandle<ArrangementSnapshot>),
-    /// Registers a callback to be invoked on successful writes and seals.
-    ///
-    /// Also returns a copy of the snapshot so that users can, if they want,
-    /// apply their logic to a consistent read of the entire stream.
-    Listen(
-        Id,
-        crossbeam_channel::Sender<ListenEvent>,
-        PFutureHandle<ArrangementSnapshot>,
-    ),
-    /// Flush out any pending work and close the underlying storage, causing
-    /// all future commands to error.
-    ///
-    /// If applicable, releases exclusive-writer locks.
-    Stop(PFutureHandle<()>),
-}
-
-impl CmdRead {
-    /// Fills self's response, if applicable, with Error::RuntimeShutdown.
-    pub fn fill_err_runtime_shutdown(self) {
-        match self {
-            CmdRead::Load(_, _, res) => res.fill(Err(Error::RuntimeShutdown)),
-            CmdRead::GetDescriptions(res) => res.fill(Err(Error::RuntimeShutdown)),
-            CmdRead::Snapshot(_, res) => res.fill(Err(Error::RuntimeShutdown)),
-            CmdRead::Listen(_, _, res) => res.fill(Err(Error::RuntimeShutdown)),
-            CmdRead::Stop(res) => {
-                // Already stopped: no-op.
-                res.fill(Ok(()))
-            }
-        }
-    }
-}
-
-/// An input to the persist state machine.
-//
-// NB: The set of these that aren't in the CmdRead variant is exactly the set of
-// things that we'll serialize to Log when we add that back in.
-#[derive(Debug)]
-pub enum Cmd {
-    /// Creates, if necessary, a new unsealed and trace with the given external
-    /// stream name, returning the corresponding internal stream id.
-    ///
-    /// This is idempotent: names may be registered multiple times.
-    Register(String, (String, String), PFutureHandle<Id>),
-    /// Removes a stream from the index.
-    ///
-    /// This is idempotent and may be called multiple times. It returns true if
-    /// the stream was destroyed from this call, and false if it was already
-    /// destroyed.
-    Destroy(String, PFutureHandle<bool>),
-    /// Asynchronously persists (Key, Value, Time, i64) updates for the stream
-    /// with the given id.
-    Write(Vec<(Id, ColumnarRecords)>, PFutureHandle<SeqNo>),
-    /// Sealing a time advances the "sealed" frontier for an id, which restricts
-    /// what times can later be sealed and written for that id. See
-    /// `sealed_frontier` for details.
-    Seal(Vec<Id>, u64, PFutureHandle<SeqNo>),
-    /// Permit compaction of updates at times <= since to since.
-    ///
-    /// The compaction frontier can never decrease and it is an error to call
-    /// this function with a since argument that is less than the current
-    /// compaction frontier.
-    ///
-    /// While it may seem counter-intuitive to advance the compaction frontier
-    /// past the seal frontier, this is perfectly valid. It can happen when
-    /// joining updates from one stream to updates from another stream, and we
-    /// already know that the other stream is compacted further along. Allowing
-    /// compaction on this, the first stream, then is saying that we are fine
-    /// with losing historical detail, and that we already allow compaction of
-    /// updates that are yet to come because we don't need them at their full
-    /// resolution. A similar case is when we know that any outstanding queries
-    /// have an `as_of` that is in the future of the seal: we can also
-    /// pro-actively allow compaction of updates that did not yet arrive.
-    AllowCompaction(Vec<(Id, Antichain<u64>)>, PFutureHandle<SeqNo>),
-    /// A response from a previously sent maintenance request.
-    Maintenance(MaintenanceRes),
-    /// A read-only input to the persist state machine.
-    Read(CmdRead),
-}
-
-impl Cmd {
-    /// Fills self's response, if applicable, with Error::RuntimeShutdown.
-    pub fn fill_err_runtime_shutdown(self) {
-        match self {
-            Cmd::Register(_, _, res) => res.fill(Err(Error::RuntimeShutdown)),
-            Cmd::Destroy(_, res) => res.fill(Err(Error::RuntimeShutdown)),
-            Cmd::Write(_, res) => res.fill(Err(Error::RuntimeShutdown)),
-            Cmd::Seal(_, _, res) => res.fill(Err(Error::RuntimeShutdown)),
-            Cmd::AllowCompaction(_, res) => res.fill(Err(Error::RuntimeShutdown)),
-            Cmd::Maintenance(_) => {}
-            Cmd::Read(cmd_read) => cmd_read.fill_err_runtime_shutdown(),
-        }
-    }
-}
-
-/// A request for some work e.g. trace compaction, that can be performed outside
-/// of the main [Indexed] loop.
-#[derive(Clone, Debug, PartialEq)]
-pub enum MaintenanceReq {
-    /// A request to compact a trace by merging together some immutable batches.
-    CompactTrace((Id, CompactTraceReq)),
-}
-
-/// A future for some work that can be completed outside of the main [Indexed]
-/// loop.
-#[derive(Debug)]
-pub enum MaintenanceFuture {
-    /// A future to perform some trace compaction.
-    CompactTrace((Id, PFuture<CompactTraceRes>)),
-}
-
-/// A response for some work that was completed outside of the main [Indexed] loop.
-#[derive(Clone, Debug, PartialEq)]
-pub enum MaintenanceRes {
-    /// The results of performing some trace compaction by merging together some
-    /// immutable trace batches.
-    CompactTrace((Id, Result<CompactTraceRes, Error>)),
-}
-
-impl MaintenanceReq {
-    /// Asynchronously runs the requested maintenance work on the work pool
-    /// provided at construction time.
-    ///
-    /// Returns a [MaintenanceFuture] that can be used to get the results of the
-    /// requested work.
-    pub fn run_async<B: Blob>(self, maintainer: &Maintainer<B>) -> MaintenanceFuture {
-        match self {
-            MaintenanceReq::CompactTrace((id, req)) => {
-                let fut = maintainer.compact_trace(req);
-                MaintenanceFuture::CompactTrace((id, fut))
-            }
-        }
-    }
-}
-
-impl MaintenanceFuture {
-    /// Blocks and asynchronously receives the result for some previously requested
-    /// maintenance work
-    pub async fn recv(self) -> MaintenanceRes {
-        match self {
-            MaintenanceFuture::CompactTrace((id, fut)) => {
-                MaintenanceRes::CompactTrace((id, fut.await))
-            }
-        }
-    }
-}
 
 #[derive(Debug)]
 enum PendingResponse {
@@ -244,7 +77,6 @@ struct Pending {
     writes: HashMap<Id, Vec<ColumnarRecords>>,
     responses: Vec<PendingResponse>,
     seals: HashMap<Id, u64>,
-    deleted_trace_batches: Vec<Vec<TraceBatchMeta>>,
     durable_meta: BlobMeta,
 }
 
@@ -254,7 +86,6 @@ impl Pending {
             writes: HashMap::new(),
             responses: Vec::new(),
             seals: HashMap::new(),
-            deleted_trace_batches: Vec::new(),
             durable_meta,
         }
     }
@@ -277,14 +108,10 @@ impl Pending {
             self.seals.insert(id, seal);
         }
     }
-
-    fn add_deleted_trace_batches(&mut self, batches: Vec<TraceBatchMeta>) {
-        self.deleted_trace_batches.push(batches);
-    }
 }
 
 /// A persistent, compacting, indexed data structure of `(Key, Value, Time,
-/// i64)` updates.
+/// Diff)` updates.
 ///
 /// Indexed contains a set of named persistent [Arrangement]s.
 ///
@@ -307,17 +134,17 @@ impl Pending {
 ///   AppliedState (which has no knowledge of storage, etc). Then, if this was
 ///   successful, Indexed will serialize AppliedState and durably write it down.
 #[derive(Debug)]
-pub struct Indexed<L: Log, B: BlobRead> {
+pub struct Indexed<L: Log, B: Blob> {
     // NB: we are not using Log for anything at the moment and instead have
     // all writes going directly to trace. At some point we'll need to revisit
     // what we want to do with Log, and whether we want it to live inside of
     // Indexed or somewhere else.
     log: L,
     blob: BlobCache<B>,
+    maintainer: Maintainer<B>,
     listeners: HashMap<Id, Vec<crossbeam_channel::Sender<ListenEvent>>>,
-    metrics: Arc<Metrics>,
+    metrics: Metrics,
     state: AppliedState,
-    in_flight_trace_compactions: HashMap<Id, CompactTraceReq>,
     pending: Option<Pending>,
 }
 
@@ -337,10 +164,15 @@ struct AppliedState {
     arrangements: BTreeMap<Id, Arrangement>,
 }
 
-impl<L: Log, B: BlobRead> Indexed<L, B> {
+impl<L: Log, B: Blob> Indexed<L, B> {
     /// Returns a new Indexed, initializing each Unsealed and Trace with the
     /// existing data for them in the blob storage, if any.
-    pub fn new(mut log: L, mut blob: BlobCache<B>, metrics: Arc<Metrics>) -> Result<Self, Error> {
+    pub fn new(
+        mut log: L,
+        mut blob: BlobCache<B>,
+        maintainer: Maintainer<B>,
+        metrics: Metrics,
+    ) -> Result<Self, Error> {
         let meta = blob
             .get_meta()
             .map_err(|err| {
@@ -351,10 +183,10 @@ impl<L: Log, B: BlobRead> Indexed<L, B> {
                 //
                 // TODO: Regression test for this.
                 if let Err(err) = log.close() {
-                    warn!("error closing log: {}", err);
+                    log::warn!("error closing log: {}", err);
                 }
                 if let Err(err) = blob.close() {
-                    warn!("error closing blob: {}", err);
+                    log::warn!("error closing blob: {}", err);
                 }
                 err
             })?
@@ -363,10 +195,10 @@ impl<L: Log, B: BlobRead> Indexed<L, B> {
         let indexed = Indexed {
             log,
             blob,
+            maintainer,
             listeners: HashMap::new(),
             metrics,
             state,
-            in_flight_trace_compactions: HashMap::new(),
             pending: None,
         };
 
@@ -391,7 +223,7 @@ impl AppliedState {
     }
 
     fn assign_seqno(&mut self) -> SeqNo {
-        let seqno = self.highest_assigned_seqno.next();
+        let seqno = self.highest_assigned_seqno + 1;
         self.highest_assigned_seqno = seqno;
         seqno
     }
@@ -475,7 +307,7 @@ impl<L: Log, B: Blob> Indexed<L, B> {
     /// Precondition: pending has been emptied
     fn apply_unbatched_cmd<
         T,
-        WorkFn: FnOnce(&mut AppliedState, &mut BlobCache<B>) -> Result<T, Error>,
+        WorkFn: FnOnce(&mut AppliedState, &mut BlobCache<B>, &mut Maintainer<B>) -> Result<T, Error>,
     >(
         &mut self,
         work_fn: WorkFn,
@@ -487,7 +319,7 @@ impl<L: Log, B: Blob> Indexed<L, B> {
         self.validate_pending_empty()?;
 
         let meta_before = self.state.serialize_meta();
-        let work_ret = match work_fn(&mut self.state, &mut self.blob) {
+        let work_ret = match work_fn(&mut self.state, &mut self.blob, &mut self.maintainer) {
             Ok(work_ret) => work_ret,
             Err(err) => {
                 self.state = AppliedState::new(meta_before);
@@ -535,156 +367,33 @@ impl<L: Log, B: Blob> Indexed<L, B> {
         Ok(())
     }
 
-    // A test helper for Cmd::Register.
-    #[cfg(test)]
-    fn register(
-        &mut self,
-        name: &str,
-        key_codec_name: &str,
-        val_codec_name: &str,
-        res: PFutureHandle<Id>,
-    ) -> bool {
-        self.apply(Cmd::Register(
-            name.into(),
-            (key_codec_name.to_owned(), val_codec_name.to_owned()),
-            res,
-        ))
-    }
-
-    /// Applies the given input to the state machine.
+    /// Creates, if necessary, a new unsealed and trace with the given external
+    /// stream name, returning the corresponding internal stream id.
     ///
-    /// Returns false to indicate a graceful shutdown, true otherwise.
-    pub fn apply(&mut self, cmd: Cmd) -> bool {
-        // TODO: Should this metric be made more general so we count every
-        // command type?
-        if let Cmd::Write(..) = &cmd {
-            self.metrics.cmd_write_count.inc();
-        }
-        match cmd {
-            // Commands that can be batched.
-            Cmd::Write(updates, res) => self.apply_batched_cmd(|state, pending| {
-                let seqno = state.assign_seqno();
-                let resp = state
-                    .validate_write(&updates)
-                    .map(|_| seqno)
-                    .map_err(|err| Error::Noop(seqno, err));
-
-                if resp.is_ok() {
-                    pending.add_writes(updates);
-                }
-                pending.add_response(PendingResponse::SeqNo(res, resp));
-            }),
-            Cmd::Seal(ids, seal_ts, res) => self.apply_batched_cmd(|state, pending| {
-                let seqno = state.assign_seqno();
-                let resp = state
-                    .do_seal(&ids, seal_ts)
-                    .map(|_| seqno)
-                    .map_err(|err| Error::Noop(seqno, err));
-                if resp.is_ok() {
-                    pending.add_seals(ids, seal_ts);
-                }
-                pending.add_response(PendingResponse::SeqNo(res, resp));
-            }),
-            Cmd::AllowCompaction(id_sinces, res) => self.apply_batched_cmd(|state, pending| {
-                let seqno = state.assign_seqno();
-                let resp = state
-                    .do_allow_compaction(id_sinces)
-                    .map(|_| seqno)
-                    .map_err(|err| Error::Noop(seqno, err));
-                pending.add_response(PendingResponse::SeqNo(res, resp));
-            }),
-            Cmd::Maintenance(res) => self.handle_maintenance_res(res),
-
-            // Commands that cannot be batched.
-            Cmd::Register(id, (key_codec_name, val_codec_name), res) => res.fill((|| {
-                self.drain_pending()?;
-                self.apply_unbatched_cmd(|state, _| {
-                    state.do_register(&id, &key_codec_name, &val_codec_name)
-                })
-            })()),
-            Cmd::Destroy(name, res) => res.fill((|| {
-                self.drain_pending()?;
-                self.apply_unbatched_cmd(|state, _| state.do_destroy(&name))
-            })()),
-
-            // Commands that are read-only.
-            Cmd::Read(CmdRead::Load(name, (key_codec_name, val_codec_name), res)) => {
-                res.fill((|| {
-                    self.drain_pending()?;
-                    self.state.do_load(&name, &key_codec_name, &val_codec_name)
-                })())
-            }
-            Cmd::Read(CmdRead::GetDescriptions(res)) => res.fill((|| {
-                self.drain_pending()?;
-                self.state.do_get_descriptions()
-            })()),
-            Cmd::Read(CmdRead::Snapshot(id, res)) => res.fill((|| {
-                self.drain_pending()?;
-                self.state.do_snapshot(id, &self.blob)
-            })()),
-            Cmd::Read(CmdRead::Listen(id, sender, res)) => res.fill((|| {
-                self.drain_pending()?;
-                self.do_listen(id, sender)
-            })()),
-
-            // Stop is special, it's the only one that indicates future work is
-            // impossible (return false).
-            Cmd::Read(CmdRead::Stop(res)) => {
-                // Finish up any pending work that we can before closing, but
-                // don't bother kicking off any maintenance requests.
-                self.step_or_log();
-                res.fill(self.close());
-                return false;
-            }
-        }
-        true
-    }
-}
-
-impl<L: Log, B: BlobRead> Indexed<L, B> {
-    /// Applies the given read-only input to the state machine.
-    ///
-    /// Returns false to indicate a graceful shutdown, true otherwise.
-    pub fn apply_read(&mut self, cmd: CmdRead) -> bool {
-        // TODO: It'd be nice to share code between this and apply, but it's not
-        // yet clear how to do that in a reasonable way.
-        debug_assert_eq!(self.validate_pending_empty(), Ok(()));
-        match cmd {
-            CmdRead::Load(name, (key_codec_name, val_codec_name), res) => res.fill({
-                // We validated that pending was empty above.
-                self.state.do_load(&name, &key_codec_name, &val_codec_name)
-            }),
-            CmdRead::GetDescriptions(res) => res.fill({
-                // We validated that pending was empty above.
-                self.state.do_get_descriptions()
-            }),
-            CmdRead::Snapshot(id, res) => res.fill({
-                // We validated that pending was empty above.
-                self.state.do_snapshot(id, &self.blob)
-            }),
-            CmdRead::Listen(id, listen_fn, res) => res.fill({
-                // We validated that pending was empty above.
-                self.do_listen(id, listen_fn)
-            }),
-
-            // Stop is special, it's the only one that indicates future work is
-            // impossible (return false).
-            CmdRead::Stop(res) => {
-                res.fill(Ok(()));
-                return false;
-            }
-        }
-        true
-    }
-}
-
-impl AppliedState {
-    fn do_load(
+    /// This method is idempotent: ids may be registered multiple times.
+    pub fn register(
         &mut self,
         id_str: &str,
         key_codec_name: &str,
         val_codec_name: &str,
-    ) -> Result<Option<Id>, Error> {
+        res: PFutureHandle<Id>,
+    ) {
+        res.fill((|| {
+            self.drain_pending()?;
+            self.apply_unbatched_cmd(|state, _, _| {
+                state.do_register(id_str, key_codec_name, val_codec_name)
+            })
+        })());
+    }
+}
+
+impl AppliedState {
+    fn do_register(
+        &mut self,
+        id_str: &str,
+        key_codec_name: &str,
+        val_codec_name: &str,
+    ) -> Result<Id, Error> {
         if self.graveyard.iter().any(|r| r.name == id_str) {
             return Err(Error::from(format!(
                 "invalid registration: stream {} already destroyed",
@@ -707,21 +416,8 @@ impl AppliedState {
                         val_codec_name, s.val_codec_name
                     )));
                 }
-                Some(s.id)
+                s.id
             }
-            None => None,
-        };
-        Ok(id)
-    }
-
-    fn do_register(
-        &mut self,
-        id_str: &str,
-        key_codec_name: &str,
-        val_codec_name: &str,
-    ) -> Result<Id, Error> {
-        let id = match self.do_load(id_str, key_codec_name, val_codec_name)? {
-            Some(id) => id,
             None => {
                 let id = self.serialize_meta().next_stream_id();
                 self.id_mapping.push(StreamRegistration {
@@ -743,7 +439,23 @@ impl AppliedState {
         };
         Ok(id)
     }
+}
 
+impl<L: Log, B: Blob> Indexed<L, B> {
+    /// Removes a stream from the index.
+    ///
+    /// This method is idempotent and may be called multiple times. It returns
+    /// true if the stream was destroyed from this call, and false if it was
+    /// already destroyed.
+    pub fn destroy(&mut self, id_str: &str, res: PFutureHandle<bool>) {
+        res.fill((|| {
+            self.drain_pending()?;
+            self.apply_unbatched_cmd(|state, _, _| state.do_destroy(id_str))
+        })());
+    }
+}
+
+impl AppliedState {
     fn do_destroy(&mut self, id_str: &str) -> Result<bool, Error> {
         if self.graveyard.iter().any(|r| r.name == id_str) {
             return Ok(false);
@@ -776,7 +488,7 @@ impl AppliedState {
     }
 }
 
-impl<L: Log, B: BlobRead> Indexed<L, B> {
+impl<L: Log, B: Blob> Indexed<L, B> {
     fn validate(&self) -> Result<(), Error> {
         if let Some(pending) = self.pending.as_ref() {
             Self::validate_matches_storage(&self.blob, &pending.durable_meta)?;
@@ -806,9 +518,9 @@ impl<L: Log, B: BlobRead> Indexed<L, B> {
                     // This is a test and we've almost certainly used
                     // UnreliableBlob to make storage unavailable, log it at a
                     // lower level to keep test output a little less spammy.
-                    trace!("unable to read back persisted metadata: {:?}", e);
+                    log::trace!("unable to read back persisted metadata: {:?}", e);
                 } else {
-                    error!("unable to read back persisted metadata: {:?}", e);
+                    log::error!("unable to read back persisted metadata: {:?}", e);
                 }
             }
         }
@@ -833,10 +545,8 @@ impl<L: Log, B: BlobRead> Indexed<L, B> {
                         }
                     }
                     for batch in arrangement.trace_batches.iter() {
-                        for key in batch.keys.iter() {
-                            if !keys.contains(key) {
-                                return Err(Error::from("key missing in trace batch"));
-                            }
+                        if !keys.contains(&batch.key) {
+                            return Err(Error::from("key missing in trace batch"));
                         }
                     }
                 }
@@ -846,9 +556,9 @@ impl<L: Log, B: BlobRead> Indexed<L, B> {
                     // This is a test and we've almost certainly used
                     // UnreliableBlob to make storage unavailable, log it at a
                     // lower level to keep test output a little less spammy.
-                    trace!("unable to read back persisted metadata: {:?}", e);
+                    log::trace!("unable to read back persisted metadata: {:?}", e);
                 } else {
-                    error!("unable to read back persisted metadata: {:?}", e);
+                    log::error!("unable to read back persisted metadata: {:?}", e);
                 }
             }
         }
@@ -872,9 +582,7 @@ impl<L: Log, B: BlobRead> Indexed<L, B> {
             .as_ref()
             .map_or(false, |p| !p.responses.is_empty())
     }
-}
 
-impl<L: Log, B: Blob> Indexed<L, B> {
     /// Commit any pending in-memory changes to persistent storage, respond to clients
     /// and notify any listeners.
     fn drain_pending(&mut self) -> Result<(), Error> {
@@ -909,17 +617,6 @@ impl<L: Log, B: Blob> Indexed<L, B> {
                 let mut responses = pending.responses;
                 responses.drain(..).for_each(|r| r.fill());
                 self.update_listeners(updates_for_listeners, seals_for_listeners);
-
-                // We can physically delete these trace batches because we successfully
-                // committed the logical deletes to meta.
-                let deleted_trace_batches = pending.deleted_trace_batches;
-                for batches in deleted_trace_batches {
-                    self.metrics.compaction_count.inc();
-                    for batch in batches {
-                        self.blob.delete_trace_batch(&batch)?;
-                    }
-                }
-
                 Ok(())
             }
             Err(e) => {
@@ -940,17 +637,29 @@ impl<L: Log, B: Blob> Indexed<L, B> {
 }
 
 impl AppliedState {
-    fn compact_unsealed(&mut self) -> Result<Vec<UnsealedBatchMeta>, Error> {
+    fn compact_inner<B: Blob>(
+        &mut self,
+        maintainer: &Maintainer<B>,
+    ) -> Result<(u64, Vec<UnsealedBatchMeta>, Vec<TraceBatchMeta>), Error> {
+        let mut total_written_bytes = 0;
         let mut deleted_unsealed_batches = vec![];
+        let mut deleted_trace_batches = vec![];
         for arrangement in self.arrangements.values_mut() {
             deleted_unsealed_batches.extend(arrangement.unsealed_evict());
+            let (written_bytes, deleted_batches) = arrangement.trace_step(maintainer)?;
+            total_written_bytes += written_bytes;
+            deleted_trace_batches.extend(deleted_batches);
         }
-        Ok(deleted_unsealed_batches)
+        Ok((
+            total_written_bytes,
+            deleted_unsealed_batches,
+            deleted_trace_batches,
+        ))
     }
 }
 
 impl<L: Log, B: Blob> Indexed<L, B> {
-    /// Truncate all unsealeds, as much as possible.
+    /// Compact all traces and truncate all unsealeds, if possible.
     ///
     /// Precondition: pending has been emptied
     ///
@@ -960,24 +669,27 @@ impl<L: Log, B: Blob> Indexed<L, B> {
     /// assuming data mostly arrives in order, or not very far in advance of the
     /// currently sealed time. We will need to revisit the unsealed compaction if
     /// that assumption stops being true.
-    fn compact_unsealed(&mut self) -> Result<(), Error> {
+    fn compact(&mut self) -> Result<(), Error> {
         // NB: This validate_pending_empty is intentionally a returned error
         // instead of an assert because it's a precondition (and so a violation
         // means a usage error by the caller of this).
         self.validate_pending_empty()?;
 
         let compaction_start = Instant::now();
-        let ret = self.apply_unbatched_cmd(|state, _| state.compact_unsealed());
+        let ret = self.apply_unbatched_cmd(|state, _, maintainer| state.compact_inner(maintainer));
 
         // Track compaction_seconds even if compaction failed.
         self.metrics
             .compaction_seconds
             .inc_by(compaction_start.elapsed().as_secs_f64());
 
-        let deleted_unsealed_batches = ret?;
-        if !deleted_unsealed_batches.is_empty() {
+        let (total_written_bytes, deleted_unsealed_batches, deleted_trace_batches) = ret?;
+        if !deleted_unsealed_batches.is_empty() || !deleted_trace_batches.is_empty() {
             self.metrics.compaction_count.inc();
         }
+        self.metrics
+            .compaction_write_bytes
+            .inc_by(total_written_bytes);
 
         // After we've committed our logical deletions to durable storage, we can
         // physically delete the data.
@@ -993,125 +705,24 @@ impl<L: Log, B: Blob> Indexed<L, B> {
             self.blob.delete_unsealed_batch(&batch)?;
         }
 
+        for batch in deleted_trace_batches {
+            self.blob.delete_trace_batch(&batch)?;
+        }
+
         Ok(())
-    }
-
-    fn compact_trace_maintenance_reqs(&mut self) -> Result<Vec<MaintenanceReq>, Error> {
-        let mut reqs = vec![];
-        for (id, arrangement) in self.state.arrangements.iter() {
-            // Skip over the arrangement if it already has a compaction request in flight.
-            //
-            // TODO: note that this works because right now the connection between Indexed
-            // and Maintainer is infallible, and the two cannot fail independently of each
-            // other. If that changes, we will have to revisit the policy around waiting
-            // arbitrarily long for maintenance responses and most likely institute
-            // a timeout.
-            if self.in_flight_trace_compactions.contains_key(&id) {
-                self.metrics.trace_compaction_skipped_count.inc();
-                continue;
-            }
-            if let Some(req) = arrangement.trace_next_compact_req()? {
-                reqs.push(MaintenanceReq::CompactTrace((*id, req.clone())));
-                self.in_flight_trace_compactions.insert(*id, req);
-            }
-        }
-        Ok(reqs)
-    }
-
-    /// Handle the results of a prior request to compact a trace.
-    fn handle_compact_trace_res(&mut self, id: Id, res: Result<CompactTraceRes, Error>) {
-        // Check that the request belongs to a stream with currently in-flight
-        // compaction requests, and matches the request currently in flight for
-        // that stream. We expect this condition to always be true while the connection
-        // between Indexed and Maintainer is infallible.
-        //
-        // TODO: can we get rid of this check and simply attempt to handle the response
-        // we've received?
-        let response_expected = {
-            match (self.in_flight_trace_compactions.get(&id), &res) {
-                (Some(req), Ok(res)) => req == &res.req,
-                (Some(_), Err(_)) => {
-                    // TODO: if the error response also contained the original
-                    // request, we could make sure to only handle error responses
-                    // that match the currently in-flight request.
-                    true
-                }
-                (None, _) => false,
-            }
-        };
-
-        debug_assert!(
-            response_expected,
-            "unexpected compaction response for stream: {:?}",
-            id
-        );
-        if !response_expected {
-            return;
-        }
-
-        self.in_flight_trace_compactions.remove(&id);
-
-        // Ignore the response if it corresponds to an error encountered while
-        // trying to compact the stream. The next call to compact_trace_maintenance_reqs
-        // will retry the compaction request.
-        let response = match res {
-            Ok(res) => res,
-            Err(_) => {
-                self.metrics.trace_compaction_error_response_count.inc();
-                return;
-            }
-        };
-
-        let written_bytes = response.merged.size_bytes;
-        self.metrics.compaction_write_bytes.inc_by(written_bytes);
-
-        self.apply_batched_cmd(|state, pending| {
-            // Ignore the response if it belongs to a stream that has since been
-            // deleted.
-            let arrangement = match state.arrangements.get_mut(&id) {
-                Some(arrangement) => arrangement,
-                None => return,
-            };
-            let deleted_trace_batches = arrangement.trace_handle_compact_response(response);
-            if !deleted_trace_batches.is_empty() {
-                pending.add_deleted_trace_batches(deleted_trace_batches);
-            }
-        });
-    }
-
-    /// Handle the results of a previously sent maintenance request.
-    fn handle_maintenance_res(&mut self, res: MaintenanceRes) {
-        match res {
-            MaintenanceRes::CompactTrace((id, res)) => self.handle_compact_trace_res(id, res),
-        };
-    }
-
-    fn step(&mut self) -> Result<Vec<MaintenanceReq>, Error> {
-        self.drain_pending()?;
-        self.apply_unbatched_cmd(|state, blob| state.drain_unsealed(blob))?;
-        self.compact_unsealed()?;
-        self.compact_trace_maintenance_reqs()
     }
 
     /// Drains writes from the log into the unsealed and does any necessary
     /// resulting compaction work.
     ///
-    /// In production, step_or_log should just be called in a loop (probably
-    /// with some smarts about waiting to call it only after there have been
-    /// some writes), but it's exposed this way so we can write deterministic
-    /// tests.
-    pub fn step_or_log(&mut self) -> Vec<MaintenanceReq> {
-        match self.step() {
-            Err(e) => {
-                self.metrics.cmd_step_error_count.inc();
-                // TODO: revisit whether we need to move this to a different log level
-                // depending on how spammy it ends up being. Alternatively, we
-                // may want to rate-limit our logging here.
-                warn!("error running step: {:?}", e);
-                vec![]
-            }
-            Ok(reqs) => reqs,
-        }
+    /// In production, step should just be called in a loop (probably with some
+    /// smarts about waiting to call it only after there have been some writes),
+    /// but it's exposed this way so we can write deterministic tests.
+    pub fn step(&mut self) -> Result<(), Error> {
+        self.drain_pending()?;
+        self.apply_unbatched_cmd(|state, blob, _| state.drain_unsealed(blob))?;
+        self.compact()?;
+        Ok(())
     }
 }
 
@@ -1130,11 +741,32 @@ impl AppliedState {
         }
         Ok(())
     }
+}
 
+impl<L: Log, B: Blob> Indexed<L, B> {
+    /// Asynchronously persists (Key, Value, Time, Diff) updates for the stream
+    /// with the given id.
+    pub fn write(&mut self, updates: Vec<(Id, ColumnarRecords)>, res: PFutureHandle<SeqNo>) {
+        self.apply_batched_cmd(|state, pending| {
+            let seqno = state.assign_seqno();
+            let resp = state
+                .validate_write(&updates)
+                .map(|_| seqno)
+                .map_err(|err| Error::Noop(seqno, err));
+
+            if resp.is_ok() {
+                pending.add_writes(updates);
+            }
+            pending.add_response(PendingResponse::SeqNo(res, resp));
+        })
+    }
+}
+
+impl AppliedState {
     /// Drain pending writes to unsealed.
     ///
-    /// The caller is responsible for committing metadata after this succeeds,
-    /// and restoring metadata if this fails.
+    /// The caller is responsible for commiting metadata after this succeeds, and
+    /// restoring metadata if this fails.
     fn drain_pending_writes<B: Blob>(
         &mut self,
         mut writes_by_id: HashMap<Id, Vec<ColumnarRecords>>,
@@ -1308,21 +940,57 @@ impl AppliedState {
         }
         Ok(())
     }
+}
 
-    fn do_get_descriptions(&self) -> Result<HashMap<Id, StreamDesc>, Error> {
-        let mut descs = HashMap::with_capacity(self.id_mapping.len());
-        for x in self.id_mapping.iter() {
-            let arrangement = self.arrangements.get(&x.id).expect("missing arrangement");
-            let desc = StreamDesc {
-                name: x.name.clone(),
-                upper: arrangement.get_seal(),
-                since: arrangement.since(),
-            };
-            descs.insert(x.id, desc);
-        }
-        Ok(descs)
+impl<L: Log, B: Blob> Indexed<L, B> {
+    /// Sealing a time advances the "sealed" frontier for an id, which restricts
+    /// what times can later be sealed and written for that id. See
+    /// `sealed_frontier` for details.
+    pub fn seal(&mut self, ids: Vec<Id>, seal_ts: u64, res: PFutureHandle<SeqNo>) {
+        self.apply_batched_cmd(|state, pending| {
+            let seqno = state.assign_seqno();
+            let resp = state
+                .do_seal(&ids, seal_ts)
+                .map(|_| seqno)
+                .map_err(|err| Error::Noop(seqno, err));
+            if resp.is_ok() {
+                pending.add_seals(ids, seal_ts);
+            }
+            pending.add_response(PendingResponse::SeqNo(res, resp));
+        })
     }
+}
 
+impl<L: Log, B: Blob> Indexed<L, B> {
+    /// Returns a [Description] of the stream identified by `id_str`.
+    // TODO: We might want to think about returning only the compaction frontier (since) and seal
+    // timestamp (upper) here. Description seems more oriented towards describing batches, and in
+    // our case the lower is always `Antichain::from_elem(Timestamp::minimum())`. We could return a
+    // tuple or create our own Description-like return type for this.
+    fn get_description(&mut self, id_str: &str, res: PFutureHandle<Description<u64>>) {
+        res.fill((|| {
+            self.drain_pending()?;
+            self.apply_unbatched_cmd(|state, _, _| {
+                let registration = state.id_mapping.iter().find(|s| s.name == id_str);
+                match registration {
+                    Some(registration) => {
+                        let arrangement = state
+                            .arrangements
+                            .get(&registration.id)
+                            .expect("missing trace");
+                        let upper = arrangement.get_seal();
+                        let since = arrangement.since();
+                        let lower = Antichain::from_elem(u64::minimum());
+                        Ok(Description::new(lower, upper, since))
+                    }
+                    None => Err(Error::UnknownRegistration(id_str.to_string())),
+                }
+            })
+        })());
+    }
+}
+
+impl AppliedState {
     fn do_allow_compaction(&mut self, id_sinces: Vec<(Id, Antichain<u64>)>) -> Result<(), String> {
         for (id, since) in id_sinces.iter() {
             let arrangement = self
@@ -1342,7 +1010,32 @@ impl AppliedState {
         }
         Ok(())
     }
+}
 
+impl<L: Log, B: Blob> Indexed<L, B> {
+    /// Permit compaction of updates at times <= since to since.
+    ///
+    /// The compaction frontier can never decrease and it is an error to call
+    /// this function with a since argument that is less than the current compaction
+    /// frontier. It is also an error to advance the compaction frontier beyond the
+    /// current sealed frontier.
+    pub fn allow_compaction(
+        &mut self,
+        id_sinces: Vec<(Id, Antichain<u64>)>,
+        res: PFutureHandle<SeqNo>,
+    ) {
+        self.apply_batched_cmd(|state, pending| {
+            let seqno = state.assign_seqno();
+            let response = state
+                .do_allow_compaction(id_sinces)
+                .map(|_| seqno)
+                .map_err(|err| Error::Noop(seqno, err));
+            pending.add_response(PendingResponse::SeqNo(res, response));
+        })
+    }
+}
+
+impl AppliedState {
     /// Appends the given `batch` to the unsealed for `id`, writing the data into
     /// blob storage.
     ///
@@ -1369,8 +1062,20 @@ impl AppliedState {
             arrangements: self.arrangements.values().map(|x| x.meta()).collect(),
         }
     }
+}
 
-    fn do_snapshot<B: BlobRead>(
+impl<L: Log, B: Blob> Indexed<L, B> {
+    /// Returns a [Snapshot] for the given id.
+    pub fn snapshot(&mut self, id: Id, res: PFutureHandle<ArrangementSnapshot>) {
+        res.fill((|| {
+            self.drain_pending()?;
+            self.state.do_snapshot(id, &self.blob)
+        })());
+    }
+}
+
+impl AppliedState {
+    fn do_snapshot<B: Blob>(
         &self,
         id: Id,
         blob: &BlobCache<B>,
@@ -1384,7 +1089,26 @@ impl AppliedState {
     }
 }
 
-impl<L: Log, B: BlobRead> Indexed<L, B> {
+impl<L: Log, B: Blob> Indexed<L, B> {
+    /// Registers a callback to be invoked on successful writes and seals.
+    //
+    // Also returns a copy of the snapshot so that users can, if they want,
+    // apply their logic to a consistent read of the entire stream.
+    //
+    // TODO: Finish the naming bikeshed for this. Other options so far include
+    // tail, subscribe, tee, inspect, and capture.
+    pub fn listen(
+        &mut self,
+        id: Id,
+        sender: crossbeam_channel::Sender<ListenEvent>,
+        res: PFutureHandle<ArrangementSnapshot>,
+    ) {
+        res.fill((|| {
+            self.drain_pending()?;
+            self.do_listen(id, sender)
+        })());
+    }
+
     fn do_listen(
         &mut self,
         id: Id,
@@ -1408,92 +1132,77 @@ impl<L: Log, B: BlobRead> Indexed<L, B> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ListenEvent {
     /// Records in the data stream.
-    Records(Vec<((Vec<u8>, Vec<u8>), u64, i64)>),
+    Records(Vec<((Vec<u8>, Vec<u8>), u64, isize)>),
     /// Progress of the data stream.
     Sealed(u64),
 }
 
+/// An isolated, consistent read of previously written (Key, Value, Time, Diff)
+/// updates.
+//
+// TODO: This <K, V> allows Snapshot to be generic over both IndexedSnapshot
+// (and friends) and DecodedSnapshot, but does that get us anything?
+pub trait Snapshot<K, V>: Sized {
+    /// The kind of iterator we are turning this into.
+    type Iter: Iterator<Item = Result<((K, V), u64, isize), Error>>;
+
+    /// Returns a set of `num_iters` [Iterator]s that each output roughly
+    /// `1/num_iters` of the data represented by this snapshot.
+    fn into_iters(self, num_iters: NonZeroUsize) -> Vec<Self::Iter>;
+
+    /// Returns a single [Iterator] that outputs the data represented by this
+    /// snapshot.
+    fn into_iter(self) -> Self::Iter {
+        let mut iters = self.into_iters(NonZeroUsize::new(1).unwrap());
+        assert_eq!(iters.len(), 1);
+        iters.remove(0)
+    }
+}
+
+/// Extension methods on `Snapshot<K, V>` for use in tests.
+#[cfg(test)]
+pub trait SnapshotExt<K: Ord, V: Ord>: Snapshot<K, V> + Sized {
+    /// A full read of the data in the snapshot.
+    fn read_to_end(self) -> Result<Vec<((K, V), u64, isize)>, Error> {
+        let iter = self.into_iter();
+        let mut buf = iter.collect::<Result<Vec<_>, Error>>()?;
+        buf.sort();
+        Ok(buf)
+    }
+}
+
+#[cfg(test)]
+impl<K: Ord, V: Ord, S: Snapshot<K, V> + Sized> SnapshotExt<K, V> for S {}
+
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
-
-    use tokio::runtime::Runtime as AsyncRuntime;
-
     use crate::error::Error;
-    use crate::indexed::columnar::ColumnarRecordsVec;
-    use crate::indexed::snapshot::SnapshotExt;
-    use crate::mem::{MemBlob, MemLog, MemRegistry};
+    use crate::indexed::SnapshotExt;
+    use crate::mem::MemRegistry;
     use crate::pfuture::PFuture;
-    use crate::unreliable::{UnreliableBlob, UnreliableHandle, UnreliableLog};
+    use crate::unreliable::UnreliableHandle;
 
     use super::*;
 
-    fn block_on_drain<
-        T,
-        F: FnOnce(&mut Indexed<L, B>, PFutureHandle<T>) -> bool,
-        L: Log,
-        B: Blob,
-    >(
+    fn block_on_drain<T, F: FnOnce(&mut Indexed<L, B>, PFutureHandle<T>), L: Log, B: Blob>(
         index: &mut Indexed<L, B>,
         f: F,
     ) -> Result<T, Error> {
         let (tx, rx) = PFuture::new();
-        debug_assert!(f(index, tx));
+        f(index, tx);
         index.drain_pending()?;
         rx.recv()
     }
 
-    fn block_on<T, F: FnOnce(PFutureHandle<T>) -> bool>(f: F) -> Result<T, Error> {
+    fn block_on<T, F: FnOnce(PFutureHandle<T>)>(f: F) -> Result<T, Error> {
         let (tx, rx) = PFuture::new();
-        debug_assert!(f(tx));
+        f(tx);
         rx.recv()
-    }
-
-    fn write_req_payload(
-        id: Id,
-        updates: &[((Vec<u8>, Vec<u8>), u64, i64)],
-    ) -> Vec<(Id, ColumnarRecords)> {
-        updates
-            .iter()
-            .collect::<ColumnarRecordsVec>()
-            .into_inner()
-            .into_iter()
-            .map(|x| (id, x))
-            .collect()
-    }
-
-    fn indexed_and_maintainer(
-        unreliable: UnreliableHandle,
-    ) -> Result<
-        (
-            Indexed<UnreliableLog<MemLog>, UnreliableBlob<MemBlob>>,
-            Maintainer<UnreliableBlob<MemBlob>>,
-        ),
-        Error,
-    > {
-        let registry = MemRegistry::new();
-        let log = registry.log_no_reentrance()?;
-        let log = UnreliableLog::from_handle(log, unreliable.clone());
-        let metrics = Arc::new(Metrics::default());
-        let async_runtime = Arc::new(AsyncRuntime::new()?);
-        let blob = registry.blob_no_reentrance()?;
-        let blob = UnreliableBlob::from_handle(blob, unreliable);
-        let blob = BlobCache::new(
-            mz_build_info::DUMMY_BUILD_INFO,
-            Arc::clone(&metrics),
-            Arc::clone(&async_runtime),
-            blob,
-            None,
-        );
-        let maintainer = Maintainer::new(blob.clone(), async_runtime, Arc::clone(&metrics));
-        let i = Indexed::new(log, blob, metrics)?;
-
-        Ok((i, maintainer))
     }
 
     #[test]
     fn single_stream() -> Result<(), Error> {
-        let updates: Vec<((Vec<u8>, Vec<u8>), u64, i64)> = vec![
+        let updates: Vec<((Vec<u8>, Vec<u8>), u64, isize)> = vec![
             (("1".into(), "".into()), 1, 1),
             (("2".into(), "".into()), 2, 1),
         ];
@@ -1503,7 +1212,7 @@ mod tests {
 
         // Empty things are empty.
         let ArrangementSnapshot(unsealed, trace, seqno, seal_frontier) =
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?;
+            block_on(|res| i.snapshot(id, res))?;
         assert_eq!(unsealed.read_to_end()?, vec![]);
         assert_eq!(trace.read_to_end()?, vec![]);
         assert_eq!(seqno.0, 0);
@@ -1511,18 +1220,18 @@ mod tests {
 
         // Register a listener for writes.
         let (listen_tx, listen_rx) = crossbeam_channel::unbounded();
-        block_on(|res| i.apply(Cmd::Read(CmdRead::Listen(id, listen_tx, res))))?;
+        block_on(|res| i.listen(id, listen_tx, res))?;
 
         // After a write, all data is in the unsealed.
         block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::Write(write_req_payload(id, &updates), handle))
+            i.write(
+                vec![(id, updates.iter().collect::<ColumnarRecords>())],
+                handle,
+            )
         })?;
-        assert_eq!(
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?.read_to_end()?,
-            updates
-        );
+        assert_eq!(block_on(|res| i.snapshot(id, res))?.read_to_end()?, updates);
         let ArrangementSnapshot(unsealed, trace, seqno, seal_frontier) =
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?;
+            block_on(|res| i.snapshot(id, res))?;
         assert_eq!(unsealed.read_to_end()?, updates);
         assert_eq!(trace.read_to_end()?, vec![]);
         assert_eq!(seqno.0, 1);
@@ -1531,12 +1240,9 @@ mod tests {
         // After a step, it's all still in the unsealed as nothing has been sealed
         // yet.
         i.step()?;
-        assert_eq!(
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?.read_to_end()?,
-            updates
-        );
+        assert_eq!(block_on(|res| i.snapshot(id, res))?.read_to_end()?, updates);
         let ArrangementSnapshot(unsealed, trace, seqno, seal_frontier) =
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?;
+            block_on(|res| i.snapshot(id, res))?;
         assert_eq!(unsealed.read_to_end()?, updates);
         assert_eq!(trace.read_to_end()?, vec![]);
         assert_eq!(seqno.0, 1);
@@ -1545,28 +1251,22 @@ mod tests {
         // After a seal and a step, the relevant data has moved into the trace
         // part of the index. Since we haven't sealed all the data, some of it
         // is still in the unsealed.
-        block_on_drain(&mut i, |i, handle| i.apply(Cmd::Seal(vec![id], 2, handle)))?;
+        block_on_drain(&mut i, |i, handle| i.seal(vec![id], 2, handle))?;
         i.step()?;
-        assert_eq!(
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?.read_to_end()?,
-            updates
-        );
+        assert_eq!(block_on(|res| i.snapshot(id, res))?.read_to_end()?, updates);
         let ArrangementSnapshot(unsealed, trace, seqno, seal_frontier) =
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?;
+            block_on(|res| i.snapshot(id, res))?;
         assert_eq!(unsealed.read_to_end()?, updates[1..]);
         assert_eq!(trace.read_to_end()?, updates[..1]);
         assert_eq!(seqno.0, 2);
         assert_eq!(seal_frontier.elements(), &[2]);
 
         // All the data has been sealed, so it's now all in the trace.
-        block_on_drain(&mut i, |i, handle| i.apply(Cmd::Seal(vec![id], 3, handle)))?;
+        block_on_drain(&mut i, |i, handle| i.seal(vec![id], 3, handle))?;
         i.step()?;
-        assert_eq!(
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?.read_to_end()?,
-            updates
-        );
+        assert_eq!(block_on(|res| i.snapshot(id, res))?.read_to_end()?, updates);
         let ArrangementSnapshot(unsealed, trace, seqno, seal_frontier) =
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?;
+            block_on(|res| i.snapshot(id, res))?;
         assert_eq!(unsealed.read_to_end()?, vec![]);
         assert_eq!(trace.read_to_end()?, updates);
         assert_eq!(seqno.0, 3);
@@ -1589,280 +1289,8 @@ mod tests {
 
         // Can advance compaction frontier to a time that has already been sealed
         block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::AllowCompaction(
-                vec![(id, Antichain::from_elem(2))],
-                handle,
-            ))
+            i.allow_compaction(vec![(id, Antichain::from_elem(2))], handle)
         })?;
-
-        Ok(())
-    }
-
-    fn trace_compaction_setup(
-        unreliable: UnreliableHandle,
-    ) -> Result<
-        (
-            Indexed<UnreliableLog<MemLog>, UnreliableBlob<MemBlob>>,
-            Maintainer<UnreliableBlob<MemBlob>>,
-            Id,
-        ),
-        Error,
-    > {
-        let (mut i, maintainer) = indexed_and_maintainer(unreliable)?;
-
-        let updates: Vec<((Vec<u8>, Vec<u8>), u64, i64)> = vec![
-            (("1".into(), "".into()), 1, 1),
-            (("2".into(), "".into()), 2, 1),
-            (("3".into(), "".into()), 3, 1),
-            (("4".into(), "".into()), 4, 1),
-            (("5".into(), "".into()), 5, 1),
-        ];
-
-        let reqs = i.step()?;
-        // No trace compaction requests when no streams are registered.
-        assert_eq!(reqs, vec![]);
-
-        let id = block_on(|res| i.register("0", "()", "()", res))?;
-
-        let reqs = i.step()?;
-        // No maintenance requests when the registered stream has no data
-        // in the trace.
-        assert_eq!(reqs, vec![]);
-
-        // Move data into unsealed.
-        block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::Write(write_req_payload(id, &updates), handle))
-        })?;
-
-        // Move data into trace, one timestamp at a time.
-        for t in 2..7 {
-            block_on_drain(&mut i, |i, handle| i.apply(Cmd::Seal(vec![id], t, handle)))?;
-            let reqs = i.step()?;
-            // There will not be any compaction requests because the compaction
-            // frontier has not advanced.
-            assert_eq!(reqs, vec![]);
-        }
-
-        // Advance the compaction frontier to a time that has been sealed.
-        block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::AllowCompaction(
-                vec![(id, Antichain::from_elem(5))],
-                handle,
-            ))
-        })?;
-
-        Ok((i, maintainer, id))
-    }
-
-    /// Test the communication protocol between [Indexed] and [Maintainer]
-    /// specifically for trace compaction requests.
-    #[test]
-    fn trace_compaction() -> Result<(), Error> {
-        let mut unreliable = UnreliableHandle::default();
-        let (mut i, maintainer, id) = trace_compaction_setup(unreliable.clone())?;
-
-        let reqs = i.step()?;
-        assert_eq!(reqs.len(), 1);
-        // Check that Indexed also knows there is a compaction request in flight.
-        assert_eq!(i.in_flight_trace_compactions.len(), 1);
-        let request = reqs[0].clone();
-
-        // Once a request is in flight, don't send requests for the same stream.
-        let reqs = i.step()?;
-        assert_eq!(i.in_flight_trace_compactions.len(), 1);
-        assert_eq!(reqs, vec![]);
-
-        // Handle receiving an error MaintenanceRes.
-        let error_response =
-            MaintenanceRes::CompactTrace((id, Err(Error::from("test compaction error"))));
-        i.handle_maintenance_res(error_response.clone());
-        assert_eq!(i.drain_pending(), Ok(()));
-        // Check that Indexed resets its state to reflect that no compactions in flight.
-        assert_eq!(i.in_flight_trace_compactions.len(), 0);
-
-        // After receiving an error, retry the original request.
-        let reqs = i.step()?;
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(i.in_flight_trace_compactions.len(), 1);
-        assert_eq!(reqs[0], request);
-
-        // Handle receiving a valid MaintenanceRes.
-        let response = futures_executor::block_on(request.clone().run_async(&maintainer).recv());
-
-        i.handle_maintenance_res(response);
-        assert_eq!(i.drain_pending(), Ok(()));
-        // Check that Indexed resets its state to reflect that no compactions in flight.
-        assert_eq!(i.in_flight_trace_compactions.len(), 0);
-
-        // After receiving a valid response, issue a new compaction request.
-        let reqs = i.step()?;
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(i.in_flight_trace_compactions.len(), 1);
-        let request2 = reqs[0].clone();
-        assert!(request2 != request);
-
-        // Construct a new valid, response.
-        let response2 = futures_executor::block_on(request2.clone().run_async(&maintainer).recv());
-
-        // Send back an error response. After this there are no requests in flight.
-        i.handle_maintenance_res(error_response);
-        assert_eq!(i.drain_pending(), Ok(()));
-        assert_eq!(i.in_flight_trace_compactions.len(), 0);
-
-        // Retry request after error response.
-        let reqs = i.step()?;
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(i.in_flight_trace_compactions.len(), 1);
-        assert_eq!(reqs[0], request2);
-
-        // Handle failed write to metadata after receiving a response.
-        i.handle_maintenance_res(response2.clone());
-        unreliable.make_unavailable();
-        assert_eq!(i.drain_pending(), Err(Error::from("unavailable: blob set")));
-        unreliable.make_available();
-        assert_eq!(i.in_flight_trace_compactions.len(), 0);
-
-        // Retry request after failed meta write.
-        let reqs = i.step()?;
-        assert_eq!(i.in_flight_trace_compactions.len(), 1);
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0], request2);
-
-        // Handle receiving a response after the trace is deleted.
-        block_on(|res| i.apply(Cmd::Destroy("0".into(), res)))?;
-
-        // Handle receiving an valid MaintenanceRes for a stream that has been deleted.
-        i.handle_maintenance_res(response2);
-        assert_eq!(i.drain_pending(), Ok(()));
-        assert_eq!(i.in_flight_trace_compactions.len(), 0);
-
-        // Don't produce any more requests because the stream is deleted.
-        let reqs = i.step()?;
-        assert_eq!(i.in_flight_trace_compactions.len(), 0);
-        assert_eq!(reqs, vec![]);
-
-        Ok(())
-    }
-
-    /// This test checks that Indexed correctly handles receiving an unexpected
-    /// MainenanceRes (one whose request does not match the currently in-flight
-    /// request). This test is expected to panic when run with
-    /// cfg!(debug_assertions).
-    fn trace_compaction_unexpected_nonmatching_response() -> Result<(), Error> {
-        let unreliable = UnreliableHandle::default();
-        let (mut i, maintainer, _) = trace_compaction_setup(unreliable)?;
-
-        let reqs = i.step()?;
-        assert_eq!(reqs.len(), 1);
-        let request = reqs[0].clone();
-
-        // Handle receiving an unexpected MaintenanceRes (one whoese request does
-        // not match the one currently in flight)
-        let mut response = futures_executor::block_on(request.run_async(&maintainer).recv());
-        if let MaintenanceRes::CompactTrace((_, Ok(response))) = &mut response {
-            response.req.b0.keys = vec!["unexpected".into()];
-        }
-        i.handle_maintenance_res(response);
-        assert_eq!(i.drain_pending(), Ok(()));
-
-        Ok(())
-    }
-
-    /// This test checks that Indexed correctly handles receiving a MaintenanceRes when
-    /// no request is in flight for the given stream. This test is expected to panic when
-    /// run with cfg!(debug_assertions).
-    fn trace_compaction_unexpected_response() -> Result<(), Error> {
-        let unreliable = UnreliableHandle::default();
-        let (mut i, maintainer, id) = trace_compaction_setup(unreliable)?;
-
-        let reqs = i.step()?;
-        assert_eq!(reqs.len(), 1);
-        let request = reqs[0].clone();
-
-        // Send an error response. Now there are no more requests in flight.
-        let error_response =
-            MaintenanceRes::CompactTrace((id, Err(Error::from("test compaction error"))));
-        i.handle_maintenance_res(error_response);
-        assert_eq!(i.drain_pending(), Ok(()));
-
-        // Handle receiving an unexpected (valid) MaintenanceRes when none is in flight.
-        let response = futures_executor::block_on(request.run_async(&maintainer).recv());
-        i.handle_maintenance_res(response);
-        assert_eq!(i.drain_pending(), Ok(()));
-
-        Ok(())
-    }
-
-    /// This test checks that Indexed correctly handles receiving an error MaintenanceRes
-    /// even when no requests are in flight for that stream. This test is expected to
-    /// panic when run with cfg!(debug_assertions).
-    fn trace_compaction_unexpected_error_response() -> Result<(), Error> {
-        let unreliable = UnreliableHandle::default();
-        let (mut i, _, id) = trace_compaction_setup(unreliable)?;
-
-        let reqs = i.step()?;
-        assert_eq!(reqs.len(), 1);
-
-        // Send an error response. Now there are no more requests in flight.
-        let error_response =
-            MaintenanceRes::CompactTrace((id, Err(Error::from("test compaction error"))));
-        i.handle_maintenance_res(error_response.clone());
-        assert_eq!(i.drain_pending(), Ok(()));
-
-        // Handle receiving an unexpected error MaintenanceRes when no request is in flight.
-        i.handle_maintenance_res(error_response);
-        assert_eq!(i.drain_pending(), Ok(()));
-
-        Ok(())
-    }
-
-    #[test]
-    fn trace_compaction_expected_panics() -> Result<(), Error> {
-        fn check_error(
-            e: Option<Box<dyn Any + Send + 'static>>,
-            expected: &str,
-        ) -> Result<(), Error> {
-            let e = match e {
-                Some(e) => e,
-                None => return Err(Error::from("unexpected success while checking error")),
-            };
-
-            let error = match e.downcast_ref::<String>() {
-                Some(error) => error.clone(),
-                None => "unable to check error".to_string(),
-            };
-
-            assert!(
-                error.contains(expected),
-                "{} not found in {}",
-                expected,
-                error
-            );
-            Ok(())
-        }
-        let result = std::panic::catch_unwind(|| {
-            let _ = trace_compaction_unexpected_response();
-        });
-        check_error(
-            result.err(),
-            "unexpected compaction response for stream: Id(0)",
-        )?;
-
-        let result = std::panic::catch_unwind(|| {
-            let _ = trace_compaction_unexpected_error_response();
-        });
-        check_error(
-            result.err(),
-            "unexpected compaction response for stream: Id(0)",
-        )?;
-
-        let result = std::panic::catch_unwind(|| {
-            let _ = trace_compaction_unexpected_nonmatching_response();
-        });
-        check_error(
-            result.err(),
-            "unexpected compaction response for stream: Id(0)",
-        )?;
 
         Ok(())
     }
@@ -1881,19 +1309,21 @@ mod tests {
         // orders it within each batch by time. It's not, so this will fire a
         // validations error if the sort code doesn't work.
         block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::Write(write_req_payload(id, &updates), handle))
+            i.write(
+                vec![(id, updates.iter().collect::<ColumnarRecords>())],
+                handle,
+            )
         })?;
 
         // Now move it into the trace part of the index, which orders it within
         // each batch by key. It should currently be ordered by time, which
         // given the data is not ordered by key, so again this should fire a
         // validations error if the sort code doesn't work.
-        block_on_drain(&mut i, |i, handle| i.apply(Cmd::Seal(vec![id], 3, handle)))?;
+        block_on_drain(&mut i, |i, handle| i.seal(vec![id], 3, handle))?;
         i.step()?;
 
         // Sanity check that all the data made it into trace as expected.
-        let ArrangementSnapshot(unsealed, trace, _, _) =
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?;
+        let ArrangementSnapshot(unsealed, trace, _, _) = block_on(|res| i.snapshot(id, res))?;
         assert_eq!(unsealed.read_to_end()?, vec![]);
         assert_eq!(trace.read_to_end()?, updates);
         Ok(())
@@ -1902,8 +1332,8 @@ mod tests {
     #[test]
     fn batch_consolidation() -> Result<(), Error> {
         let updates = vec![
-            (("1".into(), "".into()), 1, 1),
-            (("1".into(), "".into()), 1, 1),
+            (("1".as_bytes(), "".as_bytes()), 1, 1),
+            (("1".as_bytes(), "".as_bytes()), 1, 1),
         ];
 
         let mut i = MemRegistry::new().indexed_no_reentrance()?;
@@ -1911,18 +1341,23 @@ mod tests {
 
         // Write the data and move it into the unsealed part of the index.
         block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::Write(write_req_payload(id, &updates), handle))
+            i.write(
+                vec![(id, updates.iter().collect::<ColumnarRecords>())],
+                handle,
+            )
         })?;
 
         // Add another set of identical updates and place into another unsealed
         // batch.
         block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::Write(write_req_payload(id, &updates), handle))
+            i.write(
+                vec![(id, updates.iter().collect::<ColumnarRecords>())],
+                handle,
+            )
         })?;
 
         // Sanity check that the data is all in unsealed and none of it is in trace.
-        let ArrangementSnapshot(unsealed, trace, _, _) =
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?;
+        let ArrangementSnapshot(unsealed, trace, _, _) = block_on(|res| i.snapshot(id, res))?;
         assert_eq!(
             unsealed.read_to_end()?,
             vec![
@@ -1937,12 +1372,11 @@ mod tests {
         // Now move the data to the trace part of the index, which consolidates
         // updates at identical ((k, v), t). Since the writes are unconsolidated
         // this test will fail if trace batch consolidation does not work.
-        block_on_drain(&mut i, |i, handle| i.apply(Cmd::Seal(vec![id], 2, handle)))?;
+        block_on_drain(&mut i, |i, handle| i.seal(vec![id], 2, handle))?;
         i.step()?;
 
         // Sanity check that all the data made it into trace as expected.
-        let ArrangementSnapshot(unsealed, trace, _, _) =
-            block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?;
+        let ArrangementSnapshot(unsealed, trace, _, _) = block_on(|res| i.snapshot(id, res))?;
         assert_eq!(unsealed.read_to_end()?, vec![]);
         assert_eq!(trace.read_to_end()?, vec![(("1".into(), "".into()), 1, 4)]);
 
@@ -1959,7 +1393,10 @@ mod tests {
         // Write the data and move it into the unsealed part of the index.
         assert_eq!(
             block_on_drain(&mut i, |i, handle| {
-                i.apply(Cmd::Write(write_req_payload(id, &updates), handle))
+                i.write(
+                    vec![(id, updates.iter().collect::<ColumnarRecords>())],
+                    handle,
+                )
             }),
             Ok(SeqNo(1))
         );
@@ -1984,27 +1421,42 @@ mod tests {
         // to verify the fix.
         let s1 = block_on(|res| i.register("s1", "", "", res))?;
         block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::Write(
-                write_req_payload(s1, &[(("".into(), "".into()), 0, 1)]),
+            i.write(
+                vec![(
+                    s1,
+                    vec![(("".as_bytes(), "".as_bytes()), 0, 1)]
+                        .iter()
+                        .collect::<ColumnarRecords>(),
+                )],
                 handle,
-            ))
+            )
         })?;
         let s2 = block_on(|res| i.register("s2", "", "", res))?;
         block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::Write(
-                write_req_payload(s2, &[(("".into(), "".into()), 1, 1)]),
+            i.write(
+                vec![(
+                    s2,
+                    vec![(("".as_bytes(), "".as_bytes()), 1, 1)]
+                        .iter()
+                        .collect::<ColumnarRecords>(),
+                )],
                 handle,
-            ))
+            )
         })?;
 
         // The second flavor is similar. If we then write to the first stream
         // again and step, it is then missing X..Y. (A stream not written to
         // between two step calls doesn't get a batch.)
         block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::Write(
-                write_req_payload(s1, &[(("".into(), "".into()), 2, 1)]),
+            i.write(
+                vec![(
+                    s1,
+                    vec![(("".as_bytes(), "".as_bytes()), 2, 1)]
+                        .iter()
+                        .collect::<ColumnarRecords>(),
+                )],
                 handle,
-            ))
+            )
         })?;
 
         Ok(())
@@ -2017,20 +1469,14 @@ mod tests {
         let _ = block_on(|res| i.register("stream", "", "", res))?;
 
         // Normal case: destroy registered stream.
-        assert_eq!(
-            block_on(|res| i.apply(Cmd::Destroy("stream".into(), res))),
-            Ok(true)
-        );
+        assert_eq!(block_on(|res| i.destroy("stream", res)), Ok(true));
 
         // Normal case: destroy already destroyed stream.
-        assert_eq!(
-            block_on(|res| i.apply(Cmd::Destroy("stream".into(), res))),
-            Ok(false)
-        );
+        assert_eq!(block_on(|res| i.destroy("stream", res)), Ok(false));
 
         // Destroy stream that was never created.
         assert_eq!(
-            block_on(|res| i.apply(Cmd::Destroy("stream2".into(), res))),
+            block_on(|res| i.destroy("stream2", res)),
             Err(Error::from(
                 "invalid destroy of stream stream2 that was never registered or destroyed"
             ))
@@ -2056,7 +1502,7 @@ mod tests {
         // Normal case: registration uses same key and value codec.
         let _ = block_on(|res| i.register("stream", "key", "val", res))?;
 
-        // i64erent key codec
+        // Different key codec
         assert_eq!(
             block_on(|res| i.register("stream", "nope", "val", res)),
             Err(Error::from(
@@ -2064,7 +1510,7 @@ mod tests {
             ))
         );
 
-        // i64erent val codec
+        // Different val codec
         assert_eq!(
             block_on(|res| i.register("stream", "key", "nope", res)),
             Err(Error::from(
@@ -2081,8 +1527,8 @@ mod tests {
     #[test]
     fn try_set_meta_matches_storage() -> Result<(), Error> {
         let updates = vec![
-            (("1".into(), "".into()), 2, 1),
-            (("2".into(), "".into()), 1, 1),
+            (("1".as_bytes(), "".as_bytes()), 2, 1),
+            (("2".as_bytes(), "".as_bytes()), 1, 1),
         ];
 
         let mut unreliable = UnreliableHandle::default();
@@ -2091,7 +1537,10 @@ mod tests {
 
         // Write the data out but don't close it.
         block_on_drain(&mut i, |i, handle| {
-            i.apply(Cmd::Write(write_req_payload(id, &updates), handle))
+            i.write(
+                vec![(id, updates.iter().collect::<ColumnarRecords>())],
+                handle,
+            )
         })?;
 
         // We haven't closed the data, so nothing for step to do. If the
@@ -2111,21 +1560,18 @@ mod tests {
         // answer (at the time of the bug, compaction did the right thing, which
         // is why we didn't catch it initially).
         let updates = vec![
-            (("1".into(), "".into()), 1, 1),
-            (("1".into(), "".into()), 10, -1),
-            (("2".into(), "".into()), 2, 1),
+            (("1".as_bytes(), "".as_bytes()), 1, 1),
+            (("1".as_bytes(), "".as_bytes()), 10, -1),
+            (("2".as_bytes(), "".as_bytes()), 2, 1),
         ];
         block_on_drain(&mut i, |i, res| {
-            i.apply(Cmd::Write(write_req_payload(id, &updates), res))
+            i.write(vec![(id, updates.iter().collect::<ColumnarRecords>())], res)
         })?;
-        block_on_drain(&mut i, |i, res| i.apply(Cmd::Seal(vec![id], 4, res)))?;
+        block_on_drain(&mut i, |i, res| i.seal(vec![id], 4, res))?;
         block_on_drain(&mut i, |i, res| {
-            i.apply(Cmd::AllowCompaction(
-                vec![(id, Antichain::from_elem(3))],
-                res,
-            ))
+            i.allow_compaction(vec![(id, Antichain::from_elem(3))], res)
         })?;
-        let snap = block_on(|res| i.apply(Cmd::Read(CmdRead::Snapshot(id, res))))?;
+        let snap = block_on(|res| i.snapshot(id, res))?;
 
         // Now verify that the snapshot has the right since and that the data in
         // it has been advanced as expected.

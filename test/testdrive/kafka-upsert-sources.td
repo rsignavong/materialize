@@ -97,7 +97,7 @@ fish          fish     1000
 birdmore      geese    56
 mämmalmore    moose    42
 
-$ kafka-create-topic topic=textbytes partitions=1
+$ kafka-create-topic topic=textbytes
 
 $ kafka-ingest format=bytes topic=textbytes key-format=bytes key-terminator=:
 fish:fish
@@ -178,7 +178,7 @@ message Test {
 
 $ protobuf-compile-descriptors inputs=test.proto output=test.pb
 
-$ kafka-create-topic topic=textproto partitions=1
+$ kafka-create-topic topic=textproto
 
 > CREATE MATERIALIZED SOURCE textproto
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC
@@ -193,7 +193,7 @@ $ kafka-create-topic topic=textproto partitions=1
   ENVELOPE UPSERT FORMAT BYTES
 
 $ kafka-ingest topic=textproto
-  format=protobuf descriptor-file=test.pb message=Test
+  format=protobuf descriptor-file=test.pb message=.Test
   key-format=bytes key-terminator=:
 fish:{"f": "one"}
 bìrd1:{"f": "two"}
@@ -210,7 +210,7 @@ bìrd1     two  2
 birdmore  ""   3
 
 $ kafka-ingest topic=textproto
-  format=protobuf descriptor-file=test.pb message=Test
+  format=protobuf descriptor-file=test.pb message=.Test
   key-format=bytes key-terminator=:
 mammal1: {"f": "three"}
 bìrd1:
@@ -234,7 +234,7 @@ mämmalmore  five   7
 bìrd1       six    8
 mammalmore  seven  10
 
-$ kafka-create-topic topic=nullkey partitions=1
+$ kafka-create-topic topic=nullkey
 
 # A null key should result in an error decoding that row but not a panic
 $ kafka-ingest format=bytes topic=nullkey key-format=bytes key-terminator=:
@@ -257,7 +257,7 @@ key0          text  mz_offset
 birdmore      geese 5
 mammalmore    moose 6
 
-$ kafka-create-topic topic=realtimeavroavro partitions=1
+$ kafka-create-topic topic=realtimeavroavro
 
 # test multi-field avro key
 $ set keyschema2={
@@ -597,18 +597,18 @@ $ kafka-verify format=avro sink=materialize.public.input_pkne_key_sink sort-mess
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avroavro-${testdrive.seed}'
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
   ENVELOPE UPSERT
-contains:Key constraint (f1) conflicts with existing key (key)
+Key constraint (f1) conflicts with existing key (key)
 
 ! CREATE MATERIALIZED SOURCE avroavro (PRIMARY KEY (unknown) NOT ENFORCED)
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avroavro-${testdrive.seed}'
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
   ENVELOPE UPSERT
-contains:No such column in source key constraint: unknown
+No such column in source key constraint: unknown
 
 ! CREATE MATERIALIZED SOURCE avroavro (PRIMARY KEY (f1, f1) NOT ENFORCED)
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avroavro-${testdrive.seed}'
   FORMAT AVRO USING SCHEMA '${schema}' ENVELOPE NONE
-contains:Repeated column name in source key constraint: f1
+Repeated column name in source key constraint: f1
 
 $ set ambiguous-schema={
         "type" : "record",
@@ -623,4 +623,4 @@ $ set ambiguous-schema={
 ! CREATE MATERIALIZED SOURCE input_pkne (f1, f2, f1, PRIMARY KEY (f1) NOT ENFORCED)
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-avroavro-${testdrive.seed}'
   FORMAT AVRO USING SCHEMA '${ambiguous-schema}' ENVELOPE NONE
-contains:Ambiguous column in source key constraint: f1
+Ambiguous column in source key constraint: f1

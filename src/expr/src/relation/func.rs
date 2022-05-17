@@ -19,12 +19,13 @@ use ordered_float::OrderedFloat;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use mz_lowertest::MzReflect;
-use mz_repr::adt::array::ArrayDimension;
-use mz_repr::adt::interval::Interval;
-use mz_repr::adt::numeric::{self, NumericMaxScale};
-use mz_repr::adt::regex::Regex as ReprRegex;
-use mz_repr::{ColumnName, ColumnType, Datum, Diff, RelationType, Row, RowArena, ScalarType};
+use lowertest::MzEnumReflect;
+use ore::cast::CastFrom;
+use repr::adt::array::ArrayDimension;
+use repr::adt::interval::Interval;
+use repr::adt::numeric;
+use repr::adt::regex::Regex as ReprRegex;
+use repr::{ColumnName, ColumnType, Datum, Diff, RelationType, Row, RowArena, ScalarType};
 
 use crate::relation::{compare_columns, ColumnOrder};
 use crate::scalar::func::{add_timestamp_months, jsonb_stringify};
@@ -524,8 +525,8 @@ where
         })
         .collect();
 
-    let mut left_datum_vec = mz_repr::DatumVec::new();
-    let mut right_datum_vec = mz_repr::DatumVec::new();
+    let mut left_datum_vec = repr::DatumVec::new();
+    let mut right_datum_vec = repr::DatumVec::new();
     let mut sort_by = |left: &(_, Row), right: &(_, Row)| {
         let left = &left.1;
         let right = &right.1;
@@ -587,7 +588,7 @@ where
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzEnumReflect)]
 pub enum AggregateFunc {
     MaxNumeric,
     MaxInt16,
@@ -638,8 +639,8 @@ pub enum AggregateFunc {
     JsonbObjectAgg {
         order_by: Vec<ColumnOrder>,
     },
-    /// Accumulates `Datum::Array`s of `ScalarType::Record` whose first element is a `Datum::Array`
-    /// into a single `Datum::Array` (the remaining fields are used by `order_by`).
+    /// Accumulates `Datum::List`s whose first element is a `Datum::Array` into a
+    /// single `Datum::Array`. The other elements are columns used by `order_by`.
     ArrayConcat {
         order_by: Vec<ColumnOrder>,
     },
@@ -750,19 +751,17 @@ impl AggregateFunc {
             AggregateFunc::JsonbObjectAgg { .. } => ScalarType::Jsonb,
             AggregateFunc::SumInt16 => ScalarType::Int64,
             AggregateFunc::SumInt32 => ScalarType::Int64,
-            AggregateFunc::SumInt64 => ScalarType::Numeric {
-                max_scale: Some(NumericMaxScale::ZERO),
-            },
+            AggregateFunc::SumInt64 => ScalarType::Numeric { scale: Some(0) },
             AggregateFunc::ArrayConcat { .. } | AggregateFunc::ListConcat { .. } => {
                 match input_type.scalar_type {
                     // The input is wrapped in a Record if there's an ORDER BY, so extract it out.
-                    ScalarType::Record { ref fields, .. } => fields[0].1.scalar_type.clone(),
+                    ScalarType::Record { fields, .. } => fields[0].1.scalar_type.clone(),
                     _ => unreachable!(),
                 }
             }
             AggregateFunc::StringAgg { .. } => ScalarType::String,
             AggregateFunc::RowNumber { .. } => match input_type.scalar_type {
-                ScalarType::Record { ref fields, .. } => ScalarType::List {
+                ScalarType::Record { fields, .. } => ScalarType::List {
                     element_type: Box::new(ScalarType::Record {
                         fields: vec![
                             (
@@ -787,22 +786,12 @@ impl AggregateFunc {
             // Note AggregateFunc::MaxString, MinString rely on returning input
             // type as output type to support the proper return type for
             // character input.
-            _ => input_type.scalar_type.clone(),
+            _ => input_type.scalar_type,
         };
         // Count never produces null, and other aggregations only produce
         // null in the presence of null inputs.
         let nullable = match self {
             AggregateFunc::Count => false,
-            // Use the nullability of the underlying column being aggregated, not the Records wrapping it
-            AggregateFunc::StringAgg { .. } => match input_type.scalar_type {
-                // The outer Record wraps the input in the first position, and any ORDER BY expressions afterwards
-                ScalarType::Record { fields, .. } => match &fields[0].1.scalar_type {
-                    // The inner Record is a (value, separator) tuple
-                    ScalarType::Record { fields, .. } => fields[0].1.nullable,
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            },
             _ => input_type.nullable,
         };
         scalar_type.nullable(nullable)
@@ -858,7 +847,7 @@ fn jsonb_each<'a>(
     // First produce a map, so that a common iterator can be returned.
     let map = match a {
         Datum::Map(dict) => dict,
-        _ => mz_repr::DatumMap::empty(),
+        _ => repr::DatumMap::empty(),
     };
 
     map.iter().map(move |(k, mut v)| {
@@ -872,7 +861,7 @@ fn jsonb_each<'a>(
 fn jsonb_object_keys<'a>(a: Datum<'a>) -> impl Iterator<Item = (Row, Diff)> + 'a {
     let map = match a {
         Datum::Map(dict) => dict,
-        _ => mz_repr::DatumMap::empty(),
+        _ => repr::DatumMap::empty(),
     };
 
     map.iter()
@@ -886,7 +875,7 @@ fn jsonb_array_elements<'a>(
 ) -> impl Iterator<Item = (Row, Diff)> + 'a {
     let list = match a {
         Datum::List(list) => list,
-        _ => mz_repr::DatumList::empty(),
+        _ => repr::DatumList::empty(),
     };
     list.iter().map(move |mut e| {
         if stringify {
@@ -971,13 +960,12 @@ fn generate_series_ts(
     step: Interval,
     conv: fn(NaiveDateTime) -> Datum<'static>,
 ) -> Result<impl Iterator<Item = (Row, Diff)>, EvalError> {
-    let normalized_step = step.as_microseconds();
-    if normalized_step == 0 {
+    if step.months == 0 && step.duration == 0 {
         return Err(EvalError::InvalidParameterValue(
             "step size cannot equal zero".to_owned(),
         ));
     }
-    let rev = normalized_step < 0;
+    let rev = step.duration < 0;
 
     let tsri = TimestampRangeStepInclusive {
         state: start,
@@ -1076,14 +1064,14 @@ impl fmt::Display for AggregateFunc {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct CaptureGroupDesc {
     pub index: u32,
     pub name: Option<String>,
     pub nullable: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct AnalyzedRegex(ReprRegex, Vec<CaptureGroupDesc>);
 
 impl AnalyzedRegex {
@@ -1126,15 +1114,15 @@ pub fn csv_extract(a: Datum, n_cols: usize) -> impl Iterator<Item = (Row, Diff)>
         .from_reader(bytes);
     csv_reader.into_records().filter_map(move |res| match res {
         Ok(sr) if sr.len() == n_cols => {
-            row.packer().extend(sr.iter().map(Datum::String));
-            Some((row.clone(), 1))
+            row.extend(sr.iter().map(Datum::String));
+            Some((row.finish_and_reuse(), 1))
         }
         _ => None,
     })
 }
 
 pub fn repeat(a: Datum) -> Option<(Row, Diff)> {
-    let n = a.unwrap_int64();
+    let n = Diff::cast_from(a.unwrap_int64());
     if n != 0 {
         Some((Row::default(), n))
     } else {
@@ -1146,7 +1134,7 @@ fn wrap<'a>(datums: &'a [Datum<'a>], width: usize) -> impl Iterator<Item = (Row,
     datums.chunks(width).map(|chunk| (Row::pack(chunk), 1))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzEnumReflect)]
 pub enum TableFunc {
     JsonbEach {
         stringify: bool,
@@ -1252,105 +1240,45 @@ impl TableFunc {
     }
 
     pub fn output_type(&self) -> RelationType {
-        let (column_types, keys) = match self {
-            TableFunc::JsonbEach { stringify: true } => {
-                let column_types = vec![
-                    ScalarType::String.nullable(false),
-                    ScalarType::String.nullable(true),
-                ];
-                let keys = vec![];
-                (column_types, keys)
-            }
-            TableFunc::JsonbEach { stringify: false } => {
-                let column_types = vec![
-                    ScalarType::String.nullable(false),
-                    ScalarType::Jsonb.nullable(false),
-                ];
-                let keys = vec![];
-                (column_types, keys)
-            }
-            TableFunc::JsonbObjectKeys => {
-                let column_types = vec![ScalarType::String.nullable(false)];
-                let keys = vec![];
-                (column_types, keys)
-            }
+        RelationType::new(match self {
+            TableFunc::JsonbEach { stringify: true } => vec![
+                ScalarType::String.nullable(false),
+                ScalarType::String.nullable(true),
+            ],
+            TableFunc::JsonbEach { stringify: false } => vec![
+                ScalarType::String.nullable(false),
+                ScalarType::Jsonb.nullable(false),
+            ],
+            TableFunc::JsonbObjectKeys => vec![ScalarType::String.nullable(false)],
             TableFunc::JsonbArrayElements { stringify: true } => {
-                let column_types = vec![ScalarType::String.nullable(true)];
-                let keys = vec![];
-                (column_types, keys)
+                vec![ScalarType::String.nullable(true)]
             }
             TableFunc::JsonbArrayElements { stringify: false } => {
-                let column_types = vec![ScalarType::Jsonb.nullable(false)];
-                let keys = vec![];
-                (column_types, keys)
+                vec![ScalarType::Jsonb.nullable(false)]
             }
-            TableFunc::RegexpExtract(a) => {
-                let column_types = a
-                    .capture_groups_iter()
-                    .map(|cg| ScalarType::String.nullable(cg.nullable))
-                    .collect();
-                let keys = vec![];
-                (column_types, keys)
-            }
-            TableFunc::CsvExtract(n_cols) => {
-                let column_types = iter::repeat(ScalarType::String.nullable(false))
-                    .take(*n_cols)
-                    .collect();
-                let keys = vec![];
-                (column_types, keys)
-            }
+            TableFunc::RegexpExtract(a) => a
+                .capture_groups_iter()
+                .map(|cg| ScalarType::String.nullable(cg.nullable))
+                .collect(),
+            TableFunc::CsvExtract(n_cols) => iter::repeat(ScalarType::String.nullable(false))
+                .take(*n_cols)
+                .collect(),
             TableFunc::GenerateSeriesInt32 => {
-                let column_types = vec![ScalarType::Int32.nullable(false)];
-                let keys = vec![vec![0]];
-                (column_types, keys)
+                vec![ScalarType::Int32.nullable(false)]
             }
             TableFunc::GenerateSeriesInt64 => {
-                let column_types = vec![ScalarType::Int64.nullable(false)];
-                let keys = vec![vec![0]];
-                (column_types, keys)
+                vec![ScalarType::Int64.nullable(false)]
             }
-            TableFunc::GenerateSeriesTimestamp => {
-                let column_types = vec![ScalarType::Timestamp.nullable(false)];
-                let keys = vec![vec![0]];
-                (column_types, keys)
-            }
-            TableFunc::GenerateSeriesTimestampTz => {
-                let column_types = vec![ScalarType::TimestampTz.nullable(false)];
-                let keys = vec![vec![0]];
-                (column_types, keys)
-            }
+            TableFunc::GenerateSeriesTimestamp => vec![ScalarType::Timestamp.nullable(false)],
+            TableFunc::GenerateSeriesTimestampTz => vec![ScalarType::TimestampTz.nullable(false)],
             TableFunc::GenerateSubscriptsArray => {
-                let column_types = vec![ScalarType::Int32.nullable(false)];
-                let keys = vec![vec![0]];
-                (column_types, keys)
+                vec![ScalarType::Int32.nullable(false)]
             }
-            TableFunc::Repeat => {
-                let column_types = vec![];
-                let keys = vec![];
-                (column_types, keys)
-            }
-            TableFunc::UnnestArray { el_typ } => {
-                let column_types = vec![el_typ.clone().nullable(true)];
-                let keys = vec![];
-                (column_types, keys)
-            }
-            TableFunc::UnnestList { el_typ } => {
-                let column_types = vec![el_typ.clone().nullable(true)];
-                let keys = vec![];
-                (column_types, keys)
-            }
-            TableFunc::Wrap { types, .. } => {
-                let column_types = types.clone();
-                let keys = vec![];
-                (column_types, keys)
-            }
-        };
-
-        if !keys.is_empty() {
-            RelationType::new(column_types).with_keys(keys)
-        } else {
-            RelationType::new(column_types)
-        }
+            TableFunc::Repeat => vec![],
+            TableFunc::UnnestArray { el_typ } => vec![el_typ.clone().nullable(true)],
+            TableFunc::UnnestList { el_typ } => vec![el_typ.clone().nullable(true)],
+            TableFunc::Wrap { types, .. } => types.clone(),
+        })
     }
 
     pub fn output_arity(&self) -> usize {

@@ -1,4 +1,3 @@
-# Copyright 2020 Josh Wills. All rights reserved.
 # Copyright Materialize, Inc. and contributors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +14,43 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 
 from dbt.adapters.postgres import PostgresRelation
-from dbt.dataclass_schema import StrEnum
+from mashumaro.types import SerializableType
 
 
+# Stolen from https://github.com/dbt-labs/dbt/blob/develop/core/dbt/dataclass_schema.py ,
+# which is not importable.
+class StrEnum(str, SerializableType, Enum):
+    def __str__(self):
+        return self.value
+
+    # https://docs.python.org/3.6/library/enum.html#using-automatic-values
+    def _generate_next_value_(name, *_):
+        return name
+
+    def _serialize(self) -> str:
+        return self.value
+
+    @classmethod
+    def _deserialize(cls, value: str):
+        return cls(value)
+
+
+# Override RelationType to add Materialize-specifc materializatiton types:
+#   - source
+#   - index
+#   - sink
 class MaterializeRelationType(StrEnum):
-    # Built-in materialization types.
-    Table = "table"
-    View = "view"
-    CTE = "cte"
-    External = "external"
-
-    # Materialize-specific materialization types.
     Source = "source"
+    View = "view"
     MaterializedView = "materializedview"
+    Table = "table"
     Index = "index"
     Sink = "sink"
+    CTE = "cte"
 
 
 @dataclass(frozen=True, eq=False, repr=False)

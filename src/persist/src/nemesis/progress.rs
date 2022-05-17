@@ -40,7 +40,7 @@ impl DataflowProgress {
             DataflowProgressHandle {
                 core: Arc::new(Mutex::new(DataflowProgressCore {
                     rx,
-                    closed: Arc::clone(&closed),
+                    closed: closed.clone(),
                     waiters: BTreeMap::new(),
                     frontier: Antichain::from_elem(0),
                 })),

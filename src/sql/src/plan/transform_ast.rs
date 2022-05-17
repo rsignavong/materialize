@@ -15,25 +15,25 @@
 
 use uuid::Uuid;
 
-use crate::names::Aug;
-use mz_ore::stack::{CheckedRecursion, RecursionGuard};
-use mz_sql_parser::ast::visit_mut::{self, VisitMut};
-use mz_sql_parser::ast::{
-    Expr, Function, FunctionArgs, Ident, Op, OrderByExpr, Query, Select, SelectItem, TableAlias,
-    TableFactor, TableFunction, TableWithJoins, UnresolvedObjectName, Value,
+use ore::stack::{CheckedRecursion, RecursionGuard};
+use sql_parser::ast::visit_mut::{self, VisitMut};
+use sql_parser::ast::{
+    Expr, Function, FunctionArgs, Ident, Op, OrderByExpr, Query, Raw, Select, SelectItem,
+    TableAlias, TableFactor, TableFunction, TableWithJoins, UnresolvedObjectName, Value,
 };
 
+use crate::func::Func;
 use crate::normalize;
 use crate::plan::{PlanError, StatementContext};
 
 pub fn transform_query<'a>(
     scx: &StatementContext,
-    query: &'a mut Query<Aug>,
+    query: &'a mut Query<Raw>,
 ) -> Result<(), PlanError> {
     run_transforms(scx, |t, query| t.visit_query_mut(query), query)
 }
 
-pub fn transform_expr(scx: &StatementContext, expr: &mut Expr<Aug>) -> Result<(), PlanError> {
+pub fn transform_expr(scx: &StatementContext, expr: &mut Expr<Raw>) -> Result<(), PlanError> {
     run_transforms(scx, |t, expr| t.visit_expr_mut(expr), expr)
 }
 
@@ -43,13 +43,13 @@ pub(crate) fn run_transforms<F, A>(
     ast: &mut A,
 ) -> Result<(), PlanError>
 where
-    F: for<'ast> FnMut(&mut dyn VisitMut<'ast, Aug>, &'ast mut A),
+    F: for<'ast> FnMut(&mut dyn VisitMut<'ast, Raw>, &'ast mut A),
 {
     let mut func_rewriter = FuncRewriter::new(scx);
     f(&mut func_rewriter, ast);
     func_rewriter.status?;
 
-    let mut desugarer = Desugarer::new();
+    let mut desugarer = Desugarer::new(scx);
     f(&mut desugarer, ast);
     desugarer.status
 }
@@ -89,7 +89,7 @@ impl<'a> FuncRewriter<'a> {
 
     // Divides `lhs` by `rhs` but replaces division-by-zero errors with NULL;
     // note that this is semantically equivalent to `NULLIF(rhs, 0)`.
-    fn plan_divide(lhs: Expr<Aug>, rhs: Expr<Aug>) -> Expr<Aug> {
+    fn plan_divide(lhs: Expr<Raw>, rhs: Expr<Raw>) -> Expr<Raw> {
         lhs.divide(Expr::Case {
             operand: None,
             conditions: vec![rhs.clone().equals(Expr::number("0"))],
@@ -100,11 +100,11 @@ impl<'a> FuncRewriter<'a> {
 
     fn plan_agg(
         name: UnresolvedObjectName,
-        expr: Expr<Aug>,
-        order_by: Vec<OrderByExpr<Aug>>,
-        filter: Option<Box<Expr<Aug>>>,
+        expr: Expr<Raw>,
+        order_by: Vec<OrderByExpr<Raw>>,
+        filter: Option<Box<Expr<Raw>>>,
         distinct: bool,
-    ) -> Expr<Aug> {
+    ) -> Expr<Raw> {
         Expr::Function(Function {
             name,
             args: FunctionArgs::Args {
@@ -117,7 +117,7 @@ impl<'a> FuncRewriter<'a> {
         })
     }
 
-    fn plan_avg(expr: Expr<Aug>, filter: Option<Box<Expr<Aug>>>, distinct: bool) -> Expr<Aug> {
+    fn plan_avg(expr: Expr<Raw>, filter: Option<Box<Expr<Raw>>>, distinct: bool) -> Expr<Raw> {
         let sum = Self::plan_agg(
             UnresolvedObjectName::qualified(&["pg_catalog", "sum"]),
             expr.clone(),
@@ -137,11 +137,11 @@ impl<'a> FuncRewriter<'a> {
     }
 
     fn plan_variance(
-        expr: Expr<Aug>,
-        filter: Option<Box<Expr<Aug>>>,
+        expr: Expr<Raw>,
+        filter: Option<Box<Expr<Raw>>>,
         distinct: bool,
         sample: bool,
-    ) -> Expr<Aug> {
+    ) -> Expr<Raw> {
         // N.B. this variance calculation uses the "textbook" algorithm, which
         // is known to accumulate problematic amounts of error. The numerically
         // stable variants, the most well-known of which is Welford's, are
@@ -191,15 +191,15 @@ impl<'a> FuncRewriter<'a> {
     }
 
     fn plan_stddev(
-        expr: Expr<Aug>,
-        filter: Option<Box<Expr<Aug>>>,
+        expr: Expr<Raw>,
+        filter: Option<Box<Expr<Raw>>>,
         distinct: bool,
         sample: bool,
-    ) -> Expr<Aug> {
+    ) -> Expr<Raw> {
         Self::plan_variance(expr, filter, distinct, sample).call_unary(vec!["sqrt"])
     }
 
-    fn rewrite_expr(&mut self, expr: &Expr<Aug>) -> Option<(Ident, Expr<Aug>)> {
+    fn rewrite_expr(&mut self, expr: &Expr<Raw>) -> Option<(Ident, Expr<Raw>)> {
         match expr {
             Expr::Function(Function {
                 name,
@@ -269,8 +269,8 @@ impl<'a> FuncRewriter<'a> {
     }
 }
 
-impl<'ast> VisitMut<'ast, Aug> for FuncRewriter<'_> {
-    fn visit_select_item_mut(&mut self, item: &'ast mut SelectItem<Aug>) {
+impl<'ast> VisitMut<'ast, Raw> for FuncRewriter<'_> {
+    fn visit_select_item_mut(&mut self, item: &'ast mut SelectItem<Raw>) {
         if let SelectItem::Expr { expr, alias: None } = item {
             visit_mut::visit_expr_mut(self, expr);
             if let Some((alias, expr)) = self.rewrite_expr(expr) {
@@ -284,7 +284,7 @@ impl<'ast> VisitMut<'ast, Aug> for FuncRewriter<'_> {
         }
     }
 
-    fn visit_expr_mut(&mut self, expr: &'ast mut Expr<Aug>) {
+    fn visit_expr_mut(&mut self, expr: &'ast mut Expr<Raw>) {
         visit_mut::visit_expr_mut(self, expr);
         if let Some((_name, new_expr)) = self.rewrite_expr(expr) {
             *expr = new_expr;
@@ -296,24 +296,29 @@ impl<'ast> VisitMut<'ast, Aug> for FuncRewriter<'_> {
 ///
 /// For example, `<expr> NOT IN (<subquery>)` is rewritten to `expr <> ALL
 /// (<subquery>)`.
-struct Desugarer {
+struct Desugarer<'a> {
+    scx: &'a StatementContext<'a>,
     status: Result<(), PlanError>,
     recursion_guard: RecursionGuard,
 }
 
-impl CheckedRecursion for Desugarer {
+impl<'a> CheckedRecursion for Desugarer<'a> {
     fn recursion_guard(&self) -> &RecursionGuard {
         &self.recursion_guard
     }
 }
 
-impl<'ast> VisitMut<'ast, Aug> for Desugarer {
-    fn visit_expr_mut(&mut self, expr: &'ast mut Expr<Aug>) {
+impl<'ast> VisitMut<'ast, Raw> for Desugarer<'_> {
+    fn visit_expr_mut(&mut self, expr: &'ast mut Expr<Raw>) {
         self.visit_internal(Self::visit_expr_mut_internal, expr);
+    }
+
+    fn visit_select_mut(&mut self, node: &'ast mut Select<Raw>) {
+        self.visit_internal(Self::visit_select_mut_internal, node);
     }
 }
 
-impl Desugarer {
+impl<'a> Desugarer<'a> {
     fn visit_internal<F, X>(&mut self, f: F, x: X)
     where
         F: Fn(&mut Self, X) -> Result<(), PlanError>,
@@ -328,14 +333,60 @@ impl Desugarer {
         }
     }
 
-    fn new() -> Desugarer {
+    fn new(scx: &'a StatementContext<'a>) -> Desugarer {
         Desugarer {
+            scx,
             status: Ok(()),
             recursion_guard: RecursionGuard::with_limit(1024), // chosen arbitrarily
         }
     }
 
-    fn visit_expr_mut_internal(&mut self, expr: &mut Expr<Aug>) -> Result<(), PlanError> {
+    fn visit_select_mut_internal(&mut self, node: &mut Select<Raw>) -> Result<(), PlanError> {
+        // `SELECT .., $table_func, .. FROM x`
+        // =>
+        // `SELECT .., table_func, .. FROM x, LATERAL $table_func`
+        //
+        // Table functions in SELECT projections are supported by rewriting them to a
+        // FROM LATERAL, which is limited to a single table function. After we find a
+        // table function, if we find another identical to it, they are all rewritten
+        // to the same identifier. A second unique table function will cause an error.
+        //
+        // See: https://www.postgresql.org/docs/14/xfunc-sql.html#XFUNC-SQL-FUNCTIONS-RETURNING-SET
+        // See: https://www.postgresql.org/docs/14/queries-table-expressions.html#QUERIES-FROM
+
+        // Look for table function in SELECT projections. We use a unique
+        // TableFuncRewriter per SELECT, which allows differing table functions to
+        // exist in the same statement, as long as they are in other SELECTs.
+        let mut tf = TableFuncRewriter::new(self.scx);
+        for item in node.projection.iter_mut() {
+            visit_mut::visit_select_item_mut(&mut tf, item);
+        }
+        tf.status?;
+
+        if let Some((func, name)) = tf.table_func {
+            // We have a table func in a select item's position, add it to FROM.
+            node.from.push(TableWithJoins {
+                relation: TableFactor::Function {
+                    function: TableFunction {
+                        name: func.name,
+                        args: func.args,
+                    },
+                    alias: Some(TableAlias {
+                        name,
+                        columns: vec![],
+                        strict: false,
+                    }),
+                    with_ordinality: false,
+                },
+                joins: vec![],
+            });
+        }
+
+        visit_mut::visit_select_mut(self, node);
+        Ok(())
+    }
+
+    fn visit_expr_mut_internal(&mut self, expr: &mut Expr<Raw>) -> Result<(), PlanError> {
         // `($expr)` => `$expr`
         while let Expr::Nested(e) = expr {
             *expr = e.take();
@@ -531,7 +582,7 @@ impl Desugarer {
             if let (Expr::Row { exprs: left }, Expr::Row { exprs: right }) =
                 (&mut **left, &mut **right)
             {
-                if matches!(normalize::op(op)?, "=" | "<>" | "<" | "<=" | ">" | ">=") {
+                if matches!(op.op_str(), "=" | "<>" | "<" | "<=" | ">" | ">=") {
                     if left.len() != right.len() {
                         sql_bail!("unequal number of entries in row expressions");
                     }
@@ -540,19 +591,19 @@ impl Desugarer {
                         sql_bail!("cannot compare rows of zero length");
                     }
                 }
-                match normalize::op(op)? {
+                match op.op_str() {
                     "=" | "<>" => {
                         let mut new = Expr::Value(Value::Boolean(true));
                         for (l, r) in left.iter_mut().zip(right) {
                             new = l.take().equals(r.take()).and(new);
                         }
-                        if normalize::op(op)? == "<>" {
+                        if op.op_str() == "<>" {
                             new = new.negate();
                         }
                         *expr = new;
                     }
                     "<" | "<=" | ">" | ">=" => {
-                        let strict_op = match normalize::op(op)? {
+                        let strict_op = match op.op_str() {
                             "<" | "<=" => "<",
                             ">" | ">=" => ">",
                             _ => unreachable!(),
@@ -562,7 +613,7 @@ impl Desugarer {
                         for (l, r) in left.iter_mut().zip(right).rev().skip(1) {
                             new = l
                                 .clone()
-                                .binop(Op::bare(strict_op), r.clone())
+                                .binop(Op::Bare(String::from(strict_op)), r.clone())
                                 .or(l.take().equals(r.take()).and(new));
                         }
                         *expr = new;
@@ -573,6 +624,108 @@ impl Desugarer {
         }
 
         visit_mut::visit_expr_mut(self, expr);
+        Ok(())
+    }
+}
+
+// A VisitMut that replaces table functions with the function name as an
+// Identifier. After calls to visit_mut, if table_func is Some, it holds the
+// extracted table function, which should be added as a FROM clause. Query
+// nodes (and thus any subquery Expr) are ignored.
+struct TableFuncRewriter<'a> {
+    scx: &'a StatementContext<'a>,
+    disallowed_context: Vec<&'static str>,
+    table_func: Option<(Function<Raw>, Ident)>,
+    status: Result<(), PlanError>,
+}
+
+impl<'ast> VisitMut<'ast, Raw> for TableFuncRewriter<'_> {
+    fn visit_expr_mut(&mut self, expr: &'ast mut Expr<Raw>) {
+        self.visit_internal(Self::visit_expr_mut_internal, expr);
+    }
+
+    fn visit_query_mut(&mut self, _node: &'ast mut Query<Raw>) {
+        // Do not descend into Query nodes so subqueries can have their own table
+        // functions rewritten.
+    }
+}
+
+impl<'a> TableFuncRewriter<'a> {
+    fn new(scx: &'a StatementContext<'a>) -> TableFuncRewriter<'a> {
+        TableFuncRewriter {
+            scx,
+            disallowed_context: Vec::new(),
+            table_func: None,
+            status: Ok(()),
+        }
+    }
+
+    fn visit_internal<F, X>(&mut self, f: F, x: X)
+    where
+        F: Fn(&mut Self, X) -> Result<(), PlanError>,
+    {
+        if self.status.is_ok() {
+            // self.status could have changed from a deeper call, so don't blindly
+            // overwrite it with the result of this call.
+            let status = f(self, x);
+            if self.status.is_ok() {
+                self.status = status;
+            }
+        }
+    }
+
+    fn visit_expr_mut_internal(&mut self, expr: &mut Expr<Raw>) -> Result<(), PlanError> {
+        // This block does two things:
+        // - Check if expr is a context where table functions are disallowed.
+        // - Check if expr is a table function, and attempt to replace if so.
+        let disallowed_context = match expr {
+            Expr::Case { .. } => Some("CASE"),
+            Expr::Coalesce { .. } => Some("COALESCE"),
+            Expr::Function(func) => {
+                if let Ok(item) = self.scx.resolve_function(func.name.clone()) {
+                    match item.func()? {
+                        Func::Aggregate(_) => Some("aggregate function calls"),
+                        Func::Table(_) => {
+                            if let Some(context) = self.disallowed_context.last() {
+                                sql_bail!("table functions are not allowed in {}", context);
+                            }
+                            let name = Ident::new(item.name().item.clone());
+                            let ident = Expr::Identifier(vec![name.clone()]);
+                            match self.table_func.as_mut() {
+                                None => {
+                                    self.table_func = Some((func.clone(), name));
+                                }
+                                Some((table_func, _)) => {
+                                    if func != table_func {
+                                        bail_unsupported!(
+                                            1546,
+                                            "multiple table functions in select projections"
+                                        );
+                                    }
+                                }
+                            }
+                            *expr = ident;
+                            None
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(context) = disallowed_context {
+            self.disallowed_context.push(context);
+        }
+
+        visit_mut::visit_expr_mut(self, expr);
+
+        if disallowed_context.is_some() {
+            self.disallowed_context.pop();
+        }
+
         Ok(())
     }
 }

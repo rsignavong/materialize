@@ -16,15 +16,17 @@ use std::pin::Pin;
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, Stream, StreamExt};
-use mz_expr::GlobalId;
 use prometheus::proto::MetricType;
 use tokio::time::{self, Duration};
 use tokio_stream::wrappers::IntervalStream;
 
-use mz_ore::metrics::MetricsRegistry;
-use mz_ore::now::{self, SYSTEM_TIME};
-use mz_repr::{Datum, Diff, Row};
+use ore::metrics::MetricsRegistry;
+use ore::now::{self, SYSTEM_TIME};
+use repr::{Datum, Diff, Row};
 
+use crate::catalog::builtin::{
+    BuiltinTable, MZ_PROMETHEUS_HISTOGRAMS, MZ_PROMETHEUS_METRICS, MZ_PROMETHEUS_READINGS,
+};
 use crate::catalog::BuiltinTableUpdate;
 use crate::coord::{LoggingConfig, Message, TimestampedUpdate};
 
@@ -35,9 +37,6 @@ pub struct Scraper {
     retain_for: u64,
     registry: MetricsRegistry,
     metadata: HashMap<Row, u64>,
-    mz_prometheus_metrics_global_id: GlobalId,
-    mz_prometheus_histograms_global_id: GlobalId,
-    mz_prometheus_readings_global_id: GlobalId,
 }
 
 fn convert_metrics_to_value_rows<
@@ -47,7 +46,7 @@ fn convert_metrics_to_value_rows<
     timestamp: DateTime<Utc>,
     families: M,
 ) -> (Vec<Row>, Vec<Row>) {
-    let mut row_buf = Row::default();
+    let mut row_packer = Row::default();
     let mut rows: Vec<Row> = vec![];
     let mut metadata: Vec<Row> = vec![];
 
@@ -64,7 +63,6 @@ fn convert_metrics_to_value_rows<
                 .into_iter()
                 .map(|pair| (pair.get_name(), Datum::from(pair.get_value())))
                 .collect();
-            let mut row_packer = row_buf.packer();
             row_packer.push(Datum::from(fam.get_name()));
             row_packer.push(Datum::from(timestamp));
             row_packer.push_dict(labels.iter().copied());
@@ -73,7 +71,7 @@ fn convert_metrics_to_value_rows<
                 MetricType::GAUGE => metric.get_gauge().get_value(),
                 _ => unreachable!("never hit for anything other than gauges & counters"),
             }));
-            rows.push(row_buf.clone());
+            rows.push(row_packer.finish_and_reuse());
         }
     }
     (rows, metadata)
@@ -86,7 +84,7 @@ fn convert_metrics_to_histogram_rows<
     timestamp: DateTime<Utc>,
     families: M,
 ) -> (Vec<Row>, Vec<Row>) {
-    let mut row_buf = Row::default();
+    let mut row_packer = Row::default();
     let mut rows: Vec<Row> = vec![];
     let mut metadata: Vec<Row> = vec![];
 
@@ -101,13 +99,12 @@ fn convert_metrics_to_histogram_rows<
                     .map(|pair| (pair.get_name(), Datum::from(pair.get_value())))
                     .collect();
                 for bucket in metric.get_histogram().get_bucket() {
-                    let mut row_packer = row_buf.packer();
                     row_packer.push(Datum::from(name));
                     row_packer.push(Datum::from(timestamp));
                     row_packer.push_dict(labels.iter().copied());
                     row_packer.push(Datum::from(bucket.get_upper_bound()));
                     row_packer.push(Datum::from(bucket.get_cumulative_count() as i64));
-                    rows.push(row_buf.clone());
+                    rows.push(row_packer.finish_and_reuse());
                 }
             }
         }
@@ -130,7 +127,7 @@ fn metric_family_metadata(family: &prometheus::proto::MetricFamily) -> Row {
 }
 
 fn add_expiring_update(
-    id: GlobalId,
+    table: &BuiltinTable,
     updates: Vec<Row>,
     retain_for: u64,
     out: &mut Vec<TimestampedUpdate>,
@@ -138,6 +135,7 @@ fn add_expiring_update(
     // NB: This makes sure to send both records in the same message so we can
     // persist them atomically. Otherwise, we may end up with permanent orphans
     // if a restart/crash happens at the wrong time.
+    let id = table.id;
     out.push(TimestampedUpdate {
         updates: updates
             .iter()
@@ -157,18 +155,18 @@ fn add_expiring_update(
 }
 
 fn add_metadata_update<I: IntoIterator<Item = Row>>(
-    mz_prometheus_metrics_global_id: GlobalId,
     updates: I,
     diff: Diff,
+    retain_for: u64,
     out: &mut Vec<TimestampedUpdate>,
 ) {
-    let id = mz_prometheus_metrics_global_id;
+    let id = MZ_PROMETHEUS_METRICS.id;
     out.push(TimestampedUpdate {
         updates: updates
             .into_iter()
             .map(|row| BuiltinTableUpdate { id, row, diff })
             .collect(),
-        timestamp_offset: 0,
+        timestamp_offset: retain_for,
     });
 }
 
@@ -181,9 +179,6 @@ impl Scraper {
     pub fn new(
         logging_config: Option<&LoggingConfig>,
         registry: MetricsRegistry,
-        mz_prometheus_metrics_global_id: GlobalId,
-        mz_prometheus_histograms_global_id: GlobalId,
-        mz_prometheus_readings_global_id: GlobalId,
     ) -> Result<Scraper, anyhow::Error> {
         let (interval, retain_for) = match logging_config {
             Some(config) => {
@@ -199,9 +194,6 @@ impl Scraper {
             retain_for,
             registry,
             metadata: HashMap::new(),
-            mz_prometheus_metrics_global_id,
-            mz_prometheus_histograms_global_id,
-            mz_prometheus_readings_global_id,
         })
     }
 
@@ -231,7 +223,7 @@ impl Scraper {
         let (value_readings, meta_value) =
             convert_metrics_to_value_rows(timestamp, metric_fams.iter());
         add_expiring_update(
-            self.mz_prometheus_readings_global_id,
+            &MZ_PROMETHEUS_READINGS,
             value_readings,
             self.retain_for,
             &mut out,
@@ -240,7 +232,7 @@ impl Scraper {
         let (histo_readings, meta_histo) =
             convert_metrics_to_histogram_rows(timestamp, metric_fams.iter());
         add_expiring_update(
-            self.mz_prometheus_histograms_global_id,
+            &MZ_PROMETHEUS_HISTOGRAMS,
             histo_readings,
             self.retain_for,
             &mut out,
@@ -256,17 +248,17 @@ impl Scraper {
                     .insert(metric.clone(), now + retain_for)
                     .is_none()
             });
-        add_metadata_update(self.mz_prometheus_metrics_global_id, missing, 1, &mut out);
+        add_metadata_update(missing, 1, retain_for, &mut out);
 
         // Expire any that can now go (I would love HashMap.drain_filter here):
         add_metadata_update(
-            self.mz_prometheus_metrics_global_id,
             self.metadata
                 .iter()
                 .filter(|(_, &retention)| retention <= now)
                 .map(|(row, _)| row)
                 .cloned(),
             -1,
+            retain_for,
             &mut out,
         );
         self.metadata.retain(|_, &mut retention| retention > now);

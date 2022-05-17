@@ -17,12 +17,12 @@
 //!     the [`LinearOperator`] and then the `projection`.
 //!   * Intermediate views in the dataflow come next.
 //!     The format is "View <name> (<id>):" followed by the output of
-//!     [`mz_expr::explain::ViewExplanation`].
+//!     [`expr::explain::ViewExplanation`].
 //!   * Last is the view or query being explained. The format is "Query:"
-//!     followed by the output of [`mz_expr::explain::ViewExplanation`].
+//!     followed by the output of [`expr::explain::ViewExplanation`].
 //!   * If there are no sources with some [`LinearOperator`] and no intermediate
 //!     views, then the format is identical to the format of
-//!     [`mz_expr::explain::ViewExplanation`].
+//!     [`expr::explain::ViewExplanation`].
 //!
 //! It's important to avoid trailing whitespace everywhere, as plans may be
 //! printed in contexts where trailing whitespace is unacceptable, like
@@ -32,10 +32,10 @@ use std::fmt;
 
 use crate::{DataflowDescription, LinearOperator};
 
-use mz_expr::explain::{Indices, ViewExplanation};
-use mz_expr::{ExprHumanizer, GlobalId, OptimizedMirRelationExpr, RowSetFinishing};
-use mz_ore::result::ResultExt;
-use mz_ore::str::{bracketed, separated};
+use expr::explain::{Indices, ViewExplanation};
+use expr::{ExprHumanizer, GlobalId, OptimizedMirRelationExpr, RowSetFinishing};
+use ore::result::ResultExt;
+use ore::str::{bracketed, separated};
 
 pub trait ViewFormatter<ViewExpr> {
     fn fmt_source_body(&self, f: &mut fmt::Formatter, operator: &LinearOperator) -> fmt::Result;
@@ -90,8 +90,8 @@ where
         let sources = dataflow
             .source_imports
             .iter()
-            .filter_map(|(id, source)| {
-                if let Some(operator) = &source.arguments.operators {
+            .filter_map(|(id, source_desc)| {
+                if let Some(operator) = &source_desc.0.operators {
                     Some((*id, operator))
                 } else {
                     None
@@ -101,7 +101,7 @@ where
         let views = dataflow
             .objects_to_build
             .iter()
-            .map(|build_desc| (build_desc.id, &build_desc.plan))
+            .map(|build_desc| (build_desc.id, &build_desc.view))
             .collect::<Vec<_>>();
         Self {
             formatter,
@@ -229,46 +229,5 @@ impl<'a> ViewFormatter<OptimizedMirRelationExpr> for DataflowGraphFormatter<'a> 
             explain.explain_types();
         }
         fmt::Display::fmt(&explain, f)
-    }
-}
-
-/// Information used when determining the timestamp for a query.
-pub struct TimestampExplanation<T> {
-    /// The chosen timestamp from `determine_timestamp`.
-    pub timestamp: T,
-    /// Whether the query contains a table.
-    pub has_table: bool,
-    /// If the query contains a table, the global table read timestamp.
-    pub table_read_ts: Option<T>,
-    /// The read frontier of all involved sources.
-    pub since: Vec<T>,
-    /// The write frontier of all involved sources.
-    pub upper: Vec<T>,
-    /// Details about each source.
-    pub sources: Vec<TimestampSource<T>>,
-}
-
-pub struct TimestampSource<T> {
-    pub name: String,
-    pub read_frontier: Vec<T>,
-    pub write_frontier: Vec<T>,
-}
-
-impl<T: fmt::Display + fmt::Debug> fmt::Display for TimestampExplanation<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "     timestamp: {:13}", self.timestamp)?;
-        writeln!(f, "         since:{:13?}", self.since)?;
-        writeln!(f, "         upper:{:13?}", self.upper)?;
-        writeln!(f, "     has table: {}", self.has_table)?;
-        if let Some(ts) = &self.table_read_ts {
-            writeln!(f, " table read ts: {:13}", ts)?;
-        }
-        for source in &self.sources {
-            writeln!(f, "")?;
-            writeln!(f, "source {}:", source.name)?;
-            writeln!(f, " read frontier:{:13?}", source.read_frontier)?;
-            writeln!(f, "write frontier:{:13?}", source.write_frontier)?;
-        }
-        Ok(())
     }
 }

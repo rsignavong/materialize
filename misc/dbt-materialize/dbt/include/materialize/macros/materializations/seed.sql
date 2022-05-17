@@ -15,13 +15,9 @@
 -- limitations under the License.
 
 {% macro materialize__load_csv_rows(model, agate_table) -%}
-  {% set column_override = model['config'].get('column_types', {}) %}
-
   {% set cols_sql %}
     {% for column in agate_table.column_names %}
-      {%- set inferred_type = adapter.convert_type(agate_table, loop.index0) -%}
-      {%- set type = column_override.get(column, inferred_type) -%}
-      column{{ loop.index }}::{{ type }} as {{ column }}
+      column{{loop.index}} as {{column}}
       {%- if not loop.last%},{%- endif %}
     {% endfor %}
   {% endset %}
@@ -62,7 +58,6 @@
   {%- do store_result('agate_table', response='OK', agate_table=agate_table) -%}
 
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
-  {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
   {% if old_relation %}
      {{ adapter.drop_relation(old_relation) }}
@@ -78,7 +73,6 @@
   {% endcall %}
 
   {{ run_hooks(post_hooks, inside_transaction=False) }}
-  {{ run_hooks(post_hooks, inside_transaction=True) }}
 
   {% set target_relation = this.incorporate(type='materializedview') %}
   {{ return({'relations': [target_relation]}) }}

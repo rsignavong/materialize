@@ -21,14 +21,14 @@
 #![warn(missing_docs)]
 #![warn(missing_debug_implementations)]
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::iter;
 
-use mz_expr::GlobalId;
-use mz_expr::MirRelationExpr;
-use mz_expr::MirScalarExpr;
-use mz_ore::id_gen::IdGen;
+use expr::GlobalId;
+use expr::MirRelationExpr;
+use expr::MirScalarExpr;
+use ore::id_gen::IdGen;
 
 pub mod canonicalize_mfp;
 pub mod column_knowledge;
@@ -55,7 +55,7 @@ pub mod update_let;
 
 pub mod dataflow;
 pub use dataflow::optimize_dataflow;
-use mz_ore::stack::RecursionLimitError;
+use ore::stack::RecursionLimitError;
 
 /// Arguments that get threaded through all transforms.
 #[derive(Debug)]
@@ -63,7 +63,7 @@ pub struct TransformArgs<'a> {
     /// A shared instance of IdGen to allow constructing new Let expressions.
     pub id_gen: &'a mut IdGen,
     /// The indexes accessible.
-    pub indexes: &'a dyn IndexOracle,
+    pub indexes: &'a HashMap<GlobalId, Vec<(GlobalId, Vec<MirScalarExpr>)>>,
 }
 
 /// Types capable of transforming relation expressions.
@@ -103,32 +103,6 @@ impl Error for TransformError {}
 impl From<RecursionLimitError> for TransformError {
     fn from(error: RecursionLimitError) -> Self {
         TransformError::Internal(error.to_string())
-    }
-}
-
-/// A trait for a type that can answer questions about what indexes exist.
-pub trait IndexOracle: fmt::Debug {
-    /// Returns an iterator over the indexes that exist on the identified
-    /// collection.
-    ///
-    /// Each index is described by the list of key expressions. If no indexes
-    /// exist for the identified collection, or if the identified collection
-    /// is unknown, the returned iterator will be empty.
-    ///
-    // NOTE(benesch): The allocation here is unfortunate, but on the other hand
-    // you need only allocate when you actually look for an index. Can we do
-    // better somehow? Making the entire optimizer generic over this iterator
-    // type doesn't presently seem worthwhile.
-    fn indexes_on(&self, id: GlobalId) -> Box<dyn Iterator<Item = &[MirScalarExpr]> + '_>;
-}
-
-/// An [`IndexOracle`] that knows about no indexes.
-#[derive(Debug)]
-pub struct EmptyIndexOracle;
-
-impl IndexOracle for EmptyIndexOracle {
-    fn indexes_on(&self, _: GlobalId) -> Box<dyn Iterator<Item = &[MirScalarExpr]> + '_> {
-        Box::new(iter::empty())
     }
 }
 
@@ -215,7 +189,6 @@ impl Default for FuseAndCollapse {
                 Box::new(crate::fusion::map::Map),
                 Box::new(crate::fusion::negate::Negate),
                 Box::new(crate::fusion::filter::Filter),
-                Box::new(crate::fusion::flatmap_to_map::FlatMapToMap),
                 Box::new(crate::fusion::project::Project),
                 Box::new(crate::fusion::join::Join),
                 Box::new(crate::fusion::top_k::TopK),
@@ -386,7 +359,6 @@ impl Optimizer {
                     Box::new(crate::union_cancel::UnionBranchCancellation),
                     Box::new(crate::cse::relation_cse::RelationCSE),
                     Box::new(crate::inline_let::InlineLet::new(true)),
-                    Box::new(crate::reduction::FoldConstants { limit: Some(10000) }),
                 ],
             }),
         ];
@@ -400,9 +372,9 @@ impl Optimizer {
     pub fn optimize(
         &mut self,
         mut relation: MirRelationExpr,
-    ) -> Result<mz_expr::OptimizedMirRelationExpr, TransformError> {
-        self.transform(&mut relation, &EmptyIndexOracle)?;
-        Ok(mz_expr::OptimizedMirRelationExpr(relation))
+    ) -> Result<expr::OptimizedMirRelationExpr, TransformError> {
+        self.transform(&mut relation, &HashMap::new())?;
+        Ok(expr::OptimizedMirRelationExpr(relation))
     }
 
     /// Optimizes the supplied relation expression in place, using available arrangements.
@@ -412,7 +384,7 @@ impl Optimizer {
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        indexes: &dyn IndexOracle,
+        indexes: &HashMap<GlobalId, Vec<(GlobalId, Vec<MirScalarExpr>)>>,
     ) -> Result<(), TransformError> {
         let mut id_gen = Default::default();
         for transform in self.transforms.iter() {

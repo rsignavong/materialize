@@ -13,7 +13,7 @@ import os
 import platform
 import sys
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import List
 
 from materialize import ROOT, spawn
 
@@ -64,9 +64,7 @@ def target(arch: Arch) -> str:
     return f"{arch}-unknown-linux-gnu"
 
 
-def cargo(
-    arch: Arch, subcommand: str, rustflags: List[str], channel: Optional[str] = None
-) -> List[str]:
+def cargo(arch: Arch, subcommand: str, rustflags: List[str]) -> List[str]:
     """Construct a Cargo invocation for cross compiling.
 
     Args:
@@ -74,7 +72,6 @@ def cargo(
         subcommand: The Cargo subcommand to invoke.
         rustflags: Override the flags passed to the Rust compiler. If the list
             is empty, the default flags are used.
-        channel: The Rust toolchain channel to use. Either None/"stable" or "nightly".
 
     Returns:
         A list of arguments specifying the beginning of the command to invoke.
@@ -82,42 +79,52 @@ def cargo(
     _target = target(arch)
     _target_env = _target.upper().replace("-", "_")
 
+    ldflags: List[str] = []
     rustflags += ["-Clink-arg=-Wl,--compress-debug-sections=zlib"]
 
-    if sys.platform == "darwin":
-        _bootstrap_darwin(arch)
-        sysroot = spawn.capture([f"{_target}-cc", "-print-sysroot"]).strip()
-        rustflags += [f"-L{sysroot}/lib"]
-        extra_env = {
-            f"CMAKE_SYSTEM_NAME": "Linux",
-            f"CARGO_TARGET_{_target_env}_LINKER": f"{_target}-cc",
-            f"CARGO_TARGET_DIR": ROOT / "target-xcompile",
-            f"TARGET_AR": f"{_target}-ar",
-            f"TARGET_CPP": f"{_target}-cpp",
-            f"TARGET_CC": f"{_target}-cc",
-            f"TARGET_CXX": f"{_target}-c++",
-            f"TARGET_CXXSTDLIB": "static=stdc++",
-            f"TARGET_LD": f"{_target}-ld",
-            f"TARGET_RANLIB": f"{_target}-ranlib",
-        }
-    else:
-        # NOTE(benesch): The required Rust flags have to be duplicated with
-        # their definitions in ci/builder/Dockerfile because `rustc` has no way
-        # to merge together Rust flags from different sources.
-        rustflags += [
-            "-Clink-arg=-fuse-ld=lld",
-            f"-L/opt/x-tools/{_target}/{_target}/sysroot/lib",
-        ]
-        extra_env: Dict[str, str] = {}
+    if not sys.platform == "darwin":
+        # lld is not yet easy to install on macOS.
+        ldflags += ["-fuse-ld=lld"]
+        rustflags += ["-Clink-arg=-fuse-ld=lld"]
 
     env = {
-        **extra_env,
-        "RUSTFLAGS": " ".join(rustflags),
+        f"CMAKE_SYSTEM_NAME": "Linux",
+        f"CARGO_TARGET_{_target_env}_LINKER": f"{_target}-cc",
+        f"LDFLAGS": " ".join(ldflags),
+        f"RUSTFLAGS": " ".join(rustflags),
+        f"TARGET_AR": f"{_target}-ar",
+        f"TARGET_CPP": f"{_target}-cpp",
+        f"TARGET_CC": f"{_target}-cc",
+        f"TARGET_CXX": f"{_target}-c++",
+        f"TARGET_LD": f"{_target}-ld",
+        f"TARGET_RANLIB": f"{_target}-ranlib",
         **KRB5_CONF_OVERRIDES,
     }
 
+    # Handle the confusing situation of "cross compiling" from x86_64 Linux to
+    # x86_64 Linux. This counts as a cross compile because, while the platform
+    # is identical, we're targeting an older kernel and libc. In an ideal world,
+    # our dependencies would use the native toolchain (e.g., `cc`) when compiled
+    # as build dependencies, but the cross toolchain (e.g.,
+    # `x86_64-unknown-linux-gnu-cc`) when compiled as normal dependencies. But
+    # the build systems of several of our dependencies flub this distinction and
+    # use the native toolchain (`cc`) when compiled as a normal dependency.
+    # Fixing the build systems is hard, so instead we use the cross toolchain
+    # for build dependencies too, by setting `CC` in addition to `TARGET_CC`,
+    # `CPP` in addition to `TARGET_CPP`, etc. That means we're incorrectly using
+    # the cross toolchain to compile build dependencies, but it works out
+    # because we're still able to *run* those dependencies on the build machine,
+    # and this way we guarantee that the buggy dependencies use the cross
+    # toolchain when compiled as normal dependencies, which is the actually
+    # important consideration.
+    if Arch.host() == arch and sys.platform != "darwin":
+        for k, v in env.copy().items():
+            if k.startswith("TARGET_"):
+                k = k[len("TARGET_") :]
+                env[k] = v
+
     return [
-        *_enter_builder(arch, channel),
+        *_enter_builder(arch),
         "env",
         *(f"{k}={v}" for k, v in env.items()),
         "cargo",
@@ -127,41 +134,40 @@ def cargo(
     ]
 
 
-def tool(arch: Arch, name: str, channel: Optional[str] = None) -> List[str]:
+def tool(arch: Arch, name: str) -> List[str]:
     """Constructs a cross-compiling binutils tool invocation.
 
     Args:
         arch: The CPU architecture to build for.
         name: The name of the binutils tool to invoke.
-        channel: The Rust toolchain channel to use. Either None/"stable" or "nightly".
 
     Returns:
         A list of arguments specifying the beginning of the command to invoke.
     """
-    if sys.platform == "darwin":
-        _bootstrap_darwin(arch)
     return [
-        *_enter_builder(arch, channel),
+        *_enter_builder(arch),
         f"{target(arch)}-{name}",
     ]
 
 
-def _enter_builder(arch: Arch, channel: Optional[str] = None) -> List[str]:
+def _enter_builder(arch: Arch) -> List[str]:
     assert (
         arch == Arch.host()
     ), f"target architecture {arch} does not match host architecture {Arch.host()}"
-    if "MZ_DEV_CI_BUILDER" in os.environ or sys.platform == "darwin":
+    if "MZ_DEV_CI_BUILDER" in os.environ:
+        return []
+    elif sys.platform == "darwin":
+        # Building in Docker for Mac is painfully slow, so we install a
+        # cross-compiling toolchain on the host and use that instead.
+        _bootstrap_darwin(arch)
         return []
     else:
-        return ["bin/ci-builder", "run", channel if channel else "stable"]
+        return ["bin/ci-builder", "run", "stable"]
 
 
 def _bootstrap_darwin(arch: Arch) -> None:
-    # Building in Docker for Mac is painfully slow, so we install a
-    # cross-compiling toolchain on the host and use that instead.
-
     BOOTSTRAP_VERSION = "4"
-    BOOTSTRAP_FILE = ROOT / "target-xcompile" / target(arch) / ".xcompile-bootstrap"
+    BOOTSTRAP_FILE = ROOT / "target" / target(arch) / ".xcompile-bootstrap"
     try:
         contents = BOOTSTRAP_FILE.read_text()
     except FileNotFoundError:
@@ -169,7 +175,12 @@ def _bootstrap_darwin(arch: Arch) -> None:
     if contents == BOOTSTRAP_VERSION:
         return
 
+    # TODO(benesch): no need to clean up these old taps once sufficient time has
+    # passed (say, March 2022).
+    for old_tap in ["SergioBenitez/osxct", "messense/macos-cross-toolchains"]:
+        spawn.runv(["brew", "uninstall", "-f", f"{old_tap}/{target(arch)}"])
     spawn.runv(["brew", "install", f"materializeinc/crosstools/{target(arch)}"])
+    spawn.runv(["cargo", "clean", "--target", target(arch)], cwd=ROOT)
     spawn.runv(["rustup", "target", "add", target(arch)])
 
     BOOTSTRAP_FILE.parent.mkdir(parents=True, exist_ok=True)

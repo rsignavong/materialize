@@ -29,12 +29,6 @@ def main() -> int:
         choices=mzbuild.Arch,
     )
 
-    parser.add_argument(
-        "--channel",
-        default=None,
-        help="Rust compiler channel to use",
-    )
-
     subparsers = parser.add_subparsers(
         dest="command", metavar="<command>", required=True
     )
@@ -48,7 +42,6 @@ def main() -> int:
         default=[],
         help="override the default flags to the Rust compiler",
     )
-
     cargo_parser.add_argument("subcommand", help="the cargo subcommand to invoke")
     cargo_parser.add_argument(
         "subargs", nargs=argparse.REMAINDER, help="the arguments to pass to cargo"
@@ -66,12 +59,7 @@ def main() -> int:
     if args.command == "cargo":
         spawn.runv(
             [
-                *xcompile.cargo(
-                    arch=args.arch,
-                    channel=args.channel,
-                    subcommand=args.subcommand,
-                    rustflags=args.rustflags,
-                ),
+                *xcompile.cargo(args.arch, args.subcommand, args.rustflags),
                 *args.subargs,
             ]
         )

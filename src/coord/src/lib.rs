@@ -40,15 +40,17 @@ mod id_alloc;
 mod persistcfg;
 mod sink_connector;
 mod tail;
+mod timestamp;
 mod util;
 
 pub mod catalog;
 pub mod session;
 
 pub use crate::client::{Client, ConnClient, Handle, SessionClient};
-pub use crate::command::{Canceled, ExecuteResponse, StartupMessage, StartupResponse};
+pub use crate::command::{Cancelled, ExecuteResponse, StartupMessage, StartupResponse};
 pub use crate::coord::{serve, Config, LoggingConfig};
 pub use crate::error::CoordError;
 pub use crate::persistcfg::{
     PersistConfig, PersistFileStorage, PersistS3Storage, PersistStorage, PersisterWithConfig,
 };
+pub use crate::timestamp::Timestamper;

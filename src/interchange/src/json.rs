@@ -10,11 +10,11 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use mz_ore::collections::CollectionExt;
-use mz_repr::adt::char;
-use mz_repr::adt::jsonb::JsonbRef;
-use mz_repr::adt::numeric::{NUMERIC_AGG_MAX_PRECISION, NUMERIC_DATUM_MAX_PRECISION};
-use mz_repr::{ColumnName, ColumnType, Datum, RelationDesc, ScalarType};
+use ore::collections::CollectionExt;
+use repr::adt::char;
+use repr::adt::jsonb::JsonbRef;
+use repr::adt::numeric::{NUMERIC_AGG_MAX_PRECISION, NUMERIC_DATUM_MAX_PRECISION};
+use repr::{ColumnName, ColumnType, Datum, RelationDesc, ScalarType};
 use serde_json::{json, Map};
 
 use crate::encode::{column_names_and_types, Encode, TypedDatum};
@@ -43,11 +43,7 @@ impl JsonEncoder {
         }
     }
 
-    pub fn encode_row(
-        &self,
-        row: mz_repr::Row,
-        names_types: &[(ColumnName, ColumnType)],
-    ) -> Vec<u8> {
+    pub fn encode_row(&self, row: repr::Row, names_types: &[(ColumnName, ColumnType)]) -> Vec<u8> {
         let value = encode_datums_as_json(row.iter(), names_types, self.include_transaction);
         value.to_string().into_bytes()
     }
@@ -58,14 +54,14 @@ impl Encode for JsonEncoder {
         "json"
     }
 
-    fn encode_key_unchecked(&self, row: mz_repr::Row) -> Vec<u8> {
+    fn encode_key_unchecked(&self, row: repr::Row) -> Vec<u8> {
         self.encode_row(
             row,
             self.key_columns.as_ref().expect("key schema must exist"),
         )
     }
 
-    fn encode_value_unchecked(&self, row: mz_repr::Row) -> Vec<u8> {
+    fn encode_value_unchecked(&self, row: repr::Row) -> Vec<u8> {
         self.encode_row(row, &self.value_columns)
     }
 }
@@ -135,16 +131,15 @@ impl<'a> ToJson for TypedDatum<'_> {
         } else {
             match &typ.scalar_type {
                 ScalarType::Bool => json!(datum.unwrap_bool()),
-                ScalarType::PgLegacyChar => json!(datum.unwrap_uint8()),
                 ScalarType::Int16 => json!(datum.unwrap_int16()),
-                ScalarType::Int32 => json!(datum.unwrap_int32()),
-                ScalarType::Int64 => json!(datum.unwrap_int64()),
-                ScalarType::Oid
+                ScalarType::Int32
+                | ScalarType::Oid
                 | ScalarType::RegClass
                 | ScalarType::RegProc
                 | ScalarType::RegType => {
-                    json!(datum.unwrap_uint32())
+                    json!(datum.unwrap_int32())
                 }
+                ScalarType::Int64 => json!(datum.unwrap_int64()),
                 ScalarType::Float32 => json!(datum.unwrap_float32()),
                 ScalarType::Float64 => json!(datum.unwrap_float64()),
                 ScalarType::Numeric { .. } => {
@@ -176,11 +171,9 @@ impl<'a> ToJson for TypedDatum<'_> {
                 }
                 ScalarType::Jsonb => JsonbRef::from_datum(datum).to_serde_json(),
                 ScalarType::Uuid => json!(datum.unwrap_uuid()),
-                ty @ (ScalarType::Array(..) | ScalarType::Int2Vector | ScalarType::List { .. }) => {
+                ScalarType::Array(element_type) | ScalarType::List { element_type, .. } => {
                     let list = match typ.scalar_type {
-                        ScalarType::Array(_) | ScalarType::Int2Vector => {
-                            datum.unwrap_array().elements()
-                        }
+                        ScalarType::Array(_) => datum.unwrap_array().elements(),
                         ScalarType::List { .. } => datum.unwrap_list(),
                         _ => unreachable!(),
                     };
@@ -191,7 +184,7 @@ impl<'a> ToJson for TypedDatum<'_> {
                                 datum,
                                 ColumnType {
                                     nullable: true,
-                                    scalar_type: ty.unwrap_collection_element_type().clone(),
+                                    scalar_type: (**element_type).clone(),
                                 },
                             );
                             datum.json(namer)
@@ -252,20 +245,15 @@ fn build_row_schema_field<F: FnMut() -> String>(
 ) -> serde_json::value::Value {
     let mut field_type = match &typ.scalar_type {
         ScalarType::Bool => json!("boolean"),
-        ScalarType::PgLegacyChar => json!({
-            "type": "fixed",
-            "size": 1,
-        }),
-        ScalarType::Int16 | ScalarType::Int32 => {
+        ScalarType::Int16
+        | ScalarType::Int32
+        | ScalarType::Oid
+        | ScalarType::RegClass
+        | ScalarType::RegProc
+        | ScalarType::RegType => {
             json!("int")
         }
         ScalarType::Int64 => json!("long"),
-        ScalarType::Oid | ScalarType::RegClass | ScalarType::RegProc | ScalarType::RegType => {
-            json!({
-                "type": "fixed",
-                "size": 4,
-            })
-        }
         ScalarType::Float32 => json!("float"),
         ScalarType::Float64 => json!("double"),
         ScalarType::Date => json!({
@@ -297,13 +285,13 @@ fn build_row_schema_field<F: FnMut() -> String>(
             "type": "string",
             "logicalType": "uuid",
         }),
-        ty @ (ScalarType::Array(..) | ScalarType::Int2Vector | ScalarType::List { .. }) => {
+        ScalarType::Array(element_type) | ScalarType::List { element_type, .. } => {
             let inner = build_row_schema_field(
                 namer,
                 names_seen,
                 &ColumnType {
                     nullable: true,
-                    scalar_type: ty.unwrap_collection_element_type().clone(),
+                    scalar_type: (**element_type).clone(),
                 },
             );
             json!({
@@ -346,9 +334,9 @@ fn build_row_schema_field<F: FnMut() -> String>(
                 })
             }
         }
-        ScalarType::Numeric { max_scale } => {
-            let (p, s) = match max_scale {
-                Some(max_scale) => (NUMERIC_DATUM_MAX_PRECISION, max_scale.into_u8()),
+        ScalarType::Numeric { scale } => {
+            let (p, s) = match scale {
+                Some(scale) => (NUMERIC_DATUM_MAX_PRECISION, usize::from(*scale)),
                 None => (NUMERIC_AGG_MAX_PRECISION, NUMERIC_DATUM_MAX_PRECISION),
             };
             json!({

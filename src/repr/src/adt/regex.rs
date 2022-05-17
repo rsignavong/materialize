@@ -15,8 +15,6 @@ use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 
-use mz_lowertest::MzReflect;
-
 /// A hashable, comparable, and serializable regular expression type.
 ///
 /// The  [`regex::Regex`] type, the de facto standard regex type in Rust, does
@@ -39,7 +37,7 @@ use mz_lowertest::MzReflect;
 ///
 /// This type also implements [`Serialize`] and [`Deserialize`] via the
 /// [`serde_regex`] crate.
-#[derive(Debug, Clone, Deserialize, Serialize, MzReflect)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Regex(
     // TODO(benesch): watch for a more efficient binary serialization for
     // [`regex::Regex`] (https://github.com/rust-lang/regex/issues/258). The

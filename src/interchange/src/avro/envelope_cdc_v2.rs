@@ -10,10 +10,11 @@
 //! Logic for the Avro representation of the CDCv2 protocol.
 
 use mz_avro::schema::{FullName, SchemaNode};
-use mz_repr::{Diff, Row, Timestamp};
+use repr::{Diff, Row, Timestamp};
 use serde_json::json;
 
 use anyhow::anyhow;
+use avro_derive::AvroDecodable;
 use differential_dataflow::capture::{Message, Progress};
 use mz_avro::error::{DecodeError, Error as AvroError};
 use mz_avro::schema::Schema;
@@ -21,10 +22,9 @@ use mz_avro::{
     define_unexpected, ArrayAsVecDecoder, AvroDecodable, AvroDecode, AvroDeserializer, AvroRead,
     StatefulAvroDecodable,
 };
-use mz_avro_derive::AvroDecodable;
 use std::{cell::RefCell, rc::Rc};
 
-use super::decode::RowWrapper;
+use super::RowWrapper;
 
 pub fn extract_data_columns<'a>(schema: &'a Schema) -> anyhow::Result<SchemaNode<'a>> {
     let data_name = FullName::from_parts("data", Some("com.materialize.cdc"), "");
@@ -42,7 +42,7 @@ pub fn extract_data_columns<'a>(schema: &'a Schema) -> anyhow::Result<SchemaNode
 #[derive(AvroDecodable)]
 #[state_type(Rc<RefCell<Row>>, Rc<RefCell<Vec<u8>>>)]
 struct MyUpdate {
-    #[state_expr(Rc::clone(&self._STATE.0), Rc::clone(&self._STATE.1))]
+    #[state_expr(self._STATE.0.clone(), self._STATE.1.clone())]
     data: RowWrapper,
     time: Timestamp,
     diff: Diff,
@@ -83,11 +83,8 @@ impl AvroDecode for Decoder {
                 let packer = Rc::new(RefCell::new(Row::default()));
                 let buf = Rc::new(RefCell::new(vec![]));
                 let d = ArrayAsVecDecoder::new(|| {
-                    <MyUpdate as StatefulAvroDecodable>::new_decoder((
-                        Rc::clone(&packer),
-                        Rc::clone(&buf),
-                    ))
-                    .map_decoder(|update| Ok((update.data.0, update.time, update.diff)))
+                    <MyUpdate as StatefulAvroDecodable>::new_decoder((packer.clone(), buf.clone()))
+                        .map_decoder(|update| Ok((update.data.0, update.time, update.diff)))
                 });
                 let updates = deserializer.deserialize(r, d)?;
                 Ok(Message::Updates(updates))
@@ -197,7 +194,7 @@ mod tests {
     use mz_avro::types::Value;
     use mz_avro::AvroDeserializer;
     use mz_avro::GeneralDeserializer;
-    use mz_repr::{ColumnName, ColumnType, RelationDesc, Row, ScalarType};
+    use repr::{ColumnName, ColumnType, RelationDesc, Row, ScalarType};
 
     use crate::json::build_row_schema_json;
 

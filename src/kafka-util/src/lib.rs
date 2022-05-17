@@ -14,6 +14,5 @@
 mod addr;
 
 pub mod admin;
-pub mod client;
 
 pub use addr::{KafkaAddrs, KafkaAddrsParseError};

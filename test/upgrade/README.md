@@ -20,46 +20,37 @@ The "upgrade" from your current source to your current source is also tested.
 To run the entire sequence of tests:
 
 ```
-./mzcompose down -v ; ./mzcompose run default
+./mzcompose down -v ; ./mzcompose run upgrade
 ```
 
 To run the tests against a particular version and all following versions:
 
 ```
-./mzcompose down -v ; ./mzcompose run default --min-version 0.9.6
+./mzcompose down -v ; ./mzcompose run upgrade --min-version 0.9.6
 ```
 
 To run the tests against the last five versions:
 
 ```
-./mzcompose down -v ; ./mzcompose run default --most-recent 5
+./mzcompose down -v ; ./mzcompose run upgrade --most-recent 5
 ```
 
 To run the tests upgrading from the current source to the current source:
 
 ```
-./mzcompose down -v ; ./mzcompose run default --most-recent 0
+./mzcompose down -v ; ./mzcompose run upgrade --most-recent 0
 ```
 
 To run just a particular test or tests:
 
 ```
-./mzcompose down -v ; ./mzcompose run default 'avro-ocf*'
-```
-
-If you are running a particular test that specifies the version, then you
-must include the `--min-version` flag with that version. The reason is
-that the test won't be included when testing earlier versions of Materialize,
-and testdrive will error out if it has no files to test:
-
-```
-./mzcompose down -v ; ./mzcompose run default 'compile-proto*' --min-version 0.9.12
+./mzcompose down -v ; ./mzcompose run upgrade 'persistent-user-tables*'
 ```
 
 For a full description of the command line options, run:
 
 ```
-./mzcompose run default --help
+./mzcompose run upgrade --help
 ```
 
 ## Test naming convention

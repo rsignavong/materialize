@@ -12,35 +12,51 @@
 # dates-times.slt.
 
 $ set schema={
-    "name": "row",
     "type": "record",
+    "name": "envelope",
     "fields": [
       {
-        "name": "d",
-        "type": {
-          "type": "int",
-          "logicalType": "date"
-        }
+        "name": "before",
+        "type": [
+          {
+            "name": "row",
+            "type": "record",
+            "fields": [
+              {
+                "name": "d",
+                "type": {
+                  "type": "int",
+                  "logicalType": "date"
+                }
+              },
+              {
+                "name": "ts",
+                "type": {
+                  "type": "long",
+                  "logicalType": "timestamp-micros"
+                }
+              }
+            ]
+          },
+          "null"
+        ]
       },
-      {
-        "name": "ts",
-        "type": {
-          "type": "long",
-          "logicalType": "timestamp-micros"
-        }
-      }
+      { "name": "after", "type": ["row", "null"] }
     ]
   }
 
 $ kafka-create-topic topic=data
 
 $ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
-{"d": 18135, "ts": 1566865029000000}
-{"d": 0, "ts": 65000000}
+{"before": null, "after": {"row":{"d": 18135, "ts": 1566865029000000}}}
+{"before": null, "after": {"row":{"d": 0, "ts": 65000000}}}
+
+$ kafka-ingest format=avro topic=data schema=${schema} timestamp=10
+{"before": null, "after": null}
 
 > CREATE SOURCE data FROM
   KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
-  FORMAT AVRO USING SCHEMA '${schema}'
+  FORMAT AVRO USING SCHEMA '${schema}' ENVELOPE DEBEZIUM
 
 > CREATE MATERIALIZED VIEW data_view as SELECT * from data
 

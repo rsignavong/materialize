@@ -14,15 +14,15 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
-use mz_dataflow_types::PeekResponseUnary;
-use mz_expr::GlobalId;
-use mz_ore::collections::CollectionExt;
-use mz_ore::thread::JoinOnDropHandle;
-use mz_repr::{Datum, Row, ScalarType};
-use mz_sql::ast::{Raw, Statement};
+use dataflow_types::PeekResponse;
+use expr::GlobalId;
+use ore::collections::CollectionExt;
+use ore::thread::JoinOnDropHandle;
+use repr::{Datum, Row};
+use sql::ast::{Raw, Statement};
 
 use crate::command::{
-    Canceled, Command, ExecuteResponse, Response, SimpleExecuteResponse, SimpleResult,
+    Cancelled, Command, ExecuteResponse, Response, SimpleExecuteResponse, SimpleResult,
     StartupResponse,
 };
 use crate::error::CoordError;
@@ -99,7 +99,7 @@ impl Client {
     pub async fn system_execute(&self, stmts: &str) -> Result<SimpleExecuteResponse, CoordError> {
         let conn_client = self.new_conn()?;
         let session = Session::new(conn_client.conn_id(), "mz_system".into());
-        let (mut session_client, _) = conn_client.startup(session, false).await?;
+        let (mut session_client, _) = conn_client.startup(session).await?;
         let res = session_client.simple_execute(stmts).await;
         session_client.terminate().await;
         res
@@ -123,7 +123,7 @@ impl Client {
 /// it is created, and frees that ID for potential reuse when it is dropped.
 ///
 /// See also [`Client`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConnClient {
     conn_id: u32,
     inner: Client,
@@ -146,26 +146,24 @@ impl ConnClient {
     pub async fn startup(
         self,
         session: Session,
-        create_user_if_not_exists: bool,
     ) -> Result<(SessionClient, StartupResponse), CoordError> {
         // Cancellation works by creating a watch channel (which remembers only
         // the last value sent to it) and sharing it between the coordinator and
-        // connection. The coordinator will send a canceled message on it if a
+        // connection. The coordinator will send a cancelled message on it if a
         // cancellation request comes. The connection will reset that on every message
         // it receives and then check for it where we want to add the ability to cancel
         // an in-progress statement.
-        let (cancel_tx, cancel_rx) = watch::channel(Canceled::NotCanceled);
+        let (cancel_tx, cancel_rx) = watch::channel(Cancelled::NotCancelled);
         let cancel_tx = Arc::new(cancel_tx);
         let mut client = SessionClient {
             inner: self,
             session: Some(session),
-            cancel_tx: Arc::clone(&cancel_tx),
+            cancel_tx: cancel_tx.clone(),
             cancel_rx,
         };
         let response = client
             .send(|tx, session| Command::Startup {
                 session,
-                create_user_if_not_exists,
                 cancel_tx,
                 tx,
             })
@@ -223,8 +221,8 @@ pub struct SessionClient {
     // Invariant: session may only be `None` during a method call. Every public
     // method must ensure that `Session` is `Some` before it returns.
     session: Option<Session>,
-    cancel_tx: Arc<watch::Sender<Canceled>>,
-    cancel_rx: watch::Receiver<Canceled>,
+    cancel_tx: Arc<watch::Sender<Cancelled>>,
+    cancel_rx: watch::Receiver<Cancelled>,
 }
 
 impl SessionClient {
@@ -233,7 +231,7 @@ impl SessionClient {
         async move {
             loop {
                 let _ = cancel_rx.changed().await;
-                if let Canceled::Canceled = *cancel_rx.borrow() {
+                if let Cancelled::Cancelled = *cancel_rx.borrow() {
                     return;
                 }
             }
@@ -243,10 +241,10 @@ impl SessionClient {
     pub fn reset_canceled(&mut self) {
         // Clear any cancellation message.
         // TODO(mjibson): This makes the use of .changed annoying since it will
-        // generally always have a NotCanceled message first that needs to be ignored,
+        // generally always have a NotCancelled message first that needs to be ignored,
         // and thus run in a loop. Figure out a way to have the future only resolve on
-        // a Canceled message.
-        let _ = self.cancel_tx.send(Canceled::NotCanceled);
+        // a Cancelled message.
+        let _ = self.cancel_tx.send(Cancelled::NotCancelled);
     }
 
     // Verify and return the named prepared statement. We need to verify each use
@@ -275,7 +273,7 @@ impl SessionClient {
         &mut self,
         name: String,
         stmt: Option<Statement<Raw>>,
-        param_types: Vec<Option<ScalarType>>,
+        param_types: Vec<Option<pgrepr::Type>>,
     ) -> Result<(), CoordError> {
         self.send(|tx, session| Command::Describe {
             name,
@@ -292,7 +290,7 @@ impl SessionClient {
         &mut self,
         name: String,
         stmt: Statement<Raw>,
-        param_types: Vec<Option<ScalarType>>,
+        param_types: Vec<Option<pgrepr::Type>>,
     ) -> Result<(), CoordError> {
         self.send(|tx, session| Command::Declare {
             name,
@@ -438,7 +436,7 @@ impl SessionClient {
             }
         }
 
-        let stmts = mz_sql::parse::parse(&stmts).map_err(|e| CoordError::Unstructured(e.into()))?;
+        let stmts = sql::parse::parse(&stmts).map_err(|e| CoordError::Unstructured(e.into()))?;
         self.start_transaction(None).await?;
         const EMPTY_PORTAL: &str = "";
         let mut results = vec![];
@@ -446,8 +444,7 @@ impl SessionClient {
             self.declare(EMPTY_PORTAL.into(), stmt, vec![]).await?;
             let desc = self
                 .session()
-                // We do not need to verify here because `self.execute` verifies below.
-                .get_portal_unverified(EMPTY_PORTAL)
+                .get_portal(EMPTY_PORTAL)
                 .map(|portal| portal.desc.clone())
                 .expect("unnamed portal should be present");
             if !desc.param_types.is_empty() {
@@ -464,16 +461,16 @@ impl SessionClient {
                 _ => return Err(CoordError::Unsupported("statements of the executed type")),
             };
             let rows = match rows {
-                PeekResponseUnary::Rows(rows) => rows,
-                PeekResponseUnary::Error(e) => coord_bail!("{}", e),
-                PeekResponseUnary::Canceled => coord_bail!("execution canceled"),
+                PeekResponse::Rows(rows) => rows,
+                PeekResponse::Error(e) => coord_bail!("{}", e),
+                PeekResponse::Canceled => coord_bail!("execution canceled"),
             };
             let mut sql_rows: Vec<Vec<serde_json::Value>> = vec![];
             let col_names = match desc.relation_desc {
                 Some(desc) => desc.iter_names().map(|name| name.to_string()).collect(),
                 None => vec![],
             };
-            let mut datum_vec = mz_repr::DatumVec::new();
+            let mut datum_vec = repr::DatumVec::new();
             for row in rows {
                 let datums = datum_vec.borrow_with(&row);
                 sql_rows.push(datums.iter().map(datum_to_json).collect());
@@ -498,15 +495,6 @@ impl SessionClient {
             .cmd_tx
             .send(Command::Terminate { session })
             .expect("coordinator unexpectedly gone");
-    }
-
-    // Like `terminate`, but permits the session to not be present, assuming it was
-    // terminated by the coordinator.
-    pub async fn terminate_allow_no_session(self) {
-        if self.session.is_none() {
-            return;
-        }
-        self.terminate().await
     }
 
     /// Returns a mutable reference to the session bound to this client.

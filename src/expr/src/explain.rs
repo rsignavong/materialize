@@ -28,8 +28,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::iter;
 
-use mz_ore::str::{bracketed, separated, StrExt};
-use mz_repr::RelationType;
+use ore::str::{bracketed, separated, StrExt};
+use repr::RelationType;
 
 use crate::{ExprHumanizer, Id, JoinImplementation, LocalId, MirRelationExpr};
 
@@ -114,6 +114,7 @@ impl<'a> ViewExplanation<'a> {
                 | TopK { input, .. }
                 | Negate { input, .. }
                 | Threshold { input, .. }
+                | DeclareKeys { input, .. }
                 | ArrangeBy { input, .. } => walk(input, explanation),
                 // For join and union, each input may need to go in its own
                 // chain.
@@ -232,6 +233,7 @@ impl<'a> ViewExplanation<'a> {
                         .unwrap_or_else(|| "?".to_owned()),
                     id,
                 )?,
+                Id::LocalBareSource => writeln!(f, "| Get Bare Source for This Source")?,
             },
             // Lets are annotated on the chain ID that they correspond to.
             Let { .. } => (),
@@ -318,6 +320,15 @@ impl<'a> ViewExplanation<'a> {
             }
             Negate { .. } => writeln!(f, "| Negate")?,
             Threshold { .. } => writeln!(f, "| Threshold")?,
+            DeclareKeys { input: _, keys } => writeln!(
+                f,
+                "| Declare primary keys {}",
+                separated(
+                    " ",
+                    keys.iter()
+                        .map(|key| bracketed("(", ")", separated(", ", key)))
+                )
+            )?,
             Union { base, inputs } => writeln!(
                 f,
                 "| Union %{} {}",
@@ -439,7 +450,7 @@ impl<'a> fmt::Display for Indices<'a> {
                 while slice.get(last) == Some(&(lead + last)) {
                     last += 1;
                 }
-                write!(f, "#{}..=#{}", lead, lead + last - 1)?;
+                write!(f, "#{}..#{}", lead, lead + last - 1)?;
                 slice = &slice[last..];
             } else {
                 write!(f, "#{}", slice[0])?;

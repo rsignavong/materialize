@@ -13,17 +13,16 @@ use byteorder::{NetworkEndian, WriteBytesExt};
 use chrono::Timelike;
 use itertools::Itertools;
 use lazy_static::lazy_static;
+use mz_avro::types::AvroMap;
+use repr::adt::jsonb::JsonbRef;
+use repr::adt::numeric::{self, NUMERIC_AGG_MAX_PRECISION, NUMERIC_DATUM_MAX_PRECISION};
+use repr::{ColumnName, ColumnType, Datum, RelationDesc, Row, ScalarType};
 use serde_json::json;
-
-use mz_avro::types::{AvroMap, DecimalValue, Value};
-use mz_avro::Schema;
-use mz_ore::cast::CastFrom;
-use mz_repr::adt::jsonb::JsonbRef;
-use mz_repr::adt::numeric::{self, NUMERIC_AGG_MAX_PRECISION, NUMERIC_DATUM_MAX_PRECISION};
-use mz_repr::{ColumnName, ColumnType, Datum, RelationDesc, Row, ScalarType};
 
 use crate::encode::{column_names_and_types, Encode, TypedDatum};
 use crate::json::build_row_schema_json;
+use mz_avro::types::{DecimalValue, Value};
+use mz_avro::Schema;
 
 lazy_static! {
     // TODO(rkhaitan): this schema intentionally omits the data_collections field
@@ -88,8 +87,8 @@ lazy_static! {
 ///   * Union schemas are only used to represent nullability. The first
 ///     variant is always the null variant, and the second and last variant
 ///     is the non-null variant.
-fn build_schema(columns: &[(ColumnName, ColumnType)], class_name: Option<&str>) -> Schema {
-    let row_schema = build_row_schema_json(&columns, class_name.unwrap_or("envelope"));
+fn build_schema(columns: &[(ColumnName, ColumnType)]) -> Schema {
+    let row_schema = build_row_schema_json(&columns, "envelope");
     Schema::parse(&row_schema).expect("valid schema constructed")
 }
 
@@ -131,8 +130,6 @@ pub struct AvroSchemaGenerator {
 
 impl AvroSchemaGenerator {
     pub fn new(
-        key_fullname: Option<&str>,
-        value_fullname: Option<&str>,
         key_desc: Option<RelationDesc>,
         value_desc: RelationDesc,
         include_transaction: bool,
@@ -162,10 +159,10 @@ impl AvroSchemaGenerator {
                 },
             ));
         }
-        let writer_schema = build_schema(&value_columns, value_fullname);
+        let writer_schema = build_schema(&value_columns);
         let key_info = key_desc.map(|key_desc| {
             let columns = column_names_and_types(key_desc);
-            let row_schema = build_row_schema_json(&columns, key_fullname.unwrap_or("row"));
+            let row_schema = build_row_schema_json(&columns, "row");
             KeyInfo {
                 schema: Schema::parse(&row_schema).expect("valid schema constructed"),
                 columns,
@@ -291,30 +288,25 @@ impl<'a> mz_avro::types::ToAvro for TypedDatum<'a> {
         } else {
             let mut val = match &typ.scalar_type {
                 ScalarType::Bool => Value::Boolean(datum.unwrap_bool()),
-                ScalarType::PgLegacyChar => {
-                    Value::Fixed(1, datum.unwrap_uint8().to_le_bytes().into())
-                }
                 ScalarType::Int16 => Value::Int(i32::from(datum.unwrap_int16())),
-                ScalarType::Int32 => Value::Int(datum.unwrap_int32()),
-                ScalarType::Oid
+                ScalarType::Int32
+                | ScalarType::Oid
                 | ScalarType::RegClass
                 | ScalarType::RegProc
-                | ScalarType::RegType => {
-                    Value::Fixed(4, datum.unwrap_uint32().to_le_bytes().into())
-                }
+                | ScalarType::RegType => Value::Int(datum.unwrap_int32()),
                 ScalarType::Int64 => Value::Long(datum.unwrap_int64()),
                 ScalarType::Float32 => Value::Float(datum.unwrap_float32()),
                 ScalarType::Float64 => Value::Double(datum.unwrap_float64()),
-                ScalarType::Numeric { max_scale } => {
+                ScalarType::Numeric { scale } => {
                     let mut d = datum.unwrap_numeric().0;
-                    let (unscaled, precision, scale) = match max_scale {
-                        Some(max_scale) => {
+                    let (unscaled, precision, scale) = match scale {
+                        Some(scale) => {
                             // Values must be rescaled to resaturate trailing zeroes
-                            numeric::rescale(&mut d, max_scale.into_u8()).unwrap();
+                            numeric::rescale(&mut d, *scale).unwrap();
                             (
                                 numeric::numeric_to_twos_complement_be(d).to_vec(),
                                 NUMERIC_DATUM_MAX_PRECISION,
-                                max_scale.into_u8(),
+                                usize::from(*scale),
                             )
                         }
                         // Decimals without specified scale must nonetheless be
@@ -329,8 +321,8 @@ impl<'a> mz_avro::types::ToAvro for TypedDatum<'a> {
                     };
                     Value::Decimal(DecimalValue {
                         unscaled,
-                        precision: usize::cast_from(precision),
-                        scale: usize::cast_from(scale),
+                        precision,
+                        scale,
                     })
                 }
                 ScalarType::Date => Value::Date(datum.unwrap_date()),
@@ -345,13 +337,12 @@ impl<'a> mz_avro::types::ToAvro for TypedDatum<'a> {
                 // client (https://issues.apache.org/jira/browse/AVRO-2123),
                 // so no one is likely to be using it, so we're just using
                 // our own very convenient format.
-                ScalarType::Interval => Value::Fixed(16, {
+                ScalarType::Interval => Value::Fixed(20, {
                     let iv = datum.unwrap_interval();
-                    let mut buf = Vec::with_capacity(16);
+                    let mut buf = Vec::with_capacity(24);
                     buf.extend(&iv.months.to_le_bytes());
-                    buf.extend(&iv.days.to_le_bytes());
-                    buf.extend(&iv.micros.to_le_bytes());
-                    debug_assert_eq!(buf.len(), 16);
+                    buf.extend(&iv.duration.to_le_bytes());
+                    debug_assert_eq!(buf.len(), 20);
                     buf
                 }),
                 ScalarType::Bytes => Value::Bytes(Vec::from(datum.unwrap_bytes())),
@@ -359,16 +350,14 @@ impl<'a> mz_avro::types::ToAvro for TypedDatum<'a> {
                     Value::String(datum.unwrap_str().to_owned())
                 }
                 ScalarType::Char { length } => {
-                    let s = mz_repr::adt::char::format_str_pad(datum.unwrap_str(), *length);
+                    let s = repr::adt::char::format_str_pad(datum.unwrap_str(), *length);
                     Value::String(s)
                 }
                 ScalarType::Jsonb => Value::Json(JsonbRef::from_datum(datum).to_serde_json()),
                 ScalarType::Uuid => Value::Uuid(datum.unwrap_uuid()),
-                ty @ (ScalarType::Array(..) | ScalarType::Int2Vector | ScalarType::List { .. }) => {
-                    let list = match ty {
-                        ScalarType::Array(_) | ScalarType::Int2Vector => {
-                            datum.unwrap_array().elements()
-                        }
+                ScalarType::Array(element_type) | ScalarType::List { element_type, .. } => {
+                    let list = match typ.scalar_type {
+                        ScalarType::Array(_) => datum.unwrap_array().elements(),
                         ScalarType::List { .. } => datum.unwrap_list(),
                         _ => unreachable!(),
                     };
@@ -380,7 +369,7 @@ impl<'a> mz_avro::types::ToAvro for TypedDatum<'a> {
                                 datum,
                                 ColumnType {
                                     nullable: true,
-                                    scalar_type: ty.unwrap_collection_element_type().clone(),
+                                    scalar_type: (**element_type).clone(),
                                 },
                             );
                             datum.avro()

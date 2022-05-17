@@ -17,11 +17,11 @@ fn datadriven() {
         f.run(|test_case| {
             let mut f = NamedTempFile::new().unwrap();
             f.write_all(test_case.input.as_bytes()).unwrap();
-            mz_walkabout::load(f.path())
+            walkabout::load(f.path())
                 .map(|ir| match test_case.directive.as_str() {
-                    "fold" => mz_walkabout::gen_fold(&ir),
-                    "visit" => mz_walkabout::gen_visit(&ir),
-                    "visit-mut" => mz_walkabout::gen_visit_mut(&ir),
+                    "fold" => walkabout::gen_fold(&ir),
+                    "visit" => walkabout::gen_visit(&ir),
+                    "visit-mut" => walkabout::gen_visit_mut(&ir),
                     other => panic!("unknown directive: {}", other),
                 })
                 .unwrap_or_else(|e| format!("error: {}\n", e))

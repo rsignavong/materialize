@@ -1,18 +1,17 @@
 [package]
-name = "mz-walkabout"
+name = "walkabout"
 description = "AST visitor generation."
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.59.0"
 publish = false
 
 [dependencies]
-anyhow = "1.0.56"
+anyhow = "1.0.52"
 fstrings = "0.2.3"
 itertools = "0.10.3"
-mz-ore = { path = "../ore", default-features = false }
-quote = "1.0.17"
-syn = { version = "1.0.90", features = ["extra-traits", "full", "parsing"] }
+ore = { path = "../ore", default-features = false }
+quote = "1.0.14"
+syn = { version = "1.0.83", features = ["extra-traits", "full", "parsing"] }
 
 [dev-dependencies]
 datadriven = "0.6.0"

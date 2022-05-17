@@ -175,17 +175,10 @@ query BBBBBBBBBBBBBBB
 ----
 true  false  false  true  false  false  NULL  true  NULL  NULL  NULL  NULL  NULL  NULL  NULL
 
-query error subquery has 0 columns available but 1 columns specified
-SELECT 1 < ALL(SELECT * FROM nullary)
-
-query error Expected subselect to return 1 column, got 0 columns
-SELECT (SELECT);
-----
-
-query
-SELECT * FROM (SELECT);
-----
-
+# TODO(benesch): this should yield a nullary result set, but presently
+# fails.
+# query error subquery has too few columns
+# SELECT 1 < ALL(SELECT * FROM nullary)
 
 query error subquery has 2 columns available but 1 columns specified
 SELECT 1 < ALL(SELECT 1, 2)
@@ -246,18 +239,11 @@ mode standard
 query T multiline
 EXPLAIN PLAN FOR SELECT * FROM t1 WHERE EXISTS (SELECT * FROM t2)
 ----
-Source materialize.public.t1 (u9):
-| Project (#0)
-
-Source materialize.public.t2 (u10):
-| Project ()
-
-Query:
 %0 =
-| Get materialize.public.t1 (u9)
+| Get materialize.public.t1 (u17)
 
 %1 =
-| Get materialize.public.t2 (u10)
+| Get materialize.public.t2 (u19)
 | Project ()
 | Distinct group=()
 | ArrangeBy ()
@@ -271,25 +257,15 @@ EOF
 query T multiline
 EXPLAIN PLAN FOR SELECT *  FROM t1, t3 WHERE t1.a = t3.a AND EXISTS (SELECT * FROM t2)
 ----
-Source materialize.public.t1 (u9):
-| Project (#0)
-
-Source materialize.public.t2 (u10):
-| Project ()
-
-Source materialize.public.t3 (u11):
-| Project (#0, #1)
-
-Query:
 %0 =
-| Get materialize.public.t1 (u9)
+| Get materialize.public.t1 (u17)
 | ArrangeBy (#0)
 
 %1 =
-| Get materialize.public.t3 (u11)
+| Get materialize.public.t3 (u21)
 
 %2 =
-| Get materialize.public.t2 (u10)
+| Get materialize.public.t2 (u19)
 | Project ()
 | Distinct group=()
 | ArrangeBy ()
@@ -304,25 +280,15 @@ EOF
 query T multiline
 EXPLAIN PLAN FOR SELECT *  FROM t1, t3 WHERE t1.a = t3.a AND EXISTS (SELECT * FROM t2 WHERE t3.b = t2.b)
 ----
-Source materialize.public.t1 (u9):
-| Project (#0)
-
-Source materialize.public.t2 (u10):
-| Project (#0)
-
-Source materialize.public.t3 (u11):
-| Project (#0, #1)
-
-Query:
 %0 =
-| Get materialize.public.t1 (u9)
+| Get materialize.public.t1 (u17)
 | ArrangeBy (#0)
 
 %1 =
-| Get materialize.public.t3 (u11)
+| Get materialize.public.t3 (u21)
 
 %2 =
-| Get materialize.public.t2 (u10)
+| Get materialize.public.t2 (u19)
 | Distinct group=(#0)
 | ArrangeBy (#0)
 
@@ -349,22 +315,13 @@ SELECT age, ascii_num * 2 as result FROM (
   )
 )
 ----
-Source materialize.public.likes (u3):
-| Filter !(isnull(#0))
-| Project (#0, #1)
-
-Source materialize.public.age (u5):
-| Filter !(isnull(#0))
-| Project (#0, #1)
-
-Query:
 %0 =
-| Get materialize.public.likes (u3)
+| Get materialize.public.likes (u5)
 | Filter !(isnull(#0))
 | ArrangeBy (#0)
 
 %1 =
-| Get materialize.public.age (u5)
+| Get materialize.public.age (u9)
 | Filter !(isnull(#0))
 
 %2 =
@@ -478,15 +435,8 @@ true
 query T multiline
 EXPLAIN PLAN FOR SELECT b IN (SELECT a FROM x) FROM y
 ----
-Source materialize.public.x (u13):
-| Project (#0)
-
-Source materialize.public.y (u14):
-| Project (#0)
-
-Query:
 %0 = Let l0 =
-| Get materialize.public.y (u14)
+| Get materialize.public.y (u27)
 | Distinct group=(#0)
 
 %1 =
@@ -494,7 +444,7 @@ Query:
 | ArrangeBy (#0)
 
 %2 =
-| Get materialize.public.x (u13)
+| Get materialize.public.x (u25)
 | Distinct group=(#0)
 | ArrangeBy (#0)
 
@@ -506,7 +456,7 @@ Query:
 | Project (#0)
 
 %4 =
-| Get materialize.public.y (u14)
+| Get materialize.public.y (u27)
 | ArrangeBy (#0)
 
 %5 =
@@ -534,15 +484,8 @@ EOF
 query T multiline
 EXPLAIN PLAN FOR SELECT b != ALL(SELECT a FROM x) FROM y
 ----
-Source materialize.public.x (u13):
-| Project (#0)
-
-Source materialize.public.y (u14):
-| Project (#0)
-
-Query:
 %0 = Let l0 =
-| Get materialize.public.y (u14)
+| Get materialize.public.y (u27)
 | Distinct group=(#0)
 
 %1 =
@@ -550,7 +493,7 @@ Query:
 | ArrangeBy (#0)
 
 %2 =
-| Get materialize.public.x (u13)
+| Get materialize.public.x (u25)
 | Distinct group=(#0)
 | ArrangeBy (#0)
 
@@ -562,7 +505,7 @@ Query:
 | Project (#0)
 
 %4 =
-| Get materialize.public.y (u14)
+| Get materialize.public.y (u27)
 | ArrangeBy (#0)
 
 %5 =
@@ -592,15 +535,8 @@ EOF
 query T multiline
 EXPLAIN PLAN FOR SELECT b > ALL(SELECT a FROM x) FROM y
 ----
-Source materialize.public.x (u13):
-| Project (#0)
-
-Source materialize.public.y (u14):
-| Project (#0)
-
-Query:
 %0 = Let l0 =
-| Get materialize.public.y (u14)
+| Get materialize.public.y (u27)
 | Distinct group=(#0)
 
 %1 =
@@ -608,7 +544,7 @@ Query:
 | ArrangeBy ()
 
 %2 =
-| Get materialize.public.x (u13)
+| Get materialize.public.x (u25)
 
 %3 = Let l1 =
 | Join %1 %2
@@ -618,7 +554,7 @@ Query:
 | Distinct group=(#0)
 
 %4 =
-| Get materialize.public.y (u14)
+| Get materialize.public.y (u27)
 | ArrangeBy (#0)
 
 %5 =
@@ -714,43 +650,3 @@ SELECT x FROM xs WHERE EXISTS (SELECT y FROM (SELECT 1 as y) WHERE x = y)
 ----
 1
 1
-
-# Regression test for #9921, in which the presence of a SELECT subquery inside
-# of another subexpression produced a degenerate join that was not elided before
-# join implementation planning.
-query I
-SELECT 1 FROM x RIGHT JOIN (SELECT 2 FROM y) ON  NULL
-WHERE a IN (9, 0)
-  OR 0  <  ALL (
-      SELECT agg1  NULL
-      FROM (SELECT MAX(3) agg1  FROM (SELECT  FROM x)
-      GROUP BY TRUE)
-  )
-  GROUP BY TRUE;
-----
-1
-
-query T multiline
-EXPLAIN SELECT 1 FROM x RIGHT JOIN (SELECT 2 FROM y) ON  NULL
-WHERE a IN (9, 0)
-  OR 0  <  ALL (
-      SELECT agg1  NULL
-      FROM (SELECT MAX(3) agg1  FROM (SELECT  FROM x)
-      GROUP BY TRUE)
-  )
-  GROUP BY TRUE;
-----
-Source materialize.public.x (u13):
-| Project ()
-
-Source materialize.public.y (u14):
-| Project ()
-
-Query:
-%0 =
-| Get materialize.public.y (u14)
-| Project ()
-| Distinct group=()
-| Map 1
-
-EOF

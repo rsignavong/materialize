@@ -10,7 +10,7 @@
 # Build a cross-compiling toolchain that targets the oldest version of Linux
 # that we support.
 
-FROM ubuntu:focal-20220316 AS crosstool
+FROM ubuntu:focal-20211006 AS crosstool
 ARG ARCH_GCC
 ARG ARCH_GO
 
@@ -59,7 +59,7 @@ RUN DEFCONFIG=crosstool-$ARCH_GCC.defconfig ct-ng defconfig \
 # Import the cross-compiling toolchain into a fresh image, omitting the
 # dependencies that we needed to actually build the toolchain.
 
-FROM ubuntu:focal-20220316
+FROM ubuntu:focal-20211006
 ARG ARCH_GCC
 ARG ARCH_GO
 
@@ -141,10 +141,7 @@ RUN mkdir rust \
     esac \
     && rm -rf rust \
     && cargo install --root /usr/local --version "=1.33.1" cargo-deb \
-    && cargo install --root /usr/local --version "=0.9.1" cargo-deny \
-    && cargo install --root /usr/local --version "=0.1.10" cargo2junit \
-    && cargo install --root /usr/local --version "=0.1.26" cargo-udeps  --features=vendored-openssl \
-    && cargo install --root /usr/local --version "=0.2.15" --no-default-features --features=s3,openssl/vendored sccache
+    && cargo install --root /usr/local --version "=0.9.1" cargo-deny
 
 # Link the system lld into the cross-compiling sysroot.
 
@@ -207,18 +204,12 @@ ENV RANLIB=$ARCH_GCC-unknown-linux-gnu-ranlib
 ENV CPP=$ARCH_GCC-unknown-linux-gnu-cpp
 ENV CC=$ARCH_GCC-unknown-linux-gnu-cc
 ENV CXX=$ARCH_GCC-unknown-linux-gnu-c++
-ENV CXXSTDLIB=static=stdc++
-ENV LDFLAGS="-fuse-ld=lld -static-libstdc++"
-ENV RUSTFLAGS="-Clink-arg=-Wl,--compress-debug-sections=zlib -Clink-arg=-fuse-ld=lld -L/opt/x-tools/$ARCH_GCC-unknown-linux-gnu/$ARCH_GCC-unknown-linux-gnu/sysroot/lib/"
-ENV TARGET_AR=$AR
+ENV LDFLAGS=-fuse-ld=lld
 ENV TARGET_CC=$CC
 ENV TARGET_CXX=$CXX
-ENV TARGET_CXXSTDLIB=static=stdc++
-ENV TARGET_RANLIB=$RANLIB
 ENV PATH=/opt/x-tools/$ARCH_GCC-unknown-linux-gnu/bin:$PATH
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-unknown-linux-gnu-cc
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-unknown-linux-gnu-cc
-ENV CARGO_TARGET_DIR=/mnt/build
 ENV CARGO_INCREMENTAL=0
 
 # Set a environment variable that tools can check to see if they're in the

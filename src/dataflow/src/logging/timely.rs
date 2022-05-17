@@ -14,21 +14,20 @@ use std::time::Duration;
 
 use differential_dataflow::collection::AsCollection;
 use differential_dataflow::operators::arrange::arrangement::Arrange;
-use mz_expr::{permutation_for_arrangement, MirScalarExpr};
 use timely::communication::Allocate;
 use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::operators::capture::EventLink;
 use timely::logging::{ParkEvent, TimelyEvent, WorkerIdentifier};
 
-use mz_dataflow_types::logging::LoggingConfig;
-use mz_dataflow_types::KeysValsHandle;
-use mz_dataflow_types::RowSpine;
-use mz_repr::{datum_list_size, datum_size, Datum, DatumVec, Diff, Row, Timestamp};
-
 use super::{LogVariant, TimelyLog};
-use crate::common::activator::RcActivator;
-use crate::common::replay::MzReplay;
+use crate::activator::RcActivator;
+use crate::arrangement::manager::RowSpine;
+use crate::arrangement::KeysValsHandle;
 use crate::logging::ConsolidateBuffer;
+use crate::replay::MzReplay;
+use dataflow_types::logging::LoggingConfig;
+use dataflow_types::plan::Permutation;
+use repr::{datum_list_size, datum_size, Datum, DatumVec, Row, Timestamp};
 
 /// Constructs the logging dataflow for timely logs.
 ///
@@ -45,7 +44,7 @@ pub fn construct<A: Allocate>(
     config: &LoggingConfig,
     linked: std::rc::Rc<EventLink<Timestamp, (Duration, WorkerIdentifier, TimelyEvent)>>,
     activator: RcActivator,
-) -> std::collections::HashMap<LogVariant, KeysValsHandle> {
+) -> std::collections::HashMap<LogVariant, (KeysValsHandle, Permutation)> {
     let granularity_ms = std::cmp::max(1, config.granularity_ns / 1_000_000) as Timestamp;
     let peers = worker.peers();
 
@@ -83,9 +82,9 @@ pub fn construct<A: Allocate>(
             let mut channels_data = HashMap::new();
             let mut parks_data = HashMap::new();
             let mut schedules_stash = HashMap::new();
-            let mut messages_sent_data: HashMap<_, Vec<Diff>> = HashMap::new();
-            let mut messages_received_data: HashMap<_, Vec<Diff>> = HashMap::new();
-            let mut schedules_data: HashMap<_, Vec<(isize, Diff)>> = HashMap::new();
+            let mut messages_sent_data: HashMap<_, Vec<isize>> = HashMap::new();
+            let mut messages_received_data: HashMap<_, Vec<isize>> = HashMap::new();
+            let mut schedules_data: HashMap<_, Vec<(isize, isize)>> = HashMap::new();
             move |_frontiers| {
                 let operates = operates_out.activate();
                 let channels = channels_out.activate();
@@ -173,11 +172,7 @@ pub fn construct<A: Allocate>(
                                             );
                                             schedules_histogram_session.give(
                                                 &cap,
-                                                (
-                                                    (event.id, worker, 1 << index),
-                                                    time_ms,
-                                                    Diff::try_from(-pow).unwrap(),
-                                                ),
+                                                ((event.id, worker, 1 << index), time_ms, -pow),
                                             );
                                         }
                                     }
@@ -270,24 +265,20 @@ pub fn construct<A: Allocate>(
                                     messages_sent_data
                                         .entry((event.channel, event.source))
                                         .or_insert_with(|| vec![0; peers])[event.target] +=
-                                        Diff::try_from(event.length).unwrap();
+                                        event.length as isize;
                                     let d = ((event.channel, event.source), event.target);
-                                    messages_sent_session.give(
-                                        &cap,
-                                        (d, time_ms, Diff::try_from(event.length).unwrap()),
-                                    );
+                                    messages_sent_session
+                                        .give(&cap, (d, time_ms, event.length as isize));
                                 } else {
                                     // Record messages received per channel and target
                                     // We can receive data from at most `peers` targets.
                                     messages_received_data
                                         .entry((event.channel, event.target))
                                         .or_insert_with(|| vec![0; peers])[event.source] +=
-                                        Diff::try_from(event.length).unwrap();
+                                        event.length as isize;
                                     let d = ((event.channel, event.target), event.source);
-                                    messages_received_session.give(
-                                        &cap,
-                                        (d, time_ms, Diff::try_from(event.length).unwrap()),
-                                    );
+                                    messages_received_session
+                                        .give(&cap, (d, time_ms, event.length as isize));
                                 }
                             }
                             TimelyEvent::Schedule(event) => {
@@ -315,15 +306,11 @@ pub fn construct<A: Allocate>(
                                             [elapsed_ns.next_power_of_two().trailing_zeros()
                                                 as usize];
                                         schedule_entry.0 += 1;
-                                        schedule_entry.1 += Diff::try_from(elapsed_ns).unwrap();
+                                        schedule_entry.1 += elapsed_ns as isize;
 
                                         schedules_duration_session.give(
                                             &cap,
-                                            (
-                                                (key.1, worker),
-                                                time_ms,
-                                                Diff::try_from(elapsed_ns).unwrap(),
-                                            ),
+                                            ((key.1, worker), time_ms, elapsed_ns as isize),
                                         );
                                         let d = (key.1, worker, elapsed_ns.next_power_of_two());
                                         schedules_histogram_session.give(&cap, (d, time_ms, 1));
@@ -470,29 +457,23 @@ pub fn construct<A: Allocate>(
         for (variant, collection) in logs {
             if config.active_logs.contains_key(&variant) {
                 let key = variant.index_by();
-                let (_, value) = permutation_for_arrangement::<HashMap<_, _>>(
-                    &key.iter()
-                        .cloned()
-                        .map(MirScalarExpr::Column)
-                        .collect::<Vec<_>>(),
-                    variant.desc().arity(),
-                );
+                let (permutation, value) =
+                    Permutation::construct_from_columns(&key, variant.desc().arity());
                 let trace = collection
                     .map({
-                        let mut row_buf = Row::default();
+                        let mut row_packer = Row::default();
                         let mut datums = DatumVec::new();
                         move |row| {
                             let datums = datums.borrow_with(&row);
-                            row_buf.packer().extend(key.iter().map(|k| datums[*k]));
-                            let row_key = row_buf.clone();
-                            row_buf.packer().extend(value.iter().map(|k| datums[*k]));
-                            let row_val = row_buf.clone();
-                            (row_key, row_val)
+                            row_packer.extend(key.iter().map(|k| datums[*k]));
+                            let row_key = row_packer.finish_and_reuse();
+                            row_packer.extend(value.iter().map(|k| datums[*k]));
+                            (row_key, row_packer.finish_and_reuse())
                         }
                     })
                     .arrange_named::<RowSpine<_, _, _, _>>(&format!("ArrangeByKey {:?}", variant))
                     .trace;
-                result.insert(variant, trace);
+                result.insert(variant, (trace, permutation));
             }
         }
         result
@@ -513,10 +494,9 @@ fn create_address_row(id: i64, worker: i64, address: &[usize]) -> Row {
         datum_size(&id_datum) + datum_size(&worker_datum) + datum_list_size(&address_datums);
 
     let mut address_row = Row::with_capacity(row_capacity);
-    let mut packer = address_row.packer();
-    packer.push(id_datum);
-    packer.push(worker_datum);
-    packer.push_list(address_datums);
+    address_row.push(id_datum);
+    address_row.push(worker_datum);
+    address_row.push_list(address_datums);
 
     address_row
 }

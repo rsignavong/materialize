@@ -23,7 +23,7 @@ pub mod util;
 
 #[test]
 fn test_persistence() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let data_dir = tempfile::tempdir()?;
     let config = util::Config::default().data_directory(data_dir.path());
@@ -49,8 +49,8 @@ fn test_persistence() -> Result<(), Box<dyn Error>> {
         client.batch_execute("CREATE VIEW d.s.v AS SELECT 1")?;
     }
 
-    for config in [config.clone(), config.logging_granularity(None)] {
-        let server = util::start_server(config)?;
+    {
+        let server = util::start_server(config.clone())?;
         let mut client = server.connect(postgres::NoTls)?;
         assert_eq!(
             client
@@ -94,6 +94,13 @@ fn test_persistence() -> Result<(), Box<dyn Error>> {
                 .collect::<Vec<String>>(),
             vec!["u1", "u2", "u3", "u4", "u5", "u6"]
         );
+    }
+
+    {
+        let config = config.logging_granularity(None);
+        if util::start_server(config).is_ok() {
+            panic!("server unexpectedly booted with corrupted catalog")
+        };
     }
 
     Ok(())
@@ -169,10 +176,7 @@ fn test_pid_file() -> Result<(), Box<dyn Error>> {
     match util::start_server(config.clone()) {
         Ok(_) => panic!("unexpected success"),
         Err(e) => {
-            if !e
-                .to_string()
-                .contains("running with the same data directory")
-            {
+            if !e.to_string().contains("process already running") {
                 return Err(e.into());
             }
         }
@@ -291,6 +295,27 @@ fn test_http_sql() -> Result<(), Box<dyn Error>> {
         assert_eq!(res.text()?, tc.body);
     }
 
+    Ok(())
+}
+
+#[test]
+fn test_metrics_registry_hygiene() -> Result<(), Box<dyn Error>> {
+    // Minor setup chores to ensure the server has done at least a little work:
+    let server = util::start_server(util::Config::default())?;
+    let source_file = NamedTempFile::new()?;
+    let mut client = server.connect(postgres::NoTls)?;
+    client.batch_execute(&format!(
+        "CREATE SOURCE src FROM FILE '{}' FORMAT BYTES",
+        source_file.path().display()
+    ))?;
+    client.batch_execute(
+        "CREATE MATERIALIZED VIEW mat (a, a_data, c, c_data) AS SELECT 'a', data, 'c' AS c, data FROM src",
+    )?;
+
+    // Check that metrics are where we expect them:
+    let default_metrics = prometheus::default_registry().gather();
+    assert_eq!(0, default_metrics.len());
+    assert_ne!(0, server.metrics_registry.gather().len());
     Ok(())
 }
 

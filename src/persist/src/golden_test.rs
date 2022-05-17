@@ -9,21 +9,19 @@
 
 use std::sync::Arc;
 
-use mz_ore::metrics::MetricsRegistry;
-use mz_ore::test::init_logging;
+use ore::metrics::MetricsRegistry;
+use ore::test::init_logging;
 use serde::{Deserialize, Serialize};
 use timely::progress::Antichain;
-use tokio::runtime::Runtime as AsyncRuntime;
-use tracing::{debug, error, info};
 
-use crate::client::RuntimeClient;
 use crate::error::{Error, ErrorLog};
-use crate::location::{Atomicity, Blob, BlobRead};
+use crate::indexed::runtime::{self, RuntimeClient, RuntimeConfig};
+use crate::indexed::Snapshot;
 use crate::mem::{MemBlob, MemRegistry};
 use crate::nemesis::direct::{Direct, StartRuntime};
 use crate::nemesis::generator::{Generator, GeneratorConfig};
 use crate::nemesis::{Input, Runtime, RuntimeWorker};
-use crate::runtime::{self, RuntimeConfig};
+use crate::storage::{Atomicity, Blob, BlobRead};
 use crate::unreliable::UnreliableBlob;
 
 /// A test to catch changes in any part of the end-to-end persist encoding.
@@ -127,17 +125,17 @@ fn golden() -> Result<(), Error> {
     let (current, raw_blobs) = current_state(&reqs)?;
     let golden = golden_state(DATAZ).map_err(|e| {
         for req in reqs.iter() {
-            debug!("req {:?}", req);
+            log::debug!("req {:?}", req);
         }
-        info!("current impl blob state: {}", raw_blobs);
+        log::info!("current impl blob state: {}", raw_blobs);
         e
     })?;
 
     if golden != current {
         for req in reqs {
-            debug!("req {:?}", req);
+            log::debug!("req {:?}", req);
         }
-        info!("current impl blob state: {}", raw_blobs);
+        log::info!("current impl blob state: {}", raw_blobs);
         assert_eq!(golden, current);
     }
 
@@ -145,18 +143,18 @@ fn golden() -> Result<(), Error> {
 }
 
 fn golden_state(blob_json: &str) -> Result<PersistState, Error> {
-    let async_runtime = Arc::new(AsyncRuntime::new()?);
+    let runtime = Arc::new(tokio::runtime::Runtime::new()?);
     let mut blob = MemBlob::new_no_reentrance("");
-    if let Err(err) = async_runtime.block_on(Blobs::deserialize_to(blob_json, &mut blob)) {
-        error!("error deserializing golden: {}", err);
+    if let Err(err) = runtime.block_on(Blobs::deserialize_to(blob_json, &mut blob)) {
+        log::error!("error deserializing golden: {}", err);
     }
     let mut persist = runtime::start(
         RuntimeConfig::for_tests(),
         ErrorLog,
         blob,
-        mz_build_info::DUMMY_BUILD_INFO,
+        build_info::DUMMY_BUILD_INFO,
         &MetricsRegistry::new(),
-        Some(async_runtime),
+        Some(runtime),
     )?;
     let state = PersistState::slurp_from(&persist)?;
     persist.stop()?;
@@ -178,14 +176,14 @@ fn current_state(reqs: &[Input]) -> Result<(PersistState, String), Error> {
                 RuntimeConfig::for_tests(),
                 ErrorLog,
                 blob,
-                mz_build_info::DUMMY_BUILD_INFO,
+                build_info::DUMMY_BUILD_INFO,
                 &MetricsRegistry::new(),
                 None,
             )
         }
     }
 
-    let async_runtime = Arc::new(AsyncRuntime::new()?);
+    let runtime = Arc::new(tokio::runtime::Runtime::new()?);
     let reg = MemRegistry::new();
     let start_fn = GoldenStartRuntime(reg.clone());
     let mut persist = Direct::new(start_fn)?;
@@ -198,7 +196,7 @@ fn current_state(reqs: &[Input]) -> Result<(PersistState, String), Error> {
 
     let mut blob = reg.blob_no_reentrance()?;
     let raw_blobs = Blobs::serialize_from(&blob)?;
-    async_runtime.block_on(blob.close())?;
+    runtime.block_on(blob.close())?;
     Ok((persist_state, raw_blobs))
 }
 
@@ -260,7 +258,7 @@ struct PersistStreamState {
     name: String,
     seal: Antichain<u64>,
     since: Antichain<u64>,
-    snap: Vec<((String, ()), u64, i64)>,
+    snap: Vec<((String, ()), u64, isize)>,
 }
 
 const DATAZ: &'static str = include_str!("golden_test.json");

@@ -24,9 +24,8 @@
   {{ adapter.drop_relation(target_relation) }}
 
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
-  {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
-  {% call statement('main') -%}
+  {% call statement('main', auto_begin=False) -%}
     -- Creates a materialized view, not a table, in Materialize
     {{ materialize__create_materialized_view_as(target_relation, sql) }}
   {%- endcall %}
@@ -34,7 +33,6 @@
   {% do persist_docs(target_relation, model) %}
 
   {{ run_hooks(post_hooks, inside_transaction=False) }}
-  {{ run_hooks(post_hooks, inside_transaction=True) }}
 
   {{ return({'relations': [target_relation]}) }}
 {% endmaterialization %}

@@ -17,25 +17,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 
-use mz_persist_types::Codec;
+use persist_types::Codec;
 
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
 use timely::dataflow::operators::CapabilitySet;
 use timely::dataflow::operators::Operator;
 use timely::dataflow::operators::{Branch, Concat, Map};
-use timely::dataflow::ProbeHandle;
 use timely::dataflow::{Scope, Stream};
 use timely::progress::Antichain;
-use timely::progress::Timestamp as TimelyTimestamp;
 use timely::Data as TimelyData;
-use timely::PartialOrder;
-use tracing::{error, trace};
 
-use crate::client::MultiWriteHandle;
-use crate::client::StreamWriteHandle;
 use crate::error::Error;
-use crate::location::SeqNo;
+use crate::indexed::runtime::StreamWriteHandle;
+use crate::storage::SeqNo;
 
 /// Extension trait for [`Stream`].
 pub trait Persist<G: Scope<Timestamp = u64>, K: TimelyData, V: TimelyData> {
@@ -46,8 +41,8 @@ pub trait Persist<G: Scope<Timestamp = u64>, K: TimelyData, V: TimelyData> {
     /// operator is holding on to capabilities as long as data belonging to their timestamp is not
     /// persisted.
     ///
-    /// Use this together with [`seal`](Seal::seal) and
-    /// [`await_frontier`](AwaitFrontier::await_frontier) if you want to make sure that data only
+    /// Use this together with [`seal`](Seal::seal)/[`conditional_seal`](Seal::conditional_seal)
+    /// and [`await_frontier`](AwaitFrontier::await_frontier) if you want to make sure that data only
     /// becomes available downstream when persisted and sealed.
     ///
     /// **Note:** If you need to also replay persisted data when restarting, concatenate the output
@@ -62,10 +57,13 @@ pub trait Persist<G: Scope<Timestamp = u64>, K: TimelyData, V: TimelyData> {
         &self,
         name: &str,
         write: StreamWriteHandle<K, V>,
-    ) -> (Stream<G, ((K, V), u64, i64)>, Stream<G, (String, u64, i64)>);
+    ) -> (
+        Stream<G, ((K, V), u64, isize)>,
+        Stream<G, (String, u64, isize)>,
+    );
 }
 
-impl<G, K, V> Persist<G, K, V> for Stream<G, ((K, V), u64, i64)>
+impl<G, K, V> Persist<G, K, V> for Stream<G, ((K, V), u64, isize)>
 where
     G: Scope<Timestamp = u64>,
     K: TimelyData + Codec,
@@ -75,7 +73,10 @@ where
         &self,
         name: &str,
         write: StreamWriteHandle<K, V>,
-    ) -> (Stream<G, ((K, V), u64, i64)>, Stream<G, (String, u64, i64)>) {
+    ) -> (
+        Stream<G, ((K, V), u64, isize)>,
+        Stream<G, (String, u64, isize)>,
+    ) {
         let scope = self.scope();
         let operator_name = format!("persist({})", name);
         let mut persist_op = OperatorBuilder::new(operator_name.clone(), self.scope());
@@ -110,7 +111,7 @@ where
                     // We are not using the capability for the main output later, but we are
                     // holding on to it to keep the frontier from advancing because that frontier
                     // is used downstream to track how far we have persisted. This is used, for
-                    // example, by seal() operators and await_frontier().
+                    // example, by seal()/conditional_seal() operators and await_frontier().
                     pending_futures.push_back((
                         cap.delayed(cap.time()),
                         cap.retain_for_output(error_output_port),
@@ -129,7 +130,7 @@ where
                         std::task::Poll::Ready(result) => {
                             match result {
                                 Ok(seq_no) => {
-                                    trace!(
+                                    log::trace!(
                                         "In {}, finished writing for time: {}, seq_no: {:?}",
                                         &operator_name,
                                         cap.time(),
@@ -144,7 +145,7 @@ where
                                         error_cap.time(),
                                         e
                                     );
-                                    error!("{}", error);
+                                    log::error!("{}", error);
 
                                     // TODO: make error retractable? Probably not...
                                     session.give((error, *error_cap.time(), 1));
@@ -169,41 +170,58 @@ where
 
 /// Extension trait for [`Stream`].
 pub trait Seal<G: Scope<Timestamp = u64>, D: TimelyData> {
-    /// Passes through each element of the stream and calls
-    /// [`seal_all`](MultiWriteHandle::seal_all) on the given [`MultiWriteHandle`] when the
-    /// combined input frontier advances advances. The combined input frontier is derived by
-    /// combining the frontier of the input with the optional [`ProbeHandles`](ProbeHandle).
+    /// Passes through each element of the stream and seals the given collection (the `write`
+    /// handle) when the input frontier advances.
     ///
     /// This does not wait for the seal to succeed before passing through the data. We do, however,
     /// wait for the seal to be successful before allowing the frontier to advance. In other words,
     /// this operator is holding on to capabilities as long as seals corresponding to their
     /// timestamp are not done.
-    fn seal(
+    fn seal<K, V>(&self, name: &str, write: StreamWriteHandle<K, V>) -> Stream<G, (D, u64, isize)>
+    where
+        K: Codec,
+        V: Codec;
+
+    /// Passes through each element of the stream and seals the given primary and condition
+    /// collections, respectively, when their frontier advances. The primary collection is only
+    /// sealed up to a time `t` when the condition collection has also been sealed up to `t`.
+    ///
+    /// This does not wait for the seals to succeed before passing through the data. We do,
+    /// however, wait for the seals to be successful before allowing the frontier to advance. In
+    /// other words, this operator is holding on to capabilities as long as seals corresponding to
+    /// their timestamp are not done.
+    fn conditional_seal<D2: TimelyData, K, V, K2, V2>(
         &self,
         name: &str,
-        additional_frontiers: Vec<ProbeHandle<u64>>,
-        write: MultiWriteHandle,
-    ) -> Stream<G, (D, u64, i64)>;
+        condition_input: &Stream<G, (D2, u64, isize)>,
+        primary_write: StreamWriteHandle<K, V>,
+        condition_write: StreamWriteHandle<K2, V2>,
+    ) -> Stream<G, (D, u64, isize)>
+    where
+        K: Codec,
+        V: Codec,
+        K2: TimelyData + Codec,
+        V2: TimelyData + Codec;
 }
 
-impl<G, D> Seal<G, D> for Stream<G, (D, u64, i64)>
+impl<G, D> Seal<G, D> for Stream<G, (D, u64, isize)>
 where
     G: Scope<Timestamp = u64>,
     D: TimelyData,
 {
-    fn seal(
-        &self,
-        name: &str,
-        additional_frontiers: Vec<ProbeHandle<u64>>,
-        write: MultiWriteHandle,
-    ) -> Stream<G, (D, u64, i64)> {
+    fn seal<K, V>(&self, name: &str, write: StreamWriteHandle<K, V>) -> Stream<G, (D, u64, isize)>
+    where
+        K: Codec,
+        V: Codec,
+    {
         let operator_name = format!("seal({})", name);
         let mut seal_op = OperatorBuilder::new(operator_name.clone(), self.scope());
 
         let mut data_input = seal_op.new_input(&self, Pipeline);
         let (mut data_output, data_output_stream) = seal_op.new_output();
         let mut data_buffer = Vec::new();
-        let mut input_frontier = Antichain::from_elem(<G::Timestamp as TimelyTimestamp>::minimum());
+        let mut input_frontier =
+            Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum());
         // We only seal from one worker because sealing from multiple workers could lead to a race
         // conditions where one worker seals up to time `t` while another worker is still trying to
         // write data with timestamps that are not beyond `t`.
@@ -216,18 +234,11 @@ where
         // workers, or to use a non-timely solution for keeping track of outstanding write
         // capabilities.
         let active_seal_operator = self.scope().index() == 0;
-
         // An activator that allows futures to re-schedule this operator when ready.
-        let sync_activator = Arc::new(
+        let activator = Arc::new(
             self.scope()
                 .sync_activator_for(&seal_op.operator_info().address[..]),
         );
-
-        // A cheaper (non-thread-safe) activator that we use to re-schedule ourselves in case the
-        // frontier as reported by the probe handles has not advanced as far as the input frontier.
-        let activator = self
-            .scope()
-            .activator_for(&seal_op.operator_info().address[..]);
 
         let mut pending_futures = VecDeque::new();
 
@@ -257,20 +268,6 @@ where
                 let mut new_input_frontier = Antichain::new();
                 new_input_frontier.extend(frontiers[0].frontier().into_iter().cloned());
 
-                for probe_frontier in additional_frontiers.iter() {
-                    probe_frontier.with_frontier(|frontier| {
-                        new_input_frontier.extend(frontier.iter().cloned())
-                    });
-                }
-
-                if PartialOrder::less_than(&new_input_frontier.borrow(), &frontiers[0].frontier()) {
-                    // Immediately schedule again, to see if the probe frontiers to catch up.
-                    activator.activate();
-                    // TODO: This is essentially as busy loop. We could use `activate_after()`, or
-                    // not use activate at all and rely on the fact that the frontiers usually
-                    // advance to the same times because they come from a common source.
-                }
-
                 // We seal for every element in the new frontier that represents progress compared
                 // to the old frontier. Alternatively, we could always seal to the current
                 // frontier, because sealing is idempotent or seal to the current frontier if there
@@ -282,13 +279,13 @@ where
                 // This way, we are prepared for a future of multi-dimensional frontiers, though.
                 for frontier_element in new_input_frontier.iter() {
                     if input_frontier.less_than(&frontier_element) {
-                        trace!(
+                        log::trace!(
                             "In {}, sealing collection up to {}...",
                             &operator_name,
                             frontier_element,
                         );
 
-                        let future = write.seal_all(*frontier_element);
+                        let future = write.seal(*frontier_element);
 
                         pending_futures.push_back(SealFuture {
                             time: *frontier_element,
@@ -300,13 +297,13 @@ where
                 // Swing through all pending futures and see if they're ready. Ready futures will
                 // invoke the Activator, which will make sure that we arrive here, even when there
                 // are no changes in the input frontier or new input.
-                let waker = futures_util::task::waker_ref(&sync_activator);
+                let waker = futures_util::task::waker_ref(&activator);
                 let mut context = Context::from_waker(&waker);
 
                 while let Some(mut pending_future) = pending_futures.pop_front() {
                     match Pin::new(&mut pending_future.future).poll(&mut context) {
                         std::task::Poll::Ready(Ok(_)) => {
-                            trace!(
+                            log::trace!(
                                 "In {}, finished sealing collection up to {}",
                                 &operator_name,
                                 pending_future.time,
@@ -316,15 +313,15 @@ where
                             cap_set.downgrade(Some(pending_future.time));
                         }
                         std::task::Poll::Ready(Err(e)) => {
-                            trace!(
+                            log::trace!(
                                 "Error sealing {} up to {}: {}",
                                 &operator_name,
                                 pending_future.time,
                                 e
                             );
 
-                            // Only retry this seal if there is no other pending seal at a time >=
-                            // this seal's time.
+                            // Only retry this seal if there is no other pending conditional
+                            // seal at a time >= this seal's time.
                             let retry = {
                                 let mut retry = true;
                                 let seal_ts = pending_future.time;
@@ -338,9 +335,9 @@ where
                             };
 
                             if retry {
-                                trace!("Adding seal to queue again: {}", pending_future.time);
+                                log::trace!("Adding seal to queue again: {}", pending_future.time);
 
-                                let future = write.seal_all(pending_future.time);
+                                let future = write.seal(pending_future.time);
                                 pending_futures.push_front(SealFuture {
                                     time: pending_future.time,
                                     future,
@@ -366,7 +363,7 @@ where
                 // all the capabilities so that downstream operators and eventually the worker can
                 // shut down. We also need to clear all pending futures to make sure we never
                 // attempt to downgrade any more capabilities.
-                if frontiers[0].is_empty() {
+                if input_frontier.is_empty() {
                     cap_set.downgrade(input_frontier.iter());
                     pending_futures.clear();
                 }
@@ -376,6 +373,29 @@ where
         });
 
         data_output_stream
+    }
+
+    fn conditional_seal<D2: TimelyData, K, V, K2, V2>(
+        &self,
+        name: &str,
+        condition_input: &Stream<G, (D2, u64, isize)>,
+        primary_write: StreamWriteHandle<K, V>,
+        condition_write: StreamWriteHandle<K2, V2>,
+    ) -> Stream<G, (D, u64, isize)>
+    where
+        K: Codec,
+        V: Codec,
+        K2: TimelyData + Codec,
+        V2: TimelyData + Codec,
+    {
+        let condition = condition_input.seal(&format!("condition_seal_{}", name), condition_write);
+
+        // Create a data dependency between `condition_ok` and `self`, so that
+        // the data in `self` is only sealed when `condition` has successfully
+        // sealed.
+        let condition = condition.flat_map(|_| None);
+        self.concat(&condition)
+            .seal(&format!("primary_seal_{}", name), primary_write)
     }
 }
 
@@ -394,16 +414,16 @@ pub trait AwaitFrontier<G: Scope<Timestamp = u64>, D> {
     /// the frontier to pass. The latter is an implementation detail of `delay()` that is not
     /// advertised in its documentation. We therefore have our own implementation that we control
     /// to be sure we don't break if `delay()` ever changes.
-    fn await_frontier(&self, name: &str) -> Stream<G, (D, u64, i64)>;
+    fn await_frontier(&self, name: &str) -> Stream<G, (D, u64, isize)>;
 }
 
-impl<G, D> AwaitFrontier<G, D> for Stream<G, (D, u64, i64)>
+impl<G, D> AwaitFrontier<G, D> for Stream<G, (D, u64, isize)>
 where
     G: Scope<Timestamp = u64>,
     D: TimelyData,
 {
     // Note: This is mostly a copy of the timely delay() operator without the delaying part.
-    fn await_frontier(&self, name: &str) -> Stream<G, (D, u64, i64)> {
+    fn await_frontier(&self, name: &str) -> Stream<G, (D, u64, isize)> {
         let operator_name = format!("await_frontier({})", name);
 
         // The values here are Vecs of Vecs. That's how the original timely code does it, to re-use
@@ -456,10 +476,13 @@ pub trait RetractUnsealed<G: Scope<Timestamp = u64>, K: TimelyData, V: TimelyDat
         name: &str,
         write: StreamWriteHandle<K, V>,
         upper_ts: u64,
-    ) -> (Stream<G, ((K, V), u64, i64)>, Stream<G, (String, u64, i64)>);
+    ) -> (
+        Stream<G, ((K, V), u64, isize)>,
+        Stream<G, (String, u64, isize)>,
+    );
 }
 
-impl<G, K, V> RetractUnsealed<G, K, V> for Stream<G, ((K, V), u64, i64)>
+impl<G, K, V> RetractUnsealed<G, K, V> for Stream<G, ((K, V), u64, isize)>
 where
     G: Scope<Timestamp = u64>,
     K: TimelyData + Codec + Debug,
@@ -470,7 +493,10 @@ where
         name: &str,
         write: StreamWriteHandle<K, V>,
         upper_ts: u64,
-    ) -> (Stream<G, ((K, V), u64, i64)>, Stream<G, (String, u64, i64)>) {
+    ) -> (
+        Stream<G, ((K, V), u64, isize)>,
+        Stream<G, (String, u64, isize)>,
+    ) {
         let (pass_through, to_retract) = self.branch(move |_, (_, t, _)| t >= &upper_ts);
 
         let (retract_oks, errs) = to_retract
@@ -507,10 +533,10 @@ mod tests {
     use timely::dataflow::operators::probe::Probe;
     use timely::dataflow::operators::Capture;
     use timely::Config;
-    use tokio::runtime::Runtime as AsyncRuntime;
+    use tokio::runtime::Runtime;
 
     use crate::error::Error;
-    use crate::indexed::ListenEvent;
+    use crate::indexed::{ListenEvent, SnapshotExt};
     use crate::mem::MemRegistry;
     use crate::unreliable::UnreliableHandle;
 
@@ -602,9 +628,8 @@ mod tests {
         timely::execute_directly(move |worker| {
             let (mut input, probe) = worker.dataflow(|scope| {
                 let (write, _read) = p.create_or_load::<(), ()>("1");
-                let write = MultiWriteHandle::new(&write);
                 let mut input = Handle::new();
-                let ok_stream = input.to_stream(scope).seal("test", vec![], write);
+                let ok_stream = input.to_stream(scope).seal("test", write);
                 let probe = ok_stream.probe();
                 (input, probe)
             });
@@ -624,7 +649,7 @@ mod tests {
 
     #[test]
     fn seal_frontier_advance_only_on_success() -> Result<(), Error> {
-        mz_ore::test::init_logging();
+        ore::test::init_logging();
         let mut registry = MemRegistry::new();
         let mut unreliable = UnreliableHandle::default();
         let p = registry.runtime_unreliable(unreliable.clone())?;
@@ -632,11 +657,10 @@ mod tests {
         timely::execute_directly(move |worker| {
             let (mut input, seal_probe) = worker.dataflow(|scope| {
                 let (write, _read) = p.create_or_load::<(), ()>("primary");
-                let write = MultiWriteHandle::new(&write);
                 let mut input = Handle::new();
                 let stream = input.to_stream(scope);
 
-                let sealed_stream = stream.seal("test", vec![], write);
+                let sealed_stream = stream.seal("test", write);
 
                 let seal_probe = sealed_stream.probe();
 
@@ -677,7 +701,7 @@ mod tests {
     /// incorrectly process any seal futures after the operator has been closed.
     #[test]
     fn regression_9419_seal_close() -> Result<(), Error> {
-        mz_ore::test::init_logging();
+        ore::test::init_logging();
         let mut registry = MemRegistry::new();
         let mut unreliable = UnreliableHandle::default();
         let p = registry.runtime_unreliable(unreliable.clone())?;
@@ -685,7 +709,6 @@ mod tests {
         timely::execute_directly(move |worker| {
             let (mut input, mut placeholder, probe) = worker.dataflow(|scope| {
                 let (write, _read) = p.create_or_load::<(), ()>("primary");
-                let write = MultiWriteHandle::new(&write);
                 let mut input = Handle::new();
                 let stream = input.to_stream(scope);
                 // We need to create a placeholder stream to force the dataflow to stay around
@@ -693,7 +716,7 @@ mod tests {
                 let mut placeholder = Handle::new();
                 let placeholder_stream = placeholder.to_stream(scope);
 
-                let sealed_stream = stream.seal("test", vec![], write);
+                let sealed_stream = stream.seal("test", write);
 
                 let stream = placeholder_stream.concat(&sealed_stream);
                 let probe = stream.probe();
@@ -734,17 +757,9 @@ mod tests {
         Ok(())
     }
 
-    // TODO: I could remove all the complicated channel logic, the multiple downgrades and
-    // interleaved stepping, because I don't think we can verify ordering.
-    //
-    // Verify that seal works correctly when sealing multiple streams and when using probe handles
-    // to further restrict the input frontier.
-    //
-    // NOTE: We know by construction of the MultiWriteHandle that we seal atomically, and we cannot
-    // realistically assert on the order we get from the channels.
     #[test]
-    fn seal_multiple_streams() -> Result<(), Error> {
-        mz_ore::test::init_logging();
+    fn conditional_seal() -> Result<(), Error> {
+        ore::test::init_logging();
         let mut registry = MemRegistry::new();
 
         let p = registry.runtime_no_reentrance()?;
@@ -767,9 +782,8 @@ mod tests {
         condition_read.listen(condition_listen_tx)?;
         let (listen_tx, listen_rx) = crossbeam_channel::unbounded();
 
-        let async_runtime = AsyncRuntime::new()?;
-        #[allow(clippy::disallowed_methods)]
-        let listener_handle = async_runtime.spawn(async move {
+        let runtime = Runtime::new()?;
+        let listener_handle = runtime.spawn(async move {
             let mut num_channels_closed = 0;
             loop {
                 crossbeam_channel::select! {
@@ -808,18 +822,17 @@ mod tests {
             let (mut primary_input, mut condition_input, seal_probe) = worker.dataflow(|scope| {
                 let (primary_write, _read) = p.create_or_load::<(), ()>("primary");
                 let (condition_write, _read) = p.create_or_load::<(), ()>("condition");
-                let mut primary_input: Handle<u64, ((), u64, i64)> = Handle::new();
+                let mut primary_input: Handle<u64, ((), u64, isize)> = Handle::new();
                 let mut condition_input = Handle::new();
                 let primary_stream = primary_input.to_stream(scope);
                 let condition_stream = condition_input.to_stream(scope);
 
-                let mut multi_write = MultiWriteHandle::new(&primary_write);
-                multi_write
-                    .add_stream(&condition_write)
-                    .expect("client known from same runtime");
-
-                let sealed_stream =
-                    primary_stream.seal("test", vec![condition_stream.probe()], multi_write);
+                let sealed_stream = primary_stream.conditional_seal(
+                    "test",
+                    &condition_stream,
+                    primary_write,
+                    condition_write,
+                );
 
                 let seal_probe = sealed_stream.probe();
 
@@ -858,26 +871,8 @@ mod tests {
             // probe here, because only the conditional input gets sealed. Ideally, we
             // would be able to insert a probe within the conditional_seal operator
             // itself but that's not possible at the moment.
-            for _ in 0..10 {
+            for _ in 1..10 {
                 worker.step();
-            }
-
-            // Hard shut down the dataflows. We have to do this because execute_directly
-            // will otherwise close the primary and condition inputs once this closure
-            // completes and then call step_or_park until no more dataflows remain.
-            //
-            // Unfortunately, this approach is a touch brittle for the conditional
-            // seal operator and the desired behavior of this test, as there is no
-            // guarantee that each operator will observe both inputs closing at
-            // the same time. In particular, the primary seal operator can observe
-            // that the primary input closed before the condition input, and
-            // inadvertently seal the primary to its frontier (4), even though
-            // the primary never advanced to 4.
-            //
-            // Sidestep this problem by directly closing the dataflow.
-            let dataflows = worker.installed_dataflows();
-            for dataflow in dataflows {
-                worker.drop_dataflow(dataflow);
             }
         });
 
@@ -889,69 +884,150 @@ mod tests {
         let actual_seals: Vec<_> = listen_rx.try_iter().collect();
 
         // Assert that:
-        //  a) We seal up, even when never receiving any data.
-        //  b) Seals happen in timestamp order.
-        //  c) If we seal any of the involved streams to `t` we must seal all streams to `t`.
+        //  a) We don't seal primary when condition has not sufficiently advanced.
+        //  b) Condition is sealed before primary for the same timestamp OR
+        //     primary and condition got swapped when reading from two channels and a
+        //     primary seal at t is just before the condition seal at a time t' >= t.
+        //  c) We seal up, even when never receiving any data.
+        //  d) Seals happen in timestamp order.
         //
         // We cannot assert a specific seal ordering because the order is not deterministic.
 
+        let mut current_condition_seal = 0;
+        let mut current_primary_seal = 0;
         let mut condition_seals = vec![];
         let mut primary_seals = vec![];
+        let mut seal_pairs = vec![];
 
-        let mut latest_condition_seal = 0;
-        let mut latest_primary_seal = 0;
+        // Chunk up the list of seals into overlapping pairs so we can easily find
+        // the next seal.
+        for i in 0..actual_seals.len() - 1 {
+            seal_pairs.push((actual_seals[i], Some(actual_seals[i + 1])));
+        }
 
-        for seal in actual_seals.iter() {
+        seal_pairs.push((actual_seals[actual_seals.len() - 1], None));
+
+        for (seal, optional_next) in seal_pairs {
             match seal {
-                Sealed::Primary(ts) => {
-                    primary_seals.push(*ts);
-                    assert!(*ts >= latest_primary_seal);
-                    latest_primary_seal = *ts;
-                    assert!(actual_seals.contains(&Sealed::Condition(*ts)));
-                }
                 Sealed::Condition(ts) => {
-                    condition_seals.push(*ts);
-                    assert!(*ts >= latest_condition_seal);
-                    latest_condition_seal = *ts;
-                    assert!(actual_seals.contains(&Sealed::Primary(*ts)));
+                    assert!(ts >= current_condition_seal);
+                    current_condition_seal = ts;
+                    condition_seals.push(ts);
+                }
+                Sealed::Primary(ts) => {
+                    assert!(ts >= current_primary_seal);
+                    if let Some(Sealed::Condition(next_condition_seal)) = optional_next {
+                        assert!(ts <= next_condition_seal);
+                    } else {
+                        assert!(ts <= current_condition_seal);
+                    };
+                    current_primary_seal = ts;
+                    primary_seals.push(ts);
                 }
             }
         }
 
         // Check that the seal values for each collection are exactly what
         // we expect.
-        assert_eq!(condition_seals, vec![1, 2, 3]);
+        assert_eq!(condition_seals, vec![1, 2, 3, 4]);
         assert_eq!(primary_seals, vec![1, 2, 3]);
 
         Ok(())
     }
 
-    // Test using multiple workers and ensure that `seal()` doesn't block the frontier for
-    // non-active seal operators.
+    #[test]
+    fn conditional_seal_frontier_advance_only_on_success() -> Result<(), Error> {
+        ore::test::init_logging();
+        let mut registry = MemRegistry::new();
+        let mut unreliable = UnreliableHandle::default();
+        let p = registry.runtime_unreliable(unreliable.clone())?;
+
+        timely::execute_directly(move |worker| {
+            let (mut primary_input, mut condition_input, seal_probe) = worker.dataflow(|scope| {
+                let (primary_write, _read) = p.create_or_load::<(), ()>("primary");
+                let (condition_write, _read) = p.create_or_load::<(), ()>("condition");
+                let mut primary_input: Handle<u64, ((), u64, isize)> = Handle::new();
+                let mut condition_input = Handle::new();
+                let primary_stream = primary_input.to_stream(scope);
+                let condition_stream = condition_input.to_stream(scope);
+
+                let sealed_stream = primary_stream.conditional_seal(
+                    "test",
+                    &condition_stream,
+                    primary_write,
+                    condition_write,
+                );
+
+                let seal_probe = sealed_stream.probe();
+
+                (primary_input, condition_input, seal_probe)
+            });
+
+            condition_input.send((((), ()), 0, 1));
+
+            primary_input.advance_to(1);
+            condition_input.advance_to(1);
+            while seal_probe.less_than(&1) {
+                worker.step();
+            }
+
+            unreliable.make_unavailable();
+
+            primary_input.advance_to(2);
+            condition_input.advance_to(2);
+
+            // This is the best we can do. Wait for a bit, and verify that the frontier didn't
+            // advance. Of course, we cannot rule out that the frontier might advance on the 11th
+            // step, but tests without the fix showed the test to be very unstable on this
+            for _i in 0..10 {
+                worker.step();
+            }
+            assert!(seal_probe.less_than(&2));
+
+            // After we make the runtime available again, sealing will work and the frontier will
+            // advance.
+            unreliable.make_available();
+            while seal_probe.less_than(&2) {
+                worker.step();
+            }
+        });
+
+        Ok(())
+    }
+
+    // Test using multiple workers and ensure that `conditional_seal()` doesn't block the
+    // frontier for non-active seal operators.
     //
     // A failure in this test would manifest as indefinite hanging of the test, we never see the
     // frontier advance as we expect to.
     #[test]
-    fn seal_multiple_workers() -> Result<(), Error> {
+    fn conditional_seal_multiple_workers() -> Result<(), Error> {
         let mut registry = MemRegistry::new();
         let p = registry.runtime_no_reentrance()?;
 
         let guards = timely::execute(Config::process(3), move |worker| {
-            let (mut input, seal_probe) = worker.dataflow(|scope| {
-                let (write, _read) = p.create_or_load::<(), ()>("primary");
-                let mut input: Handle<u64, ((), u64, i64)> = Handle::new();
-                let stream = input.to_stream(scope);
+            let (mut primary_input, mut condition_input, seal_probe) = worker.dataflow(|scope| {
+                let (primary_write, _read) = p.create_or_load::<(), ()>("primary");
+                let (condition_write, _read) = p.create_or_load::<(), ()>("condition");
+                let mut primary_input: Handle<u64, ((), u64, isize)> = Handle::new();
+                let mut condition_input: Handle<u64, ((), u64, isize)> = Handle::new();
+                let primary_stream = primary_input.to_stream(scope);
+                let condition_stream = condition_input.to_stream(scope);
 
-                let multi_write = MultiWriteHandle::new(&write);
-
-                let sealed_stream = stream.seal("test", vec![], multi_write);
+                let sealed_stream = primary_stream.conditional_seal(
+                    "test",
+                    &condition_stream,
+                    primary_write,
+                    condition_write,
+                );
 
                 let seal_probe = sealed_stream.probe();
 
-                (input, seal_probe)
+                (primary_input, condition_input, seal_probe)
             });
 
-            input.advance_to(42);
+            primary_input.advance_to(42);
+            condition_input.advance_to(42);
             while seal_probe.less_than(&42) {
                 worker.step();
             }
@@ -965,7 +1041,7 @@ mod tests {
 
     #[test]
     fn retract_unsealed() -> Result<(), Error> {
-        mz_ore::test::init_logging();
+        ore::test::init_logging();
         let mut registry = MemRegistry::new();
         let p = registry.runtime_no_reentrance()?;
 

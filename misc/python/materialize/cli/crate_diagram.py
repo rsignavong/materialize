@@ -20,6 +20,7 @@ materialize ecosystem.
 """
 
 import subprocess
+import sys
 import webbrowser
 from collections import defaultdict
 from pathlib import Path
@@ -29,7 +30,8 @@ from typing import IO, Any, DefaultDict, Dict, List, Optional, Set, Tuple
 import click
 import toml
 
-from materialize import ROOT, spawn
+from materialize import ROOT
+from materialize.spawn import runv
 
 DepBuilder = DefaultDict[str, List[str]]
 DepMap = Dict[str, List[str]]
@@ -113,12 +115,16 @@ def main(show: bool, diagram_file: Optional[str], roots: List[str]) -> None:
 
         cmd = ["dot", "-Tsvg", "-o", str(diagram_file), out.name]
         try:
-            spawn.runv(cmd)
-        except subprocess.CalledProcessError:
+            runv(cmd, capture_output=True)
+        except subprocess.CalledProcessError as e:
             out.seek(0)
             debug = "/tmp/debug.gv"
             with open(debug, "w") as fh:
                 fh.write(out.read())
+            if e.stderr:
+                print(e.stderr.decode("utf-8"), file=sys.stderr)
+            if e.stdout:
+                print(e.stdout.decode("utf-8"))
             print(f"ERROR running dot, source in {debug}")
         except FileNotFoundError as e:
             raise click.ClickException(

@@ -72,7 +72,7 @@ pub struct DatumVecBorrow<'outer> {
 
 impl<'outer> Drop for DatumVecBorrow<'outer> {
     fn drop(&mut self) {
-        *self.outer = mz_ore::vec::repurpose_allocation(std::mem::take(&mut self.inner));
+        *self.outer = ore::vec::repurpose_allocation(std::mem::take(&mut self.inner));
     }
 }
 
@@ -99,7 +99,9 @@ mod test {
 
         assert_eq!(d.borrow().len(), 0);
 
-        let r = Row::pack_slice(&[Datum::String("first"), Datum::Dummy]);
+        let mut r = Row::with_capacity(10);
+        r.push(Datum::String("first"));
+        r.push(Datum::Dummy);
 
         {
             let borrow = d.borrow_with(&r);
@@ -109,7 +111,8 @@ mod test {
 
         {
             // different lifetime, so that rust is happy with the reference lifetimes
-            let r2 = Row::pack_slice(&[Datum::String("second")]);
+            let mut r2 = Row::with_capacity(1);
+            r2.push(Datum::String("second"));
             let borrow = d.borrow_with_many(&[&r, &r2]);
             assert_eq!(borrow.len(), 3);
             assert_eq!(borrow[2], Datum::String("second"));

@@ -9,7 +9,7 @@
 
 ///! This module defines the API and logic for running optimization pipelines.
 use crate::plan::expr::HirRelationExpr;
-use crate::query_model::{Model, QGMError};
+use crate::query_model::Model;
 
 use super::StatementContext;
 
@@ -37,33 +37,22 @@ impl<'a> From<&StatementContext<'a>> for OptimizerConfig {
 }
 
 impl HirRelationExpr {
-    /// Perform optimizing algebraic rewrites on this [`HirRelationExpr`] and lower it to a [`mz_expr::MirRelationExpr`].
+    /// Perform optimizing algebraic rewrites on this [`HirRelationExpr`] and lower it to a [`expr::MirRelationExpr`].
     ///
     /// The optimization path is fully-determined by the values of the feature flag defined in the [`OptimizerConfig`].
-    pub fn optimize_and_lower(
-        self,
-        config: &OptimizerConfig,
-    ) -> Result<mz_expr::MirRelationExpr, QGMError> {
+    pub fn optimize_and_lower(self, config: &OptimizerConfig) -> expr::MirRelationExpr {
         if config.qgm_optimizations {
-            // try to go through the QGM path
-            self.try_qgm_path()
+            // create a query graph model from this HirRelationExpr
+            let model = Model::from(self);
+
+            // @todo: perform optimizing algebraic rewrites on the qgm
+            // ...
+
+            // decorrelate and lower the optimized query graph model into a MirRelationExpr
+            model.lower()
         } else {
             // directly decorrelate and lower into a MirRelationExpr
-            Ok(self.lower())
+            self.lower()
         }
-    }
-
-    /// Attempt an optimization path from HIR to MIR that goes through a QGM representation.
-    ///
-    /// Return `Result::Err` if the path is not possible.
-    fn try_qgm_path(self) -> Result<mz_expr::MirRelationExpr, QGMError> {
-        // create a query graph model from this HirRelationExpr
-        let mut model = Model::try_from(self)?;
-
-        // perform optimizing algebraic rewrites on the qgm
-        model.optimize();
-
-        // decorrelate and lower the optimized query graph model into a MirRelationExpr
-        model.try_into()
     }
 }

@@ -15,8 +15,8 @@
 //! harming planning.
 
 use crate::TransformArgs;
-use mz_expr::{Id, LocalId, MirRelationExpr, RECURSION_LIMIT};
-use mz_ore::stack::{CheckedRecursion, RecursionGuard};
+use expr::{Id, LocalId, MirRelationExpr, RECURSION_LIMIT};
+use ore::stack::{CheckedRecursion, RecursionGuard};
 
 /// Install replace certain `Get` operators with their `Let` value.
 #[derive(Debug)]
@@ -100,7 +100,7 @@ impl InlineLet {
                 )?;
 
                 let stripped_value = if self.inline_mfp {
-                    mz_expr::MapFilterProject::extract_non_errors_from_expr(&**value).1
+                    expr::MapFilterProject::extract_non_errors_from_expr(&**value).1
                 } else {
                     &**value
                 };

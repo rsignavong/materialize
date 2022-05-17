@@ -60,7 +60,7 @@ def cli() -> None:
 @OPT_AFFECT_REMOTE
 @click.argument(
     "level",
-    type=click.Choice(["major", "weekly", "patch", "rc"]),
+    type=click.Choice(["major", "feature", "weekly", "rc"]),
 )
 def new_rc(
     create_branch: Optional[str],
@@ -122,14 +122,14 @@ def incorporate_inner(
     new_version = tag.bump_patch().replace(prerelease="dev")
     if not create_branch and not checkout:
         if is_finish:
-            create_branch = f"continue-{new_version}"
+            create = f"continue-{new_version}"
         else:
-            create_branch = f"prepare-{new_version}"
+            create = f"prepare-{new_version}"
 
     release(
         new_version,
         checkout=checkout,
-        create_branch=create_branch,
+        create_branch=create,
         tag=False,
         affect_remote=affect_remote,
     )
@@ -208,24 +208,14 @@ def dashboard_links(start_time: str, env: str) -> None:
     template = (
         "https://grafana.i.mtrlz.dev/d/materialize-overview/materialize-overview-load-tests?"
         + "orgId=1&from={time_from}&to={time_to}&var-test={test}&var-purpose={purpose}"
-        + "&var-env={env}&var-git_ref={tag}"
+        + "&var-env={env}"
     )
     purpose = "load_test"
 
     tests = []
-    for test in (
-        "chbench",
-        "perf-kinesis",
-        "kafka-ingest-open-loop",
-        "kafka-ingest-open-loop-persist",
-    ):
+    for test in ("chbench", "perf-kinesis"):
         url = template.format(
-            time_from=time_from,
-            time_to=time_to,
-            test=test,
-            purpose=purpose,
-            env=env,
-            tag=tag,
+            time_from=time_from, time_to=time_to, test=test, purpose=purpose, env=env
         )
         tests.append((test, url))
 
@@ -269,8 +259,7 @@ def release(
     if create_branch is not None:
         git.create_branch(create_branch)
 
-    if not version.prerelease:
-        confirm_on_latest_rc(affect_remote)
+    confirm_on_latest_rc(affect_remote)
 
     change_line(BIN_CARGO_TOML, "version", f'version = "{version}"')
     change_line(
@@ -514,6 +503,7 @@ def list_prs(recent_ref: Optional[str], ancestor_ref: Optional[str]) -> None:
             commit_range,
             "--",
         ],
+        unicode=True,
     )
 
     pattern = re.compile(r"^\s*\(refs/pullreqs/(\d+)|\(#(\d+)")

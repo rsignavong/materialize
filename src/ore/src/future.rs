@@ -26,19 +26,12 @@ use std::task::{Context, Poll};
 
 use futures::sink::Sink;
 
-use crate::task;
-
 /// Extension methods for futures.
 pub trait OreFutureExt {
     /// Wraps a future in a [`SpawnIfCanceled`] future, which will spawn a
     /// task to poll the inner future to completion if it is dropped.
-    fn spawn_if_canceled<Name, NameClosure>(
-        self,
-        nc: NameClosure,
-    ) -> SpawnIfCanceled<Self::Output, Name, NameClosure>
+    fn spawn_if_canceled(self) -> SpawnIfCanceled<Self::Output>
     where
-        Name: AsRef<str>,
-        NameClosure: FnOnce() -> Name + Unpin,
         Self: Future + Send + 'static,
         Self::Output: Send + 'static;
 }
@@ -47,38 +40,27 @@ impl<T> OreFutureExt for T
 where
     T: Future,
 {
-    fn spawn_if_canceled<Name, NameClosure>(
-        self,
-        nc: NameClosure,
-    ) -> SpawnIfCanceled<T::Output, Name, NameClosure>
+    fn spawn_if_canceled(self) -> SpawnIfCanceled<T::Output>
     where
-        Name: AsRef<str>,
-        NameClosure: FnOnce() -> Name + Unpin,
         T: Send + 'static,
         T::Output: Send + 'static,
     {
         SpawnIfCanceled {
             inner: Some(Box::pin(self)),
-            nc: Some(nc),
         }
     }
 }
 
 /// The future returned by [`OreFutureExt::spawn_if_canceled`].
-pub struct SpawnIfCanceled<T, Name, NameClosure>
+pub struct SpawnIfCanceled<T>
 where
-    Name: AsRef<str>,
-    NameClosure: FnOnce() -> Name + Unpin,
     T: Send + 'static,
 {
     inner: Option<Pin<Box<dyn Future<Output = T> + Send>>>,
-    nc: Option<NameClosure>,
 }
 
-impl<T, Name, NameClosure> Future for SpawnIfCanceled<T, Name, NameClosure>
+impl<T> Future for SpawnIfCanceled<T>
 where
-    Name: AsRef<str>,
-    NameClosure: FnOnce() -> Name + Unpin,
     T: Send + 'static,
 {
     type Output = T;
@@ -97,26 +79,19 @@ where
     }
 }
 
-impl<T, Name, NameClosure> Drop for SpawnIfCanceled<T, Name, NameClosure>
+impl<T> Drop for SpawnIfCanceled<T>
 where
-    Name: AsRef<str>,
-    NameClosure: FnOnce() -> Name + Unpin,
     T: Send + 'static,
 {
     fn drop(&mut self) {
         if let Some(f) = self.inner.take() {
-            task::spawn(
-                || format!("spawn_if_canceled:{}", (self.nc).take().unwrap()().as_ref()),
-                f,
-            );
+            tokio::spawn(f);
         }
     }
 }
 
-impl<T, Name, NameClosure> fmt::Debug for SpawnIfCanceled<T, Name, NameClosure>
+impl<T> fmt::Debug for SpawnIfCanceled<T>
 where
-    Name: AsRef<str>,
-    NameClosure: FnOnce() -> Name + Unpin,
     T: Send + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

@@ -15,15 +15,14 @@
 use anyhow::bail;
 use uncased::UncasedStr;
 
-use mz_repr::adt::interval::Interval;
-use mz_repr::{RelationDesc, ScalarType};
+use repr::adt::interval::Interval;
+use repr::{RelationDesc, ScalarType};
 
 use crate::ast::{
     CloseStatement, DeallocateStatement, DeclareStatement, DiscardStatement, DiscardTarget,
     ExecuteStatement, FetchStatement, PrepareStatement, Raw, SetVariableStatement,
     SetVariableValue, ShowVariableStatement, Value,
 };
-use crate::names::Aug;
 use crate::plan::statement::{StatementContext, StatementDesc};
 use crate::plan::{
     describe, query, ClosePlan, DeallocatePlan, DeclarePlan, ExecutePlan, ExecuteTimeout,
@@ -32,7 +31,7 @@ use crate::plan::{
 
 pub fn describe_set_variable(
     _: &StatementContext,
-    _: &SetVariableStatement,
+    _: SetVariableStatement,
 ) -> Result<StatementDesc, anyhow::Error> {
     Ok(StatementDesc::new(None))
 }
@@ -58,7 +57,7 @@ pub fn plan_set_variable(
 
 pub fn describe_show_variable(
     _: &StatementContext,
-    ShowVariableStatement { variable, .. }: &ShowVariableStatement,
+    ShowVariableStatement { variable, .. }: ShowVariableStatement,
 ) -> Result<StatementDesc, anyhow::Error> {
     let desc = if variable.as_str() == UncasedStr::new("ALL") {
         RelationDesc::empty()
@@ -86,7 +85,7 @@ pub fn plan_show_variable(
 
 pub fn describe_discard(
     _: &StatementContext,
-    _: &DiscardStatement,
+    _: DiscardStatement,
 ) -> Result<StatementDesc, anyhow::Error> {
     Ok(StatementDesc::new(None))
 }
@@ -105,7 +104,7 @@ pub fn plan_discard(
 
 pub fn describe_declare(
     _: &StatementContext,
-    _: &DeclareStatement<Raw>,
+    _: DeclareStatement<Raw>,
 ) -> Result<StatementDesc, anyhow::Error> {
     Ok(StatementDesc::new(None))
 }
@@ -128,7 +127,7 @@ with_options! {
 
 pub fn describe_fetch(
     _: &StatementContext,
-    _: &FetchStatement,
+    _: FetchStatement,
 ) -> Result<StatementDesc, anyhow::Error> {
     Ok(StatementDesc::new(None))
 }
@@ -148,7 +147,7 @@ pub fn plan_fetch(
             // bumped. If we do bump it, ensure that the new upper limit is within the
             // bounds of a tokio time future, otherwise it'll panic.
             const SECS_PER_DAY: f64 = 60f64 * 60f64 * 24f64;
-            let timeout_secs = timeout.as_epoch_seconds::<f64>();
+            let timeout_secs = timeout.as_seconds();
             if !timeout_secs.is_finite() || timeout_secs < 0f64 || timeout_secs > SECS_PER_DAY {
                 bail!("timeout out of range: {:#}", timeout);
             }
@@ -166,7 +165,7 @@ pub fn plan_fetch(
 
 pub fn describe_close(
     _: &StatementContext,
-    _: &CloseStatement,
+    _: CloseStatement,
 ) -> Result<StatementDesc, anyhow::Error> {
     Ok(StatementDesc::new(None))
 }
@@ -182,7 +181,7 @@ pub fn plan_close(
 
 pub fn describe_prepare(
     _: &StatementContext,
-    _: &PrepareStatement<Raw>,
+    _: PrepareStatement<Raw>,
 ) -> Result<StatementDesc, anyhow::Error> {
     Ok(StatementDesc::new(None))
 }
@@ -203,7 +202,7 @@ pub fn plan_prepare(
 
 pub fn describe_execute(
     scx: &StatementContext,
-    stmt: ExecuteStatement<Aug>,
+    stmt: ExecuteStatement<Raw>,
 ) -> Result<StatementDesc, anyhow::Error> {
     // The evaluation of the statement doesn't happen until it gets to coord. That
     // means if the statement is now invalid due to an object having been dropped,
@@ -215,14 +214,14 @@ pub fn describe_execute(
 
 pub fn plan_execute(
     scx: &StatementContext,
-    stmt: ExecuteStatement<Aug>,
+    stmt: ExecuteStatement<Raw>,
 ) -> Result<Plan, anyhow::Error> {
     Ok(plan_execute_desc(scx, stmt)?.1)
 }
 
 fn plan_execute_desc<'a>(
     scx: &'a StatementContext,
-    ExecuteStatement { name, params }: ExecuteStatement<Aug>,
+    ExecuteStatement { name, params }: ExecuteStatement<Raw>,
 ) -> Result<(&'a StatementDesc, Plan), anyhow::Error> {
     let name = name.to_string();
     let desc = match scx.catalog.get_prepared_statement_desc(&name) {
@@ -241,7 +240,7 @@ fn plan_execute_desc<'a>(
 
 pub fn describe_deallocate(
     _: &StatementContext,
-    _: &DeallocateStatement,
+    _: DeallocateStatement,
 ) -> Result<StatementDesc, anyhow::Error> {
     Ok(StatementDesc::new(None))
 }

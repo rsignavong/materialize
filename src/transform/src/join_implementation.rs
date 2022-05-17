@@ -18,11 +18,11 @@
 
 use std::collections::HashMap;
 
-use mz_expr::{JoinInputMapper, MapFilterProject, MirRelationExpr, MirScalarExpr, RECURSION_LIMIT};
-use mz_ore::stack::{CheckedRecursion, RecursionGuard};
-
-use self::index_map::IndexMap;
 use crate::TransformArgs;
+use expr::{
+    Id, JoinInputMapper, MapFilterProject, MirRelationExpr, MirScalarExpr, RECURSION_LIMIT,
+};
+use ore::stack::{CheckedRecursion, RecursionGuard};
 
 /// Determines the join implementation for join operators.
 #[derive(Debug)]
@@ -52,7 +52,12 @@ impl crate::Transform for JoinImplementation {
         relation: &mut MirRelationExpr,
         args: TransformArgs,
     ) -> Result<(), crate::TransformError> {
-        self.action_recursive(relation, &mut IndexMap::new(args.indexes))
+        let mut arranged = HashMap::new();
+        for (on_id, idxs) in args.indexes {
+            let keys = idxs.iter().map(|(_id, keys)| keys.clone()).collect();
+            arranged.insert(Id::Global(*on_id), keys);
+        }
+        self.action_recursive(relation, &mut arranged)
     }
 }
 
@@ -64,36 +69,38 @@ impl JoinImplementation {
     pub fn action_recursive(
         &self,
         relation: &mut MirRelationExpr,
-        indexes: &mut IndexMap,
+        arranged: &mut HashMap<Id, Vec<Vec<MirScalarExpr>>>,
     ) -> Result<(), crate::TransformError> {
         if let MirRelationExpr::Let { id, value, body } = relation {
-            self.action_recursive(value, indexes)?;
+            self.action_recursive(value, arranged)?;
             match &**value {
                 MirRelationExpr::ArrangeBy { keys, .. } => {
-                    for key in keys {
-                        indexes.add_local(*id, key.clone());
-                    }
+                    arranged.insert(Id::Local(*id), keys.clone());
                 }
                 MirRelationExpr::Reduce { group_key, .. } => {
-                    indexes.add_local(
-                        *id,
-                        (0..group_key.len()).map(MirScalarExpr::Column).collect(),
+                    arranged.insert(
+                        Id::Local(*id),
+                        vec![(0..group_key.len()).map(MirScalarExpr::Column).collect()],
                     );
                 }
                 _ => {}
             }
-            self.action_recursive(body, indexes)?;
-            indexes.remove_local(*id);
+            self.action_recursive(body, arranged)?;
+            arranged.remove(&Id::Local(*id));
             Ok(())
         } else {
-            relation.try_visit_mut_children(|e| self.action_recursive(e, indexes))?;
-            self.action(relation, indexes);
+            relation.try_visit_mut_children(|e| self.action_recursive(e, arranged))?;
+            self.action(relation, arranged);
             Ok(())
         }
     }
 
     /// Determines the join implementation for join operators.
-    pub fn action(&self, relation: &mut MirRelationExpr, indexes: &IndexMap) {
+    pub fn action(
+        &self,
+        relation: &mut MirRelationExpr,
+        indexes: &HashMap<Id, Vec<Vec<MirScalarExpr>>>,
+    ) {
         if let MirRelationExpr::Join {
             inputs,
             equivalences,
@@ -103,7 +110,7 @@ impl JoinImplementation {
             let input_types = inputs.iter().map(|i| i.typ()).collect::<Vec<_>>();
 
             // Canonicalize the equivalence classes
-            mz_expr::canonicalize::canonicalize_equivalences(equivalences, &input_types);
+            expr::canonicalize::canonicalize_equivalences(equivalences, &input_types);
 
             // Common information of broad utility.
             let input_mapper = JoinInputMapper::new_from_input_types(&input_types);
@@ -127,15 +134,17 @@ impl JoinImplementation {
                 // Get and ArrangeBy expressions contribute arrangements.
                 match input {
                     MirRelationExpr::Get { id, typ: _ } => {
-                        available_arrangements[index]
-                            .extend(indexes.get(*id).map(|key| key.to_vec()));
+                        if let Some(keys) = indexes.get(id) {
+                            available_arrangements[index].extend(keys.clone());
+                        }
                     }
                     MirRelationExpr::ArrangeBy { input, keys } => {
                         // We may use any presented arrangement keys.
                         available_arrangements[index].extend(keys.clone());
                         if let MirRelationExpr::Get { id, typ: _ } = &**input {
-                            available_arrangements[index]
-                                .extend(indexes.get(*id).map(|key| key.to_vec()));
+                            if let Some(keys) = indexes.get(id) {
+                                available_arrangements[index].extend(keys.clone());
+                            }
                         }
                     }
                     MirRelationExpr::Reduce { group_key, .. } => {
@@ -203,60 +212,9 @@ impl JoinImplementation {
     }
 }
 
-mod index_map {
-    use std::collections::HashMap;
-
-    use mz_expr::{Id, LocalId, MirScalarExpr};
-
-    use crate::IndexOracle;
-
-    /// Keeps track of local and global indexes available while descending
-    /// a `MirRelationExpr`.
-    #[derive(Debug)]
-    pub struct IndexMap<'a> {
-        local: HashMap<LocalId, Vec<Vec<MirScalarExpr>>>,
-        global: &'a dyn IndexOracle,
-    }
-
-    impl IndexMap<'_> {
-        /// Creates a new index map with knowledge of the provided global
-        /// indexes.
-        pub fn new(global: &dyn IndexOracle) -> IndexMap {
-            IndexMap {
-                local: HashMap::new(),
-                global,
-            }
-        }
-
-        /// Adds a local index on the specified collection with the specified
-        /// key.
-        pub fn add_local(&mut self, id: LocalId, key: Vec<MirScalarExpr>) {
-            self.local.entry(id).or_default().push(key)
-        }
-
-        /// Removes all local indexes on the specified collection.
-        pub fn remove_local(&mut self, id: LocalId) {
-            self.local.remove(&id);
-        }
-
-        pub fn get(&self, id: Id) -> Box<dyn Iterator<Item = &[MirScalarExpr]> + '_> {
-            match id {
-                Id::Global(id) => self.global.indexes_on(id),
-                Id::Local(id) => Box::new(
-                    self.local
-                        .get(&id)
-                        .into_iter()
-                        .flatten()
-                        .map(|x| x.as_slice()),
-                ),
-            }
-        }
-    }
-}
-
 mod delta_queries {
 
-    use mz_expr::{JoinImplementation, JoinInputMapper, MirRelationExpr, MirScalarExpr};
+    use expr::{JoinImplementation, JoinInputMapper, MirRelationExpr, MirScalarExpr};
 
     /// Creates a delta query plan, and any predicates that need to be lifted.
     ///
@@ -326,7 +284,7 @@ mod delta_queries {
 
 mod differential {
 
-    use mz_expr::{JoinImplementation, JoinInputMapper, MirRelationExpr, MirScalarExpr};
+    use expr::{JoinImplementation, JoinInputMapper, MirRelationExpr, MirScalarExpr};
 
     /// Creates a linear differential plan, and any predicates that need to be lifted.
     pub fn plan(

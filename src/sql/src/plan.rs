@@ -26,28 +26,23 @@
 // `plan_root_query` and fanning out based on the contents of the `SELECT`
 // statement.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use enum_kinds::EnumKind;
 use serde::{Deserialize, Serialize};
 
-use mz_dataflow_types::client::ComputeInstanceId;
-use mz_dataflow_types::sinks::{SinkConnectorBuilder, SinkEnvelope};
-use mz_dataflow_types::sources::SourceConnector;
-use mz_expr::{GlobalId, MirRelationExpr, MirScalarExpr, RowSetFinishing};
-use mz_ore::now::{self, NOW_ZERO};
-use mz_repr::{ColumnName, Diff, RelationDesc, Row, ScalarType};
+use ::expr::{GlobalId, RowSetFinishing};
+use dataflow_types::{SinkConnectorBuilder, SinkEnvelope, SourceConnector};
+use ore::now::{self, NOW_ZERO};
+use repr::{ColumnName, Diff, RelationDesc, Row, ScalarType, Timestamp};
 
 use crate::ast::{
-    ExplainOptions, ExplainStage, Expr, FetchDirection, NoticeSeverity, ObjectType, Raw, Statement,
+    ExplainOptions, ExplainStage, Expr, FetchDirection, ObjectType, Raw, Statement,
     TransactionAccessMode,
 };
-use crate::catalog::{CatalogType, IdReference};
-use crate::names::{
-    Aug, DatabaseId, FullObjectName, QualifiedObjectName, ResolvedDatabaseSpecifier, SchemaId,
-};
+use crate::names::{DatabaseSpecifier, FullName, SchemaName};
 
 pub(crate) mod error;
 pub(crate) mod explain;
@@ -66,7 +61,11 @@ pub use self::expr::{HirRelationExpr, HirScalarExpr};
 pub use error::PlanError;
 pub use explain::Explanation;
 pub use optimize::OptimizerConfig;
-pub use query::{QueryContext, QueryLifetime};
+// This is used by sqllogictest to turn SQL values into `Datum`s.
+pub use query::{
+    plan_default_expr, resolve_names, resolve_names_data_type, resolve_names_stmt,
+    scalar_type_from_sql, Aug, QueryContext, QueryLifetime,
+};
 pub use statement::{describe, plan, plan_copy_from, StatementContext, StatementDesc};
 
 /// Instructions for executing a SQL query.
@@ -75,9 +74,7 @@ pub enum Plan {
     CreateDatabase(CreateDatabasePlan),
     CreateSchema(CreateSchemaPlan),
     CreateRole(CreateRolePlan),
-    CreateComputeInstance(CreateComputeInstancePlan),
     CreateSource(CreateSourcePlan),
-    CreateSecret(CreateSecretPlan),
     CreateSink(CreateSinkPlan),
     CreateTable(CreateTablePlan),
     CreateView(CreateViewPlan),
@@ -89,7 +86,6 @@ pub enum Plan {
     DropDatabase(DropDatabasePlan),
     DropSchema(DropSchemaPlan),
     DropRoles(DropRolesPlan),
-    DropComputeInstances(DropComputeInstancesPlan),
     DropItems(DropItemsPlan),
     EmptyQuery,
     ShowAllVariables,
@@ -106,7 +102,6 @@ pub enum Plan {
     SendDiffs(SendDiffsPlan),
     Insert(InsertPlan),
     AlterNoop(AlterNoopPlan),
-    AlterComputeInstance(AlterComputeInstancePlan),
     AlterIndexSetOptions(AlterIndexSetOptionsPlan),
     AlterIndexResetOptions(AlterIndexResetOptionsPlan),
     AlterIndexEnable(AlterIndexEnablePlan),
@@ -118,7 +113,6 @@ pub enum Plan {
     Prepare(PreparePlan),
     Execute(ExecutePlan),
     Deallocate(DeallocatePlan),
-    Raise(RaisePlan),
 }
 
 #[derive(Debug)]
@@ -134,7 +128,7 @@ pub struct CreateDatabasePlan {
 
 #[derive(Debug)]
 pub struct CreateSchemaPlan {
-    pub database_spec: ResolvedDatabaseSpecifier,
+    pub database_name: DatabaseSpecifier,
     pub schema_name: String,
     pub if_not_exists: bool,
 }
@@ -145,64 +139,16 @@ pub struct CreateRolePlan {
 }
 
 #[derive(Debug)]
-pub struct CreateComputeInstancePlan {
-    pub name: String,
-    pub if_not_exists: bool,
-    pub config: ComputeInstanceConfig,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ComputeInstanceConfig {
-    Local,
-    Remote {
-        /// A map from replica name to hostnames.
-        replicas: BTreeMap<String, BTreeSet<String>>,
-        introspection: Option<ComputeInstanceIntrospectionConfig>,
-    },
-    Managed {
-        size: String,
-        introspection: Option<ComputeInstanceIntrospectionConfig>,
-    },
-}
-
-impl ComputeInstanceConfig {
-    pub fn introspection(&self) -> &Option<ComputeInstanceIntrospectionConfig> {
-        match self {
-            Self::Local => &None,
-            Self::Remote { introspection, .. } => introspection,
-            Self::Managed { introspection, .. } => introspection,
-        }
-    }
-}
-
-/// Configuration of introspection for a compute instance.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ComputeInstanceIntrospectionConfig {
-    /// Whether to introspect the introspection.
-    pub debugging: bool,
-    /// The interval at which to introspect.
-    pub granularity: Duration,
-}
-
-#[derive(Debug)]
 pub struct CreateSourcePlan {
-    pub name: QualifiedObjectName,
+    pub name: FullName,
     pub source: Source,
     pub if_not_exists: bool,
     pub materialized: bool,
 }
 
 #[derive(Debug)]
-pub struct CreateSecretPlan {
-    pub name: QualifiedObjectName,
-    pub secret: Secret,
-    pub full_name: FullObjectName,
-    pub if_not_exists: bool,
-}
-
-#[derive(Debug)]
 pub struct CreateSinkPlan {
-    pub name: QualifiedObjectName,
+    pub name: FullName,
     pub sink: Sink,
     pub with_snapshot: bool,
     pub if_not_exists: bool,
@@ -210,14 +156,14 @@ pub struct CreateSinkPlan {
 
 #[derive(Debug)]
 pub struct CreateTablePlan {
-    pub name: QualifiedObjectName,
+    pub name: FullName,
     pub table: Table,
     pub if_not_exists: bool,
 }
 
 #[derive(Debug)]
 pub struct CreateViewPlan {
-    pub name: QualifiedObjectName,
+    pub name: FullName,
     pub view: View,
     /// The ID of the object that this view is replacing, if any.
     pub replace: Option<GlobalId>,
@@ -228,14 +174,14 @@ pub struct CreateViewPlan {
 
 #[derive(Debug)]
 pub struct CreateViewsPlan {
-    pub views: Vec<(QualifiedObjectName, View)>,
+    pub views: Vec<(FullName, View)>,
     pub materialize: bool,
     pub if_not_exists: bool,
 }
 
 #[derive(Debug)]
 pub struct CreateIndexPlan {
-    pub name: QualifiedObjectName,
+    pub name: FullName,
     pub index: Index,
     pub options: Vec<IndexOption>,
     pub if_not_exists: bool,
@@ -243,27 +189,22 @@ pub struct CreateIndexPlan {
 
 #[derive(Debug)]
 pub struct CreateTypePlan {
-    pub name: QualifiedObjectName,
+    pub name: FullName,
     pub typ: Type,
 }
 
 #[derive(Debug)]
 pub struct DropDatabasePlan {
-    pub id: Option<DatabaseId>,
+    pub name: String,
 }
 
 #[derive(Debug)]
 pub struct DropSchemaPlan {
-    pub id: Option<(DatabaseId, SchemaId)>,
+    pub name: SchemaName,
 }
 
 #[derive(Debug)]
 pub struct DropRolesPlan {
-    pub names: Vec<String>,
-}
-
-#[derive(Debug)]
-pub struct DropComputeInstancesPlan {
     pub names: Vec<String>,
 }
 
@@ -287,29 +228,20 @@ pub struct SetVariablePlan {
 
 #[derive(Debug)]
 pub struct PeekPlan {
-    pub source: MirRelationExpr,
-    pub when: QueryWhen,
+    pub source: ::expr::MirRelationExpr,
+    pub when: PeekWhen,
     pub finishing: RowSetFinishing,
     pub copy_to: Option<CopyFormat>,
 }
 
 #[derive(Debug)]
 pub struct TailPlan {
-    pub from: TailFrom,
+    pub id: GlobalId,
     pub with_snapshot: bool,
-    pub when: QueryWhen,
+    pub ts: Option<Timestamp>,
     pub copy_to: Option<CopyFormat>,
     pub emit_progress: bool,
-}
-
-#[derive(Debug)]
-pub enum TailFrom {
-    Id(GlobalId),
-    Query {
-        expr: MirRelationExpr,
-        desc: RelationDesc,
-        depends_on: Vec<GlobalId>,
-    },
+    pub object_columns: usize,
 }
 
 #[derive(Debug)]
@@ -342,15 +274,15 @@ pub struct SendDiffsPlan {
 #[derive(Debug)]
 pub struct InsertPlan {
     pub id: GlobalId,
-    pub values: mz_expr::MirRelationExpr,
+    pub values: ::expr::MirRelationExpr,
 }
 
 #[derive(Debug)]
 pub struct ReadThenWritePlan {
     pub id: GlobalId,
-    pub selection: mz_expr::MirRelationExpr,
+    pub selection: ::expr::MirRelationExpr,
     pub finishing: RowSetFinishing,
-    pub assignments: HashMap<usize, mz_expr::MirScalarExpr>,
+    pub assignments: HashMap<usize, ::expr::MirScalarExpr>,
     pub kind: MutationKind,
 }
 
@@ -358,12 +290,6 @@ pub struct ReadThenWritePlan {
 #[derive(Debug)]
 pub struct AlterNoopPlan {
     pub object_type: ObjectType,
-}
-
-#[derive(Debug)]
-pub struct AlterComputeInstancePlan {
-    pub id: ComputeInstanceId,
-    pub config: ComputeInstanceConfig,
 }
 
 #[derive(Debug)]
@@ -386,7 +312,6 @@ pub struct AlterIndexEnablePlan {
 #[derive(Debug)]
 pub struct AlterItemRenamePlan {
     pub id: GlobalId,
-    pub current_full_name: FullObjectName,
     pub to_name: String,
     pub object_type: ObjectType,
 }
@@ -427,16 +352,11 @@ pub struct DeallocatePlan {
     pub name: Option<String>,
 }
 
-#[derive(Debug)]
-pub struct RaisePlan {
-    pub severity: NoticeSeverity,
-}
-
 #[derive(Clone, Debug)]
 pub struct Table {
     pub create_sql: String,
     pub desc: RelationDesc,
-    pub defaults: Vec<Expr<Aug>>,
+    pub defaults: Vec<Expr<Raw>>,
     pub temporary: bool,
     pub depends_on: Vec<GlobalId>,
 }
@@ -445,13 +365,10 @@ pub struct Table {
 pub struct Source {
     pub create_sql: String,
     pub connector: SourceConnector,
-    pub desc: RelationDesc,
-}
-
-#[derive(Clone, Debug)]
-pub struct Secret {
-    pub create_sql: String,
-    pub secret_as: MirScalarExpr,
+    pub bare_desc: RelationDesc,
+    pub expr: ::expr::MirRelationExpr,
+    /// Column names for the transformed source; i.e. the expr
+    pub column_names: Vec<ColumnName>,
 }
 
 #[derive(Clone, Debug)]
@@ -461,13 +378,12 @@ pub struct Sink {
     pub connector_builder: SinkConnectorBuilder,
     pub envelope: SinkEnvelope,
     pub depends_on: Vec<GlobalId>,
-    pub compute_instance: ComputeInstanceId,
 }
 
 #[derive(Clone, Debug)]
 pub struct View {
     pub create_sql: String,
-    pub expr: mz_expr::MirRelationExpr,
+    pub expr: ::expr::MirRelationExpr,
     pub column_names: Vec<ColumnName>,
     pub temporary: bool,
     pub depends_on: Vec<GlobalId>,
@@ -477,29 +393,36 @@ pub struct View {
 pub struct Index {
     pub create_sql: String,
     pub on: GlobalId,
-    pub keys: Vec<mz_expr::MirScalarExpr>,
+    pub keys: Vec<::expr::MirScalarExpr>,
     pub depends_on: Vec<GlobalId>,
-    pub compute_instance: ComputeInstanceId,
 }
 
 #[derive(Clone, Debug)]
 pub struct Type {
     pub create_sql: String,
-    pub inner: CatalogType<IdReference>,
+    pub inner: TypeInner,
     pub depends_on: Vec<GlobalId>,
 }
 
-/// Specifies when a `Peek` or `Tail` should occur.
+#[derive(Clone, Debug)]
+pub enum TypeInner {
+    List {
+        element_id: GlobalId,
+    },
+    Map {
+        key_id: GlobalId,
+        value_id: GlobalId,
+    },
+}
+
+/// Specifies when a `Peek` should occur.
 #[derive(Debug, PartialEq)]
-pub enum QueryWhen {
+pub enum PeekWhen {
     /// The peek should occur at the latest possible timestamp that allows the
     /// peek to complete immediately.
     Immediately,
-    /// The peek should occur at the timestamp described by the specified
-    /// expression.
-    ///
-    /// The expression may have any type.
-    AtTimestamp(MirScalarExpr),
+    /// The peek should occur at the specified timestamp.
+    AtTimestamp(Timestamp),
 }
 
 #[derive(Debug)]

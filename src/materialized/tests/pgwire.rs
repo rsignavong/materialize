@@ -18,7 +18,6 @@ use std::time::Duration;
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use futures::future;
-use mz_coord::session::DEFAULT_DATABASE_NAME;
 use postgres::binary_copy::BinaryCopyOutIter;
 use postgres::error::SqlState;
 use postgres::types::Type;
@@ -27,9 +26,8 @@ use postgres_array::{Array, Dimension};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use mz_ore::collections::CollectionExt;
-use mz_ore::task;
-use mz_pgrepr::{Numeric, Record};
+use ore::collections::CollectionExt;
+use pgrepr::{Numeric, Record};
 
 use crate::util::PostgresErrorExt;
 
@@ -37,20 +35,13 @@ pub mod util;
 
 #[test]
 fn test_bind_params() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default().experimental_mode();
     let server = util::start_server(config)?;
     let mut client = server.connect(postgres::NoTls)?;
 
     match client.query("SELECT ROW(1, 2) = $1", &[&42_i32]) {
-        Ok(_) => panic!("query with invalid parameters executed successfully"),
-        Err(err) => {
-            assert!(format!("{:?}", err.source()).contains("WrongType"));
-        }
-    }
-
-    match client.query("SELECT ROW(1, 2) = $1", &[&"(1,2)"]) {
         Ok(_) => panic!("query with invalid parameters executed successfully"),
         Err(err) => assert!(err.to_string().contains("no overload")),
     }
@@ -78,7 +69,7 @@ fn test_bind_params() -> Result<(), Box<dyn Error>> {
 
     // Ensure that the fractional component of a decimal is not lost.
     {
-        let mut num = Numeric::from(mz_repr::adt::numeric::Numeric::from(123));
+        let mut num = Numeric::from(repr::adt::numeric::Numeric::from(123));
         num.0 .0.set_exponent(-2);
         let stmt = client.prepare_typed("SELECT $1 + 2.34", &[Type::NUMERIC])?;
         let val: Numeric = client.query_one(&stmt, &[&num])?.get(0);
@@ -107,7 +98,7 @@ fn test_bind_params() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_partial_read() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default())?;
     let mut client = server.connect(postgres::NoTls)?;
@@ -137,7 +128,7 @@ fn test_partial_read() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_read_many_rows() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default())?;
     let mut client = server.connect(postgres::NoTls)?;
@@ -155,7 +146,7 @@ fn test_read_many_rows() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_conn_startup() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default())?;
     let mut client = server.connect(postgres::NoTls)?;
@@ -163,7 +154,7 @@ fn test_conn_startup() -> Result<(), Box<dyn Error>> {
     // The default database should be `materialize`.
     assert_eq!(
         client.query_one("SHOW database", &[])?.get::<_, String>(0),
-        DEFAULT_DATABASE_NAME,
+        "materialize",
     );
 
     // Connecting to a nonexistent database should work, and creating that
@@ -178,7 +169,7 @@ fn test_conn_startup() -> Result<(), Box<dyn Error>> {
             .connect(postgres::NoTls)
             .await?;
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
-        task::spawn(|| "test_conn_startup", async move {
+        tokio::spawn(async move {
             while let Some(msg) = future::poll_fn(|cx| conn.poll_message(cx)).await {
                 match msg {
                     Ok(msg) => notice_tx.send(msg).unwrap(),
@@ -286,7 +277,7 @@ fn test_conn_startup() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_conn_user() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default())?;
     let mut client = server.connect(postgres::NoTls)?;
@@ -316,7 +307,7 @@ fn test_conn_user() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_simple_query_no_hang() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default())?;
     let mut client = server.connect(postgres::NoTls)?;
@@ -329,7 +320,7 @@ fn test_simple_query_no_hang() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_copy() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default())?;
     let mut client = server.connect(postgres::NoTls)?;
@@ -372,7 +363,7 @@ fn test_copy() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_arrays() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default().experimental_mode())?;
     let mut client = server.connect(postgres::NoTls)?;
@@ -404,22 +395,12 @@ fn test_arrays() -> Result<(), Box<dyn Error>> {
         _ => panic!("unexpected simple query message"),
     }
 
-    let message = client
-        .simple_query("SELECT ARRAY[ROW(1,2), ROW(3,4), ROW(5,6)]")?
-        .into_first();
-    match message {
-        SimpleQueryMessage::Row(row) => {
-            assert_eq!(row.get(0).unwrap(), r#"{"(1,2)","(3,4)","(5,6)"}"#);
-        }
-        _ => panic!("unexpected simple query message"),
-    }
-
     Ok(())
 }
 
 #[test]
 fn test_record_types() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default())?;
     let mut client = server.connect(postgres::NoTls)?;
@@ -439,32 +420,13 @@ fn test_record_types() -> Result<(), Box<dyn Error>> {
     let record: Record<(i32, String)> = row.get(0);
     assert_eq!(record, Record((1, "a".into())));
 
-    client.batch_execute("CREATE TYPE named_composite AS (a int, b text)")?;
-    let row = client.query_one("SELECT ROW(321, '123')::named_composite", &[])?;
-    let record: Record<(i32, String)> = row.get(0);
-    assert_eq!(record, Record((321, "123".into())));
-
-    client.batch_execute("CREATE TABLE has_named_composites (f named_composite)")?;
-    client.batch_execute(
-        "INSERT INTO has_named_composites (f) VALUES ((10, '10')), ((20, '20')::named_composite)",
-    )?;
-    let rows = client.query(
-        "SELECT f FROM has_named_composites ORDER BY (f).a DESC",
-        &[],
-    )?;
-    let record: Record<(i32, String)> = rows[0].get(0);
-    assert_eq!(record, Record((20, "20".into())));
-    let record: Record<(i32, String)> = rows[1].get(0);
-    assert_eq!(record, Record((10, "10".into())));
-    assert_eq!(rows.len(), 2);
-
     Ok(())
 }
 
 fn pg_test_inner(dir: PathBuf) -> Result<(), Box<dyn Error>> {
     // We want a new server per file, so we can't use pgtest::walk.
     datadriven::walk(dir.to_str().unwrap(), |tf| {
-        let server = util::start_server(util::Config::default().experimental_mode()).unwrap();
+        let server = util::start_server(util::Config::default()).unwrap();
         let config = server.pg_config();
         let addr = match &config.get_hosts()[0] {
             tokio_postgres::config::Host::Tcp(host) => {
@@ -475,7 +437,7 @@ fn pg_test_inner(dir: PathBuf) -> Result<(), Box<dyn Error>> {
         let user = config.get_user().unwrap();
         let timeout = Duration::from_secs(5);
 
-        mz_pgtest::run_test(tf, addr, user.to_string(), timeout);
+        pgtest::run_test(tf, &addr, user, timeout);
     });
 
     Ok(())
@@ -483,7 +445,7 @@ fn pg_test_inner(dir: PathBuf) -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_pgtest() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let dir: PathBuf = ["..", "..", "test", "pgtest"].iter().collect();
     pg_test_inner(dir)
@@ -492,8 +454,19 @@ fn test_pgtest() -> Result<(), Box<dyn Error>> {
 #[test]
 // Materialize's differences from Postgres' responses.
 fn test_pgtest_mz() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let dir: PathBuf = ["..", "..", "test", "pgtest-mz"].iter().collect();
     pg_test_inner(dir)
+}
+
+#[tokio::test]
+async fn test_coordtest() -> Result<(), Box<dyn Error>> {
+    ore::test::init_logging();
+
+    let dir: PathBuf = ["..", "..", "test", "coordtest"].iter().collect();
+
+    coordtest::walk(dir.to_str().unwrap()).await;
+
+    Ok(())
 }

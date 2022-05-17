@@ -13,9 +13,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::{error, fmt, io, sync};
 
-use arrow2::error::ArrowError;
-
-use crate::location::{Log, SeqNo};
+use crate::storage::{Log, SeqNo};
 
 /// A persistence related error.
 #[derive(Debug, Clone)]
@@ -60,7 +58,6 @@ impl PartialEq for Error {
         match (self, other) {
             (Error::String(s), Error::String(o)) => s == o,
             (Error::OutOfQuota(s), Error::OutOfQuota(o)) => s == o,
-            (Error::UnknownRegistration(s), Error::UnknownRegistration(o)) => s == o,
             (Error::RuntimeShutdown, Error::RuntimeShutdown) => true,
             _ => false,
         }
@@ -89,21 +86,9 @@ impl<'a> From<&'a str> for Error {
     }
 }
 
-impl From<ArrowError> for Error {
-    fn from(e: ArrowError) -> Self {
-        Error::String(e.to_string())
-    }
-}
-
 impl<T> From<sync::PoisonError<T>> for Error {
     fn from(e: sync::PoisonError<T>) -> Self {
         Error::String(format!("poison: {}", e))
-    }
-}
-
-impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
-        Error::String(format!("sqlite: {}", e))
     }
 }
 

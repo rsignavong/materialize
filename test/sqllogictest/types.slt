@@ -460,10 +460,10 @@ select oid, oid::regproc::text from (select oid from mz_catalog.mz_functions)
 
 # 🔬🔬 record
 
-query error cannot reference pseudo type pg_catalog.record
+query error type "pg_catalog.record" does not exist
 SELECT ROW(1, 2)::record;
 
-query error cannot reference pseudo type pg_catalog.record
+query error type "pg_catalog.record" does not exist
 SELECT ROW(1, 2)::pg_catalog.record;
 
 # 🔬🔬 text
@@ -486,12 +486,9 @@ SELECT 'dog'::char(3)
 dog
 
 query T
-SELECT 'dog'::pg_catalog.bpchar(3)
+SELECT 'dog'::pg_catalog.char(3)
 ----
 dog
-
-query error pg_catalog.char does not support type modifiers
-SELECT 'dog'::pg_catalog.char(3)
 
 # 🔬🔬🔬 varchar
 
@@ -596,7 +593,7 @@ SELECT '1'::materialize.pg_catalog.int4
 1
 
 # tables are not types yet
-query error "pg_catalog.pg_enum" does not refer to a type
+query error type "pg_catalog.pg_enum" does not exist
 SELECT '1'::pg_catalog.pg_enum
 
 # 🔬 format_type
@@ -614,7 +611,7 @@ NULL
 query T
 SELECT format_type(16, NULL)
 ----
-boolean
+bool
 
 query T
 SELECT format_type(17, NULL)
@@ -624,12 +621,12 @@ bytea
 query T
 SELECT format_type(20, NULL)
 ----
-bigint
+int8
 
 query T
 SELECT format_type(23, NULL)
 ----
-integer
+int4
 
 query T
 SELECT format_type(25, NULL)
@@ -639,12 +636,12 @@ text
 query T
 SELECT format_type(18, NULL)
 ----
-character
+char
 
 query T
 SELECT format_type(1043, NULL)
 ----
-character varying
+varchar
 
 query T
 SELECT format_type(26, NULL)
@@ -654,12 +651,12 @@ oid
 query T
 SELECT format_type(700, NULL)
 ----
-real
+float4
 
 query T
 SELECT format_type(701, NULL)
 ----
-double precision
+float8
 
 query T
 SELECT format_type(1082, NULL)
@@ -679,7 +676,7 @@ timestamp
 query T
 SELECT format_type(1184, NULL)
 ----
-timestamp with time zone
+timestamptz
 
 query T
 SELECT format_type(1186, NULL)
@@ -704,102 +701,82 @@ jsonb
 query T
 SELECT format_type(1000, NULL)
 ----
-boolean[]
+_bool
 
 query T
 SELECT format_type(1001, NULL)
 ----
-bytea[]
-
-query T
-SELECT format_type(1005, NULL)
-----
-smallint[]
+_bytea
 
 query T
 SELECT format_type(1016, NULL)
 ----
-bigint[]
+_int8
 
 query T
 SELECT format_type(1007, NULL)
 ----
-integer[]
+_int4
 
 query T
 SELECT format_type(1009, NULL)
 ----
-text[]
+_text
 
 query T
 SELECT format_type(1028, NULL)
 ----
-oid[]
+_oid
 
 query T
 SELECT format_type(1021, NULL)
 ----
-real[]
+_float4
 
 query T
 SELECT format_type(1022, NULL)
 ----
-double precision[]
+_float8
 
 query T
 SELECT format_type(1182, NULL)
 ----
-date[]
+_date
 
 query T
 SELECT format_type(1183, NULL)
 ----
-time[]
+_time
 
 query T
 SELECT format_type(1115, NULL)
 ----
-timestamp[]
+_timestamp
 
 query T
 SELECT format_type(1185, NULL)
 ----
-timestamp with time zone[]
+_timestamptz
 
 query T
 SELECT format_type(1187, NULL)
 ----
-interval[]
+_interval
 
 query T
 SELECT format_type(1231, NULL)
 ----
-numeric[]
+_numeric
 
 query T
 SELECT format_type(2951, NULL)
 ----
-uuid[]
+_uuid
 
 query T
 SELECT format_type(3807, NULL)
 ----
-jsonb[]
-
-query T
-SELECT format_type(2210, NULL)
-----
-regclass[]
-
-query T
-SELECT format_type(1008, NULL)
-----
-regproc[]
-
-query T
-SELECT format_type(2211, NULL)
-----
-regtype[]
+_jsonb
 
 # 🔬🔬 non-type OID
 
@@ -823,12 +800,12 @@ SELECT format_type(6000, -100);
 query T
 SELECT format_type(1700, 0);
 ----
-numeric
+numeric(65535,65532)
 
 query T
 SELECT format_type(1700, 3);
 ----
-numeric
+numeric(65535,65535)
 
 query T
 SELECT format_type(1700, 4);
@@ -853,7 +830,7 @@ numeric(38,0)
 query T
 SELECT format_type(1700, 2490371);
 ----
-numeric(37,-1)
+numeric(37,65535)
 
 query T
 SELECT format_type(1700, 2490373);
@@ -868,7 +845,7 @@ numeric
 query T
 SELECT format_type(26, 1);
 ----
-oid(1)
+oid
 
 query T
 SELECT format_type(26, -1);

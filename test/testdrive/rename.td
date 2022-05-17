@@ -19,8 +19,6 @@ $ set writer-schema={
 $ avro-ocf-write path=data.ocf schema=${writer-schema} codec=null
 {"a": 1, "b": "dog"}
 
-$ set-regex match=u\d+ replacement=UID
-
 # Create library of objects and verify names
 > CREATE MATERIALIZED SOURCE mz_data
   FROM AVRO OCF '${testdrive.temp-dir}/data.ocf'
@@ -33,11 +31,11 @@ $ set-regex match=u\d+ replacement=UID
     SELECT * FROM mz_data
 
 > SHOW INDEXES FROM mz_view
-cluster on_name  key_name             seq_in_index  column_name  expression  nullable enabled
----------------------------------------------------------------------------------------------
-default mz_view  mz_view_primary_idx  1             a            <null>      false    true
-default mz_view  mz_view_primary_idx  2             b            <null>      false    true
-default mz_view  mz_view_primary_idx  3             mz_obj_no    <null>      false    true
+on_name  key_name             seq_in_index  column_name  expression  nullable enabled
+-------------------------------------------------------------------------------------
+mz_view  mz_view_primary_idx  1             a            <null>      false    true
+mz_view  mz_view_primary_idx  2             b            <null>      false    true
+mz_view  mz_view_primary_idx  3             mz_obj_no    <null>      false    true
 
 > CREATE VIEW dependent_view AS
     SELECT * FROM mz_view;
@@ -57,12 +55,6 @@ name
 materialize.public.mz_data
 materialize.public.mz_data_primary_idx
 
-# Test that data can be selected from the source before renaming.
-> SELECT * FROM mz_data
-a  b    mz_obj_no
------------------
-1  dog  1
-
 > ALTER SOURCE mz_data RENAME TO renamed_mz_data;
 
 > SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.mz_data%';
@@ -74,23 +66,6 @@ materialize.public.mz_data_primary_idx
 name
 -----
 materialize.public.renamed_mz_data
-
-# Test that data can be selected from the source after renaming.
-> SELECT * FROM renamed_mz_data
-a  b    mz_obj_no
------------------
-1  dog  1
-
-# Test that data can be selected from the source if it is rematerialized with
-# the new name. This previously tripped an assertion that asserted that a source
-# descriptor never changed; it is in fact okay for the name of a source to
-# change.
-> DROP INDEX mz_data_primary_idx
-> CREATE DEFAULT INDEX ON renamed_mz_data
-> SELECT * FROM renamed_mz_data
-a  b    mz_obj_no
------------------
-1  dog  1
 
 > SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.mz_view%';
 name
@@ -171,16 +146,16 @@ materialize.public.renamed_mz_view  "CREATE VIEW \"materialize\".\"public\".\"re
 
 # Item's indexes are properly re-attributed
 > SHOW INDEXES FROM renamed_mz_view
-cluster on_name          key_name       seq_in_index  column_name expression nullable enabled
----------------------------------------------------------------------------------------------
-default renamed_mz_view  renamed_index  1             a           <null>     false    true
-default renamed_mz_view  renamed_index  2             b           <null>     false    true
-default renamed_mz_view  renamed_index  3             mz_obj_no   <null>     false    true
+on_name          key_name       seq_in_index  column_name expression nullable enabled
+-------------------------------------------------------------------------------------
+renamed_mz_view  renamed_index  1             a           <null>     false    true
+renamed_mz_view  renamed_index  2             b           <null>     false    true
+renamed_mz_view  renamed_index  3             mz_obj_no   <null>     false    true
 
 > SHOW CREATE INDEX renamed_index
 Index               "Create Index"
 ---------------------------------------------------------------------------------------------------------------------
-materialize.public.renamed_index "CREATE INDEX \"renamed_index\" IN CLUSTER [1] ON \"materialize\".\"public\".\"renamed_mz_view\" (\"a\", \"b\", \"mz_obj_no\")"
+materialize.public.renamed_index "CREATE INDEX \"renamed_index\" ON \"materialize\".\"public\".\"renamed_mz_view\" (\"a\", \"b\", \"mz_obj_no\")"
 
 # Simple dependencies are renamed
 > SHOW CREATE VIEW dependent_view
@@ -188,12 +163,10 @@ View                                "Create View"
 ------------------------------------------------------------------------------------------------------------------------------------------------
 materialize.public.dependent_view   "CREATE VIEW \"materialize\".\"public\".\"dependent_view\" AS SELECT * FROM \"materialize\".\"public\".\"renamed_mz_view\""
 
-$ set-regex match=u\d+ replacement=UID
-
 > SHOW CREATE SINK renamed_sink
 Sink                            "Create Sink"
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-materialize.public.renamed_sink "CREATE SINK \"materialize\".\"public\".\"renamed_sink\" IN CLUSTER [1] FROM [UID AS \"materialize\".\"public\".\"renamed_mz_data\"] INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'snk1' FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}' WITH SNAPSHOT"
+materialize.public.renamed_sink "CREATE SINK \"materialize\".\"public\".\"renamed_sink\" FROM \"materialize\".\"public\".\"renamed_mz_data\" INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'snk1' FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}' WITH SNAPSHOT"
 
 # Simple dependencies with both fully qualified and unqualified item references are renamed
 > SHOW CREATE VIEW byzantine_view
@@ -221,24 +194,24 @@ materialize.public.oppositional_view "CREATE VIEW \"materialize\".\"public\".\"o
 
 # ❌ Identifiers used in dependent items
 ! ALTER VIEW t1 RENAME TO b;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW t1 RENAME TO materialize;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW t1 RENAME TO public;
-contains:renaming conflict
+renaming conflict
 
 # ❌ Identifiers used in own definition
 # `materialize.public.a` contains an unqualified reference to `materialize.public.t1.a`.
 ! ALTER VIEW a RENAME TO anything
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW v0 RENAME TO b
-contains:renaming conflict
+renaming conflict
 
 # ❌ Name used by another item in schema's catalog
 ! ALTER VIEW t1 RENAME TO a
-contains:catalog item 'a' already exists
+a is already taken by item in schema
 ! ALTER VIEW t1 RENAME TO dependent_view;
-contains:catalog item 'dependent_view' already exists
+dependent_view is already taken by item in schema
 
 # 🔬 Aliases
 
@@ -251,7 +224,7 @@ contains:catalog item 'dependent_view' already exists
 
 # ❌ View name used as alias
 ! ALTER VIEW t1 RENAME TO anything
-contains:renaming conflict
+renaming conflict
 
 # 🔬 Unresolvable without scope analysis
 # These are example queries whose ambiguity cannot be resolved through
@@ -273,10 +246,10 @@ contains:renaming conflict
 
 # ❌ Item name used as column
 ! ALTER VIEW db0.scm0.z RENAME TO anything
-contains:renaming conflict
+renaming conflict
 # ❌ Item name used as schema
 ! ALTER VIEW db0.scm0 RENAME TO anything
-contains:renaming conflict
+renaming conflict
 
 > CREATE SCHEMA IF NOT EXISTS materialize.scm0;
 > CREATE VIEW materialize.scm0.z AS SELECT 1 AS a;
@@ -290,10 +263,10 @@ contains:renaming conflict
 
 # ❌ Item name used as column
 ! ALTER VIEW scm0.z RENAME TO anything
-contains:renaming conflict
+renaming conflict
 # ❌ Item name used as schema
 ! ALTER VIEW scm0 RENAME TO anything
-contains:renaming conflict
+renaming conflict
 
 # 🔬 DB::DB
 
@@ -321,9 +294,9 @@ contains:renaming conflict
 
 # ❌ Insufficient qualification
 ! ALTER VIEW db1.scm1.v rename to anything;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW db2.scm1.v rename to anything;
-contains:renaming conflict
+renaming conflict
 
 > DROP VIEW db1_db2_scm1_min_qual_invalid
 
@@ -341,9 +314,9 @@ contains:renaming conflict
 
 # ❌ Insufficient qualification
 ! ALTER VIEW db1.scm1.v rename to anything;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW db2.scm1.v rename to anything;
-contains:renaming conflict
+renaming conflict
 
 > DROP VIEW db1_db2_scm1_mix_qual_invalid
 
@@ -384,15 +357,15 @@ materialize.public.db1_db2_scm1_valid_qual "CREATE VIEW \"materialize\".\"public
 
 # ❌ Identifiers used in dependent items
 ! ALTER VIEW db2.scm2.v2 RENAME TO db2;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW db2.scm2.v2 RENAME TO scm2;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW db2.scm2.v2 RENAME TO z;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW db2.scm2.v2 RENAME TO scm2;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW db2.scm2.v2 RENAME TO a;
-contains:renaming conflict
+renaming conflict
 
 # ✅ New idents
 > ALTER VIEW db2.scm2.v2 RENAME TO v3;
@@ -445,15 +418,15 @@ materialize.public.db_scm_qual "CREATE VIEW \"materialize\".\"public\".\"db_scm_
 
 # ❌ Identifiers used in dependent items
 ! ALTER VIEW v1 RENAME TO z;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW v1 RENAME TO db1;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW v1 RENAME TO scm1;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW v1 RENAME TO v5;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW db1.scm1.v5 RENAME TO v1;
-contains:renaming conflict
+renaming conflict
 
 # ✅ New idents
 > ALTER VIEW v1 RENAME TO v2;
@@ -490,9 +463,9 @@ materialize.public.db_v_qual "CREATE VIEW \"materialize\".\"public\".\"db_v_qual
 
 # ❌ Insufficient qualification
 ! ALTER VIEW db1.scm1.v rename to anything;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW db1.scm2.v rename to anything;
-contains:renaming conflict
+renaming conflict
 
 > DROP VIEW db1_scm1_scm2_min_qual_invalid
 
@@ -510,9 +483,9 @@ contains:renaming conflict
 
 # ❌ Insufficient qualification
 ! ALTER VIEW db1.scm1.v rename to anything;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW db1.scm2.v rename to anything;
-contains:renaming conflict
+renaming conflict
 
 > DROP VIEW db1_scm1_scm2_mix_qual_invalid
 
@@ -557,17 +530,17 @@ materialize.public.db1_scm1_scm2_valid_qual "CREATE VIEW \"materialize\".\"publi
 
 # ❌ Identifiers used in dependent items
 ! ALTER VIEW scm4.v1 RENAME TO z;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW scm4.v1 RENAME TO scm5;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW scm4.v1 RENAME TO v2;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW scm4.v1 RENAME TO a;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW scm5.v2 RENAME TO a;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW scm5.v2 RENAME TO v1;
-contains:renaming conflict
+renaming conflict
 
 # ✅ New idents
 > ALTER VIEW scm4.v1 RENAME TO v3;
@@ -595,11 +568,11 @@ materialize.public.scm_scm_qual "CREATE VIEW \"materialize\".\"public\".\"scm_sc
 
 # ❌ Identifiers used in dependent items
 ! ALTER VIEW v1 RENAME TO z;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW v1 RENAME TO scm5;
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW v1 RENAME TO v4;
-contains:renaming conflict
+renaming conflict
 
 # ✅ New idents
 > ALTER VIEW v1 RENAME TO v3;
@@ -626,7 +599,7 @@ materialize.public.scm_v_qual "CREATE VIEW \"materialize\".\"public\".\"scm_v_qu
 
 # ❌ Identifiers used in dependent items
 ! ALTER VIEW v4 RENAME TO z;
-contains:renaming conflict
+renaming conflict
 
 # ✅ New idents
 > ALTER VIEW v4 RENAME TO v6;
@@ -665,7 +638,7 @@ materialize.public.qualified_wildcard "CREATE VIEW \"materialize\".\"public\".\"
 
 # ❌ Identifiers used in dependent items
 ! ALTER VIEW where_in_subquery RENAME TO scm5
-contains:renaming conflict
+renaming conflict
 
 # ✅ New idents
 > ALTER VIEW where_in_literal RENAME TO v8
@@ -693,9 +666,9 @@ materialize.public.v9 "CREATE VIEW \"materialize\".\"public\".\"v9\" AS SELECT \
 
 # ❌ Identifiers used in own definition
 ! ALTER VIEW space RENAME TO "has space"
-contains:renaming conflict
+renaming conflict
 ! ALTER VIEW "already has space" RENAME TO my_space
-contains:renaming conflict
+renaming conflict
 
 # ✅ New idents
 > ALTER VIEW space RENAME TO "now has space"
@@ -740,7 +713,7 @@ materialize.public.unnatural "CREATE VIEW \"materialize\".\"public\".\"unnatural
 
 # ❌ Identifiers used in dependent items
 ! ALTER VIEW func RENAME TO count
-contains:renaming conflict
+renaming conflict
 
 # ✅ Non-colliding function name
 > ALTER VIEW no_func RENAME TO count

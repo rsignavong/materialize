@@ -148,7 +148,6 @@ SELECT ('{hello=>{\{\}=>\"\"}}'::map[text=>map[text=>text]])::text
 # Test map operators.
 
 ## ?
-
 query T
 SELECT '{a=>1, b=>2}'::map[text=>int] ? 'a'
 ----
@@ -182,9 +181,6 @@ SELECT '{hello=>{world=>false}}'::map[text=>map[text=>bool]] -> 'hello'::text ? 
 ----
 true
 
-query error unable to determine which implementation to use
-SELECT NULL ? 'a'
-
 ## ?&
 query error malformed array literal: missing opening left brace
 SELECT '{a=>1, b=>2}'::map[text=>int] ?& 'a'
@@ -194,9 +190,6 @@ SELECT '{a=>1, b=>2}'::map[text=>int] ?& ARRAY[1]
 
 query error cannot determine type of empty array
 SELECT '{a=>1, b=>2}'::map[text=>int] ?& ARRAY[]
-
-query error could not determine polymorphic type because input has type unknown
-SELECT NULL ?& 'a'
 
 query T
 SELECT '{a=>1, b=>2}'::map[text=>int] ?& ARRAY[NULL]
@@ -257,9 +250,6 @@ SELECT '{a=>1, b=>2}'::map[text=>int] ?| 'a'
 
 query error arguments cannot be implicitly cast to any implementation's parameters
 SELECT '{a=>1, b=>2}'::map[text=>int] ?| ARRAY[1]
-
-query error could not determine polymorphic type because input has type unknown
-SELECT NULL ?| 'a'
 
 query T
 SELECT '{a=>1, b=>2}'::map[text=>int] ?| ARRAY[NULL]
@@ -380,7 +370,7 @@ SELECT '{a=>1, b=>2}'::map[text=>int] <@ '{a=>1, b=>2, c=>3}'::map[text=>int]
 ----
 true
 
-query error CAST does not support casting from map\[text=>map\[text=>character\]\] to map\[text=>map\[text=>character\]\]
+query error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
 SELECT '{hello=>{world=>a}}'::map[text=>map[text=>char]] <@ '{hello=>c}'::map[text=>char]
 ----
 false
@@ -463,12 +453,6 @@ query T
 SELECT '{hello=>{world=>nested}, another=>{map=>here}}'::map[text=>map[text=>text]] -> 'hello'::text -> 'world'::text
 ----
 nested
-
-query error unable to determine which implementation to use
-SELECT NULL -> 'hello'::text
-
-query error could not determine polymorphic type because input has type unknown
-SELECT NULL -> '{a}'::text[]
 
 # 🔬 CREATE TYPE .. AS MAP
 
@@ -616,24 +600,3 @@ CREATE TYPE qualified_qualified_int4_map AS MAP (key_type=pg_catalog.text, value
 # Supports type aliases
 statement ok
 CREATE TYPE int_map AS MAP (key_type=pg_catalog.text, value_type=int)
-
-# `map_length`
-query T
-SELECT map_length('{}'::map[text=>int])
-----
-0
-
-query T
-SELECT map_length('{a=>1}'::map[text=>int])
-----
-1
-
-query T
-SELECT map_length('{a=>1, b=>2}'::map[text=>int])
-----
-2
-
-query T
-SELECT map_length(NULL::map[text=>int])
-----
-NULL

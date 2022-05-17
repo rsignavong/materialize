@@ -28,7 +28,6 @@ Alter
 And
 Any
 Arn
-Arrangement
 Array
 As
 Asc
@@ -54,8 +53,6 @@ Character
 Characteristics
 Check
 Close
-Cluster
-Clusters
 Coalesce
 Collate
 Columns
@@ -79,8 +76,6 @@ Day
 Days
 Deallocate
 Debezium
-Debug
-Debugging
 Dec
 Decimal
 Declare
@@ -89,7 +84,6 @@ Default
 Delete
 Delimited
 Desc
-Details
 Discard
 Discover
 Distinct
@@ -100,7 +94,6 @@ Enabled
 End
 Enforced
 Envelope
-Escape
 Except
 Execute
 Exists
@@ -121,9 +114,6 @@ Format
 Forward
 From
 Full
-Granularity
-Graph
-Greatest
 Group
 Groups
 Gzip
@@ -139,7 +129,6 @@ In
 Include
 Index
 Indexes
-Info
 Inner
 Insert
 Int
@@ -147,7 +136,6 @@ Integer
 Intersect
 Interval
 Into
-Introspection
 Is
 Isnull
 Isolation
@@ -159,14 +147,12 @@ Keys
 Kinesis
 Lateral
 Leading
-Least
 Left
 Level
 Like
 Limit
 List
 Local
-Log
 Login
 Map
 Matching
@@ -177,7 +163,6 @@ Minute
 Minutes
 Month
 Months
-Names
 Natural
 Next
 No
@@ -185,7 +170,6 @@ Nologin
 None
 Nosuperuser
 Not
-Notice
 Notifications
 Null
 Nullif
@@ -216,8 +200,6 @@ Primary
 Protobuf
 Publication
 Pubnub
-Query
-Raise
 Range
 Raw
 Read
@@ -225,7 +207,6 @@ Real
 References
 Regex
 Registry
-Remote
 Rename
 Repeatable
 Replace
@@ -243,8 +224,6 @@ Schema
 Schemas
 Second
 Seconds
-Secret
-Secrets
 Seed
 Select
 Sequences
@@ -254,7 +233,6 @@ Set
 Show
 Sink
 Sinks
-Size
 Slot
 Smallint
 Snapshot
@@ -305,7 +283,6 @@ Varchar
 Varying
 View
 Views
-Warning
 When
 Where
 With

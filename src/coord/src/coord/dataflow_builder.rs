@@ -14,246 +14,192 @@
 //! and indicate which identifiers have arrangements available. This module
 //! isolates that logic from the rest of the somewhat complicated coordinator.
 
-use mz_dataflow_types::client::controller::ComputeController;
-use mz_dataflow_types::client::ComputeInstanceId;
-use mz_dataflow_types::sinks::SinkDesc;
-use mz_dataflow_types::{BuildDesc, DataflowDesc, IndexDesc};
-use mz_expr::{
-    CollectionPlan, GlobalId, MapFilterProject, MirRelationExpr, MirScalarExpr,
-    OptimizedMirRelationExpr, UnmaterializableFunc,
-};
-use mz_ore::stack::maybe_grow;
-use mz_repr::adt::array::ArrayDimension;
-use mz_repr::adt::numeric::Numeric;
-use mz_repr::{Datum, Row};
-
-use crate::catalog::{CatalogItem, CatalogState};
-use crate::coord::{CatalogTxn, Coordinator};
-use crate::error::RematerializedSourceType;
-use crate::session::{Session, SERVER_MAJOR_VERSION, SERVER_MINOR_VERSION};
-use crate::{CoordError, PersisterWithConfig};
+use super::*;
+use ore::stack::maybe_grow;
 
 /// Borrows of catalog and indexes sufficient to build dataflow descriptions.
-pub struct DataflowBuilder<'a, T> {
+pub struct DataflowBuilder<'a> {
     pub catalog: &'a CatalogState,
-    pub persister: &'a PersisterWithConfig,
-    /// A handle to the compute abstraction, which describes indexes by identifier.
-    ///
-    /// This can also be used to grab a handle to the storage abstraction, through
-    /// its `storage_mut()` method.
-    pub compute: ComputeController<'a, T>,
+    pub indexes: &'a ArrangementFrontiers<Timestamp>,
+    pub transient_id_counter: &'a mut u64,
 }
 
-/// The styles in which an expression can be prepared for use in a dataflow.
-#[derive(Clone, Copy, Debug)]
-pub enum ExprPrepStyle<'a> {
-    /// The expression is being prepared for installation as a maintained index.
-    Index,
-    /// The expression is being prepared to run once at the specified logical
-    /// time in the specified session.
-    OneShot {
-        logical_time: Option<u64>,
-        session: &'a Session,
-    },
-}
-
-impl Coordinator {
+impl<C> Coordinator<C>
+where
+    C: dataflow_types::client::Client,
+{
     /// Creates a new dataflow builder from the catalog and indexes in `self`.
-    pub fn dataflow_builder(
-        &self,
-        instance: ComputeInstanceId,
-    ) -> DataflowBuilder<mz_repr::Timestamp> {
-        let compute = self.dataflow_client.compute(instance).unwrap();
+    pub fn dataflow_builder<'a>(&'a mut self) -> DataflowBuilder {
         DataflowBuilder {
             catalog: self.catalog.state(),
-            persister: &self.persister,
-            compute,
+            indexes: &self.indexes,
+            transient_id_counter: &mut self.transient_id_counter,
         }
     }
-}
 
-impl CatalogTxn<'_, mz_repr::Timestamp> {
-    /// Creates a new dataflow builder from an ongoing catalog transaction.
-    pub fn dataflow_builder(
-        &self,
-        instance: ComputeInstanceId,
-    ) -> DataflowBuilder<mz_repr::Timestamp> {
-        let compute = self.dataflow_client.compute(instance).unwrap();
-        DataflowBuilder {
-            catalog: self.catalog,
-            persister: &self.persister,
-            compute,
-        }
-    }
-}
-
-impl<'a> DataflowBuilder<'a, mz_repr::Timestamp> {
-    /// Imports the view, source, or table with `id` into the provided
-    /// dataflow description.
-    fn import_into_dataflow(
-        &mut self,
-        id: &GlobalId,
-        dataflow: &mut DataflowDesc,
-    ) -> Result<(), CoordError> {
-        maybe_grow(|| {
-            // Avoid importing the item redundantly.
-            if dataflow.is_imported(id) {
-                return Ok(());
-            }
-
-            // A valid index is any index on `id` that is known to index oracle.
-            //
-            // TODO: indexes should be imported after the optimization process,
-            // and only those actually used by the optimized plan
-            //
-            // NOTE(benesch): is the above TODO still true? The dataflow layer
-            // has gotten increasingly smart about index selection. Maybe it's
-            // now fine to present all indexes?
-            let index_oracle = self.index_oracle();
-            let mut valid_indexes = index_oracle.indexes_on(*id).peekable();
-            if valid_indexes.peek().is_some() {
-                // Deduplicate indexes by keys, in case we have redundant indexes.
-                let mut valid_indexes = valid_indexes.collect::<Vec<_>>();
-                valid_indexes.sort_by_key(|(_, idx)| &idx.keys);
-                valid_indexes.dedup_by_key(|(_, idx)| &idx.keys);
-                for (index_id, idx) in valid_indexes {
-                    let index_desc = IndexDesc {
-                        on_id: *id,
-                        key: idx.keys.to_vec(),
-                    };
-                    let entry = self.catalog.get_entry(id);
-                    let desc = entry
-                        .desc(
-                            &self
-                                .catalog
-                                .resolve_full_name(entry.name(), entry.conn_id()),
-                        )
-                        .expect("indexes can only be built on items with descs");
-                    dataflow.import_index(index_id, index_desc, desc.typ().clone());
-                }
-            } else {
-                drop(valid_indexes);
-                let entry = self.catalog.get_entry(id);
-                match entry.item() {
-                    CatalogItem::Table(_) => {
-                        let source_description = self.catalog.source_description_for(*id).unwrap();
-                        let persist_details = None;
-                        dataflow.import_source(*id, source_description, persist_details);
-                    }
-                    CatalogItem::Source(source) => {
-                        if source.requires_single_materialization() {
-                            let source_type = RematerializedSourceType::for_source(source);
-                            let dependent_indexes = self.catalog.dependent_indexes(*id);
-                            // If this source relies on any pre-existing indexes (i.e., indexes
-                            // that we're not building as part of this `DataflowBuilder`), we're
-                            // attempting to reinstantiate a single-use source.
-                            let intersection = dependent_indexes
-                                .into_iter()
-                                .filter(|id| self.compute.collection(*id).is_ok())
-                                .collect::<Vec<_>>();
-
-                            if !intersection.is_empty() {
-                                let existing_indexes = intersection
-                                    .iter()
-                                    .map(|id| self.catalog.get_entry(id).name().item.clone())
-                                    .collect();
-                                return Err(CoordError::InvalidRematerialization {
-                                    base_source: entry.name().item.clone(),
-                                    existing_indexes,
-                                    source_type,
-                                });
-                            }
-                        }
-
-                        let source_description = self.catalog.source_description_for(*id).unwrap();
-
-                        let persist_desc = self
-                            .persister
-                            .load_source_persist_desc(&source)
-                            .map_err(CoordError::Persistence)?;
-
-                        dataflow.import_source(*id, source_description, persist_desc);
-                    }
-                    CatalogItem::View(view) => {
-                        let expr = view.optimized_expr.clone();
-                        self.import_view_into_dataflow(id, &expr, dataflow)?;
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            Ok(())
-        })
-    }
-
-    /// Imports the view with the specified ID and expression into the provided
-    /// dataflow description.
+    /// Prepares the arguments to an index build dataflow, by interrogating the catalog.
     ///
-    /// You should generally prefer calling
-    /// [`DataflowBuilder::import_into_dataflow`], which can handle objects of
-    /// any type as long as they exist in the catalog. This method exists for
-    /// when the view does not exist in the catalog, e.g., because it is
-    /// identified by a [`GlobalId::Transient`].
-    pub fn import_view_into_dataflow(
-        &mut self,
-        view_id: &GlobalId,
-        view: &OptimizedMirRelationExpr,
-        dataflow: &mut DataflowDesc,
-    ) -> Result<(), CoordError> {
-        for get_id in view.depends_on() {
-            self.import_into_dataflow(&get_id, dataflow)?;
-        }
-        dataflow.insert_plan(*view_id, view.clone());
-        Ok(())
-    }
-
-    /// Builds a dataflow description for the index with the specified ID.
-    ///
-    /// Returns `None` if the index is not enabled.
-    ///
-    /// TODO(benesch): The `DataflowBuilder` shouldn't be in charge of checking
-    /// whether the index is enabled, but it will be easier to clean that up
-    /// when the concept of a "cluster" has been plumbed a bit further.
-    pub fn build_index_dataflow(
-        &mut self,
-        id: GlobalId,
-    ) -> Result<Option<DataflowDesc>, CoordError> {
-        let index_entry = self.catalog.get_entry(&id);
+    /// Returns `None` if the index entry in the catalog in not enabled.
+    pub fn prepare_index_build(
+        catalog: &CatalogState,
+        index_id: &GlobalId,
+    ) -> Option<(String, IndexDesc)> {
+        let index_entry = catalog.get_by_id(&index_id);
         let index = match index_entry.item() {
             CatalogItem::Index(index) => index,
             _ => unreachable!("cannot create index dataflow on non-index"),
         };
         if !index.enabled {
-            return Ok(None);
+            None
+        } else {
+            Some((
+                index_entry.name().to_string(),
+                dataflow_types::IndexDesc {
+                    on_id: index.on,
+                    keys: index.keys.clone(),
+                },
+            ))
         }
-        let on_entry = self.catalog.get_entry(&index.on);
-        let on_type = on_entry
-            .desc(
-                &self
+    }
+}
+
+impl<'a> DataflowBuilder<'a> {
+    /// Imports the view, source, or table with `id` into the provided
+    /// dataflow description.
+    fn import_into_dataflow(&mut self, id: &GlobalId, dataflow: &mut DataflowDesc) {
+        maybe_grow(|| {
+            // Avoid importing the item redundantly.
+            if dataflow.is_imported(id) {
+                return;
+            }
+
+            // A valid index is any index on `id` that is known to the dataflow
+            // layer, as indicated by its presence in `self.indexes`.
+            let valid_index = self.catalog.enabled_indexes()[id]
+                .iter()
+                .find(|(id, _keys)| self.indexes.contains_key(*id));
+            if let Some((index_id, keys)) = valid_index {
+                let index_desc = IndexDesc {
+                    on_id: *id,
+                    keys: keys.to_vec(),
+                };
+                let desc = self
                     .catalog
-                    .resolve_full_name(on_entry.name(), on_entry.conn_id()),
-            )
-            .unwrap()
-            .typ()
-            .clone();
-        let name = index_entry.name().to_string();
+                    .get_by_id(id)
+                    .desc()
+                    .expect("indexes can only be built on items with descs");
+                dataflow.import_index(*index_id, index_desc, desc.typ().clone(), *id);
+            } else {
+                // This is only needed in the case of a source with a transformation, but we generate it now to
+                // get around borrow checker issues.
+                let transient_id = *self.transient_id_counter;
+                *self.transient_id_counter = transient_id
+                    .checked_add(1)
+                    .expect("id counter overflows i64");
+                let entry = self.catalog.get_by_id(id);
+                match entry.item() {
+                    CatalogItem::Table(table) => {
+                        let connector = SourceConnector::Local {
+                            timeline: table.timeline(),
+                            persisted_name: table.persist.as_ref().map(|p| p.stream_name.clone()),
+                        };
+                        dataflow.import_source(
+                            *id,
+                            dataflow_types::SourceDesc {
+                                name: entry.name().to_string(),
+                                connector,
+                                operators: None,
+                                bare_desc: table.desc.clone(),
+                            },
+                            *id,
+                        );
+                    }
+                    CatalogItem::Source(source) => {
+                        let source_connector = dataflow_types::SourceDesc {
+                            name: entry.name().to_string(),
+                            connector: source.connector.clone(),
+                            operators: None,
+                            bare_desc: source.bare_desc.clone(),
+                        };
+
+                        if source.optimized_expr.0.is_trivial_source() {
+                            dataflow.import_source(*id, source_connector, *id);
+                        } else {
+                            // From the dataflow layer's perspective, the source transformation is just a view (across which it should be able to do whole-dataflow optimizations).
+                            // Install it as such (giving the source a global transient ID by which the view/transformation can refer to it)
+                            let bare_source_id = GlobalId::Transient(transient_id);
+                            dataflow.import_source(bare_source_id, source_connector, *id);
+                            let mut transformation = source.optimized_expr.clone();
+                            transformation.0.visit_mut_post(&mut |node| {
+                                match node {
+                                    MirRelationExpr::Get { id, .. }
+                                        if *id == Id::LocalBareSource =>
+                                    {
+                                        *id = Id::Global(bare_source_id);
+                                    }
+                                    _ => {}
+                                };
+                            });
+                            self.import_view_into_dataflow(id, &transformation, dataflow);
+                        }
+                    }
+                    CatalogItem::View(view) => {
+                        let expr = view.optimized_expr.clone();
+                        self.import_view_into_dataflow(id, &expr, dataflow);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        })
+    }
+
+    /// Imports the view with the specified ID and expression into the provided
+    /// dataflow description.
+    pub fn import_view_into_dataflow(
+        &mut self,
+        view_id: &GlobalId,
+        view: &OptimizedMirRelationExpr,
+        dataflow: &mut DataflowDesc,
+    ) {
+        // TODO: We only need to import Get arguments for which we cannot find arrangements.
+        for get_id in view.global_uses() {
+            self.import_into_dataflow(&get_id, dataflow);
+
+            // TODO: indexes should be imported after the optimization process, and only those
+            // actually used by the optimized plan
+            if let Some(indexes) = self.catalog.enabled_indexes().get(&get_id) {
+                for (id, keys) in indexes.iter() {
+                    // Ensure only valid indexes (i.e. those in self.indexes) are imported.
+                    // TODO(#8318): Ensure this logic is accounted for.
+                    if !self.indexes.contains_key(*id) {
+                        continue;
+                    }
+                    let on_entry = self.catalog.get_by_id(&get_id);
+                    let on_type = on_entry.desc().unwrap().typ().clone();
+                    let index_desc = IndexDesc {
+                        on_id: get_id,
+                        keys: keys.clone(),
+                    };
+                    dataflow.import_index(*id, index_desc, on_type, *view_id);
+                }
+            }
+        }
+        dataflow.insert_view(*view_id, view.clone());
+    }
+
+    /// Builds a dataflow description for the index with the specified ID.
+    pub fn build_index_dataflow(
+        &mut self,
+        name: String,
+        id: GlobalId,
+        index_description: dataflow_types::IndexDesc,
+    ) -> DataflowDesc {
+        let on_entry = self.catalog.get_by_id(&index_description.on_id);
+        let on_type = on_entry.desc().unwrap().typ().clone();
         let mut dataflow = DataflowDesc::new(name);
-        self.import_into_dataflow(&index.on, &mut dataflow)?;
-        for BuildDesc { plan, .. } in &mut dataflow.objects_to_build {
-            prep_relation_expr(self.catalog, plan, ExprPrepStyle::Index)?;
-        }
-        let mut index_description = mz_dataflow_types::IndexDesc {
-            on_id: index.on,
-            key: index.keys.clone(),
-        };
-        for key in &mut index_description.key {
-            prep_scalar_expr(self.catalog, key, ExprPrepStyle::Index)?;
-        }
+        self.import_into_dataflow(&index_description.on_id, &mut dataflow);
         dataflow.export_index(id, index_description, on_type);
-
-        // Optimize the dataflow across views, and any other ways that appeal.
-        mz_transform::optimize_dataflow(&mut dataflow, &self.index_oracle())?;
-
-        Ok(Some(dataflow))
+        dataflow
     }
 
     /// Builds a dataflow description for the sink with the specified name,
@@ -265,196 +211,12 @@ impl<'a> DataflowBuilder<'a, mz_repr::Timestamp> {
         &mut self,
         name: String,
         id: GlobalId,
-        sink_description: SinkDesc,
-    ) -> Result<DataflowDesc, CoordError> {
+        sink_description: dataflow_types::SinkDesc,
+    ) -> DataflowDesc {
         let mut dataflow = DataflowDesc::new(name);
-        self.build_sink_dataflow_into(&mut dataflow, id, sink_description)?;
-        Ok(dataflow)
-    }
-
-    /// Like `build_sink_dataflow`, but builds the sink dataflow into the
-    /// existing dataflow description instead of creating one from scratch.
-    pub fn build_sink_dataflow_into(
-        &mut self,
-        dataflow: &mut DataflowDesc,
-        id: GlobalId,
-        sink_description: SinkDesc,
-    ) -> Result<(), CoordError> {
         dataflow.set_as_of(sink_description.as_of.frontier.clone());
-        self.import_into_dataflow(&sink_description.from, dataflow)?;
-        for BuildDesc { plan, .. } in &mut dataflow.objects_to_build {
-            prep_relation_expr(self.catalog, plan, ExprPrepStyle::Index)?;
-        }
+        self.import_into_dataflow(&sink_description.from, &mut dataflow);
         dataflow.export_sink(id, sink_description);
-
-        // Optimize the dataflow across views, and any other ways that appeal.
-        mz_transform::optimize_dataflow(dataflow, &self.index_oracle())?;
-
-        Ok(())
-    }
-}
-
-/// Prepares a relation expression for dataflow execution by preparing all
-/// contained scalar expressions (see `prep_scalar_expr`) in the specified
-/// style.
-pub fn prep_relation_expr(
-    catalog: &CatalogState,
-    expr: &mut OptimizedMirRelationExpr,
-    style: ExprPrepStyle,
-) -> Result<(), CoordError> {
-    match style {
-        ExprPrepStyle::Index => {
-            expr.0.try_visit_mut_post(&mut |e| {
-                // Carefully test filter expressions, which may represent temporal filters.
-                if let MirRelationExpr::Filter { input, predicates } = &*e {
-                    let mfp =
-                        MapFilterProject::new(input.arity()).filter(predicates.iter().cloned());
-                    match mfp.into_plan() {
-                        Err(e) => coord_bail!("{:?}", e),
-                        Ok(_) => Ok(()),
-                    }
-                } else {
-                    e.try_visit_scalars_mut1(&mut |s| prep_scalar_expr(catalog, s, style))
-                }
-            })
-        }
-        ExprPrepStyle::OneShot { .. } => expr
-            .0
-            .try_visit_scalars_mut(&mut |s| prep_scalar_expr(catalog, s, style)),
-    }
-}
-
-/// Prepares a scalar expression for execution by handling unmaterializable
-/// functions.
-///
-/// Specifically, calls to unmaterializable functions are replaced if
-/// `style` is `OneShot`. If `style` is `Index`, then an error is produced
-/// if a call to a unmaterializable function is encountered.
-pub fn prep_scalar_expr(
-    state: &CatalogState,
-    expr: &mut MirScalarExpr,
-    style: ExprPrepStyle,
-) -> Result<(), CoordError> {
-    match style {
-        // Evaluate each unmaterializable function and replace the
-        // invocation with the result.
-        ExprPrepStyle::OneShot {
-            logical_time,
-            session,
-        } => {
-            let mut res = Ok(());
-            expr.visit_mut_post(&mut |e| {
-                if let MirScalarExpr::CallUnmaterializable(f) = e {
-                    match eval_unmaterializable_func(state, f, logical_time, session) {
-                        Ok(evaled) => *e = evaled,
-                        Err(e) => res = Err(e),
-                    }
-                }
-            });
-            res
-        }
-
-        // Reject the query if it contains any unmaterializable function calls.
-        ExprPrepStyle::Index => {
-            let mut last_observed_unmaterializable_func = None;
-            expr.visit_mut_post(&mut |e| {
-                if let MirScalarExpr::CallUnmaterializable(f) = e {
-                    last_observed_unmaterializable_func = Some(f.clone());
-                }
-            });
-            if let Some(f) = last_observed_unmaterializable_func {
-                return Err(CoordError::UnmaterializableFunction(f));
-            }
-            Ok(())
-        }
-    }
-}
-
-fn eval_unmaterializable_func(
-    state: &CatalogState,
-    f: &UnmaterializableFunc,
-    logical_time: Option<u64>,
-    session: &Session,
-) -> Result<MirScalarExpr, CoordError> {
-    let pack_1d_array = |datums: Vec<Datum>| {
-        let mut row = Row::default();
-        row.packer()
-            .push_array(
-                &[ArrayDimension {
-                    lower_bound: 1,
-                    length: datums.len(),
-                }],
-                datums,
-            )
-            .expect("known to be a valid array");
-        Ok(MirScalarExpr::Literal(Ok(row), f.output_type()))
-    };
-    let pack = |datum| {
-        Ok(MirScalarExpr::literal_ok(
-            datum,
-            f.output_type().scalar_type,
-        ))
-    };
-
-    match f {
-        UnmaterializableFunc::CurrentDatabase => pack(Datum::from(session.vars().database())),
-        UnmaterializableFunc::CurrentSchemasWithSystem => pack_1d_array(
-            session
-                .vars()
-                .search_path()
-                .iter()
-                .map(|s| Datum::String(s))
-                .collect(),
-        ),
-        UnmaterializableFunc::CurrentSchemasWithoutSystem => {
-            use crate::catalog::builtin::{
-                INFORMATION_SCHEMA, MZ_CATALOG_SCHEMA, MZ_INTERNAL_SCHEMA, MZ_TEMP_SCHEMA,
-                PG_CATALOG_SCHEMA,
-            };
-            pack_1d_array(
-                session
-                    .vars()
-                    .search_path()
-                    .iter()
-                    .filter(|s| {
-                        (**s != PG_CATALOG_SCHEMA)
-                            && (**s != INFORMATION_SCHEMA)
-                            && (**s != MZ_CATALOG_SCHEMA)
-                            && (**s != MZ_TEMP_SCHEMA)
-                            && (**s != MZ_INTERNAL_SCHEMA)
-                    })
-                    .map(|s| Datum::String(s))
-                    .collect(),
-            )
-        }
-        UnmaterializableFunc::CurrentTimestamp => pack(Datum::from(session.pcx().wall_time)),
-        UnmaterializableFunc::CurrentUser => pack(Datum::from(session.user())),
-        UnmaterializableFunc::MzClusterId => pack(Datum::from(state.config().cluster_id)),
-        UnmaterializableFunc::MzLogicalTimestamp => match logical_time {
-            None => coord_bail!("cannot call mz_logical_timestamp in this context"),
-            Some(logical_time) => pack(Datum::from(Numeric::from(logical_time))),
-        },
-        UnmaterializableFunc::MzSessionId => pack(Datum::from(state.config().session_id)),
-        UnmaterializableFunc::MzUptime => {
-            let uptime = state.config().start_instant.elapsed();
-            let uptime = chrono::Duration::from_std(uptime).map_or(Datum::Null, Datum::from);
-            pack(uptime)
-        }
-        UnmaterializableFunc::MzVersion => {
-            pack(Datum::from(&*state.config().build_info.human_version()))
-        }
-        UnmaterializableFunc::PgBackendPid => pack(Datum::Int32(session.conn_id() as i32)),
-        UnmaterializableFunc::PgPostmasterStartTime => pack(Datum::from(state.config().start_time)),
-        UnmaterializableFunc::Version => {
-            let build_info = state.config().build_info;
-            let version = format!(
-                "PostgreSQL {}.{} on {} (materialized {})",
-                SERVER_MAJOR_VERSION,
-                SERVER_MINOR_VERSION,
-                build_info.target_triple,
-                build_info.version,
-            );
-            pack(Datum::from(&*version))
-        }
+        dataflow
     }
 }

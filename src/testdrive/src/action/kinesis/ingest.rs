@@ -7,15 +7,14 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use anyhow::{bail, Context};
 use async_trait::async_trait;
-use aws_sdk_kinesis::types::{Blob, SdkError};
+use aws_sdk_kinesis::{Blob, SdkError};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
-use mz_ore::retry::Retry;
+use ore::retry::Retry;
 
-use crate::action::{Action, ControlFlow, State};
+use crate::action::{Action, State};
 use crate::parser::BuiltinCommand;
 
 pub struct IngestAction {
@@ -23,11 +22,11 @@ pub struct IngestAction {
     rows: Vec<String>,
 }
 
-pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, anyhow::Error> {
+pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, String> {
     let stream_prefix = format!("testdrive-{}", cmd.args.string("stream")?);
     match cmd.args.string("format")?.as_str() {
         "bytes" => (),
-        f => bail!("unsupported message format for Kinesis: {}", f),
+        f => return Err(format!("unsupported message format for Kinesis: {}", f)),
     }
     cmd.args.done()?;
 
@@ -39,11 +38,11 @@ pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, anyhow::Err
 
 #[async_trait]
 impl Action for IngestAction {
-    async fn undo(&self, _state: &mut State) -> Result<(), anyhow::Error> {
+    async fn undo(&self, _state: &mut State) -> Result<(), String> {
         Ok(())
     }
 
-    async fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+    async fn redo(&self, state: &mut State) -> Result<(), String> {
         let stream_name = format!("{}-{}", self.stream_prefix, state.seed);
 
         for row in &self.rows {
@@ -60,7 +59,7 @@ impl Action for IngestAction {
             // be prepared to back off.
             Retry::default()
                 .max_duration(state.default_timeout)
-                .retry_async_canceling(|_| async {
+                .retry_async(|_| async {
                     match state
                         .kinesis_client
                         .put_record()
@@ -74,14 +73,14 @@ impl Action for IngestAction {
                         Err(SdkError::ServiceError { err, .. })
                             if err.is_resource_not_found_exception() =>
                         {
-                            bail!("resource not found: {}", err)
+                            Err(format!("resource not found: {}", err))
                         }
-                        Err(err) => Err(err).context("putting Kinesis record"),
+                        Err(err) => Err(format!("unable to put Kinesis record: {}", err)),
                     }
                 })
                 .await
-                .context("putting Kinesis record")?;
+                .map_err(|e| format!("trying to put Kinesis record: {}", e))?;
         }
-        Ok(ControlFlow::Continue)
+        Ok(())
     }
 }

@@ -10,25 +10,23 @@
 #![warn(missing_docs)]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::fmt;
-use std::num::NonZeroUsize;
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use mz_lowertest::MzReflect;
-use mz_ore::collections::CollectionExt;
-use mz_ore::id_gen::IdGen;
-use mz_ore::stack::{maybe_grow, CheckedRecursion, RecursionGuard, RecursionLimitError};
-use mz_repr::adt::numeric::NumericMaxScale;
-use mz_repr::{ColumnName, ColumnType, Datum, Diff, RelationType, Row, ScalarType};
+use lowertest::{MzEnumReflect, MzStructReflect};
+use ore::collections::CollectionExt;
+use ore::id_gen::IdGen;
+use ore::stack::{maybe_grow, CheckedRecursion, RecursionGuard, RecursionLimitError};
+use repr::{ColumnName, ColumnType, Datum, Diff, RelationType, Row, ScalarType};
 
 use self::func::{AggregateFunc, TableFunc};
 use crate::explain::ViewExplanation;
 use crate::{
-    func as scalar_func, DummyHumanizer, EvalError, ExprHumanizer, GlobalId, Id, LocalId,
-    MirScalarExpr, UnaryFunc, VariadicFunc,
+    func as scalar_func, BinaryFunc, DummyHumanizer, EvalError, ExprHumanizer, GlobalId, Id,
+    LocalId, MirScalarExpr, UnaryFunc, VariadicFunc,
 };
 
 pub mod canonicalize;
@@ -47,26 +45,11 @@ pub mod join_input_mapper;
 /// Until we fix those, we need to stick with the larger recursion limit.
 pub const RECURSION_LIMIT: usize = 2048;
 
-/// A trait for types that describe how to build a collection.
-pub trait CollectionPlan {
-    /// Appends global identifiers on which this plan depends to `out`.
-    fn depends_on_into(&self, out: &mut BTreeSet<GlobalId>);
-
-    /// Returns the global identifiers on which this plan depends.
-    ///
-    /// See [`CollectionPlan::depends_on_into`] to reuse an existing `BTreeSet`.
-    fn depends_on(&self) -> BTreeSet<GlobalId> {
-        let mut out = BTreeSet::new();
-        self.depends_on_into(&mut out);
-        out
-    }
-}
-
 /// An abstract syntax tree which defines a collection.
 ///
 /// The AST is meant reflect the capabilities of the `differential_dataflow::Collection` type,
 /// written generically enough to avoid run-time compilation work.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzEnumReflect)]
 pub enum MirRelationExpr {
     /// A constant relation containing specified rows.
     ///
@@ -82,7 +65,6 @@ pub enum MirRelationExpr {
     /// The runtime memory footprint of this operator is zero.
     Get {
         /// The identifier for the collection to load.
-        #[mzreflect(ignore)]
         id: Id,
         /// Schema of the collection.
         typ: RelationType,
@@ -92,11 +74,10 @@ pub enum MirRelationExpr {
     /// The runtime memory footprint of this operator is zero.
     Let {
         /// The identifier to be used in `Get` variants to retrieve `value`.
-        #[mzreflect(ignore)]
         id: LocalId,
-        /// The collection to be bound to `id`.
+        /// The collection to be bound to `name`.
         value: Box<MirRelationExpr>,
-        /// The result of the `Let`, evaluated with `id` bound to `value`.
+        /// The result of the `Let`, evaluated with `name` bound to `value`.
         body: Box<MirRelationExpr>,
     },
     /// Project out some columns from a dataflow
@@ -236,6 +217,18 @@ pub enum MirRelationExpr {
         input: Box<MirRelationExpr>,
         /// Columns to arrange `input` by, in order of decreasing primacy
         keys: Vec<Vec<MirScalarExpr>>,
+    },
+    /// Declares that `keys` are primary keys for `input`.
+    /// Should be used *very* sparingly, and only if there's no plausible
+    /// way to derive the key information from the underlying expression.
+    /// The result of declaring a key that isn't actually a key for the underlying expression is undefined.
+    ///
+    /// There is no operator rendered for this IR node; thus, its runtime memory footprint is zero.
+    DeclareKeys {
+        /// The source collection
+        input: Box<MirRelationExpr>,
+        /// The set of columns in the source collection that form a key.
+        keys: Vec<Vec<usize>>,
     },
 }
 
@@ -723,6 +716,9 @@ impl MirRelationExpr {
                 // Important: do not inherit keys of either input, as not unique.
             }
             MirRelationExpr::ArrangeBy { .. } => input_types[0].clone(),
+            MirRelationExpr::DeclareKeys { keys, .. } => {
+                input_types[0].clone().with_keys(keys.clone())
+            }
         }
     }
 
@@ -753,6 +749,7 @@ impl MirRelationExpr {
             MirRelationExpr::Threshold { input } => input.arity(),
             MirRelationExpr::Union { base, inputs: _ } => base.arity(),
             MirRelationExpr::ArrangeBy { input, .. } => input.arity(),
+            MirRelationExpr::DeclareKeys { input, .. } => input.arity(),
         }
     }
 
@@ -816,14 +813,6 @@ impl MirRelationExpr {
         }
     }
 
-    /// Append to each row a single `scalar`.
-    pub fn map_one(self, scalar: MirScalarExpr) -> Self {
-        MirRelationExpr::Map {
-            input: Box::new(self),
-            scalars: vec![scalar],
-        }
-    }
-
     /// Like `map`, but yields zero-or-more output rows per input row
     pub fn flat_map(self, func: TableFunc, exprs: Vec<MirScalarExpr>) -> Self {
         MirRelationExpr::FlatMap {
@@ -861,8 +850,8 @@ impl MirRelationExpr {
     /// # Example
     ///
     /// ```rust
-    /// use mz_repr::{Datum, ColumnType, RelationType, ScalarType};
-    /// use mz_expr::MirRelationExpr;
+    /// use repr::{Datum, ColumnType, RelationType, ScalarType};
+    /// use expr::MirRelationExpr;
     ///
     /// // A common schema for each input.
     /// let schema = RelationType::new(vec![
@@ -1038,6 +1027,32 @@ impl MirRelationExpr {
         }
     }
 
+    /// Returns the distinct global identifiers on which this expression
+    /// depends.
+    ///
+    /// See [`MirRelationExpr::global_uses_into`] to reuse an existing vector.
+    pub fn global_uses(&self) -> Vec<GlobalId> {
+        let mut out = vec![];
+        self.global_uses_into(&mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Appends global identifiers on which this expression depends to `out`.
+    ///
+    /// Unlike [`MirRelationExpr::global_uses`], this method does not deduplicate
+    /// the global identifiers.
+    pub fn global_uses_into(&self, out: &mut Vec<GlobalId>) {
+        if let MirRelationExpr::Get {
+            id: Id::Global(id), ..
+        } = self
+        {
+            out.push(*id);
+        }
+        self.visit_children(|expr| expr.global_uses_into(out))
+    }
+
     /// Pretty-print this MirRelationExpr to a string.
     ///
     /// This method allows an additional `ExprHumanizer` which can annotate
@@ -1127,13 +1142,9 @@ impl MirRelationExpr {
         self,
         id_gen: &mut IdGen,
         keys_and_values: MirRelationExpr,
-        default: Vec<(Datum, ScalarType)>,
+        default: Vec<(Datum, ColumnType)>,
     ) -> MirRelationExpr {
-        let (data, column_types): (Vec<_>, Vec<_>) = default
-            .into_iter()
-            .map(|(datum, scalar_type)| (datum, scalar_type.nullable(datum.is_null())))
-            .unzip();
-        assert_eq!(keys_and_values.arity() - self.arity(), data.len());
+        assert_eq!(keys_and_values.arity() - self.arity(), default.len());
         self.let_in(id_gen, |_id_gen, get_keys| {
             MirRelationExpr::join(
                 vec![
@@ -1156,8 +1167,8 @@ impl MirRelationExpr {
             // potential predicate pushdown and elision in the
             // optimizer.
             .product(MirRelationExpr::constant(
-                vec![data],
-                RelationType::new(column_types),
+                vec![default.iter().map(|(datum, _)| *datum).collect()],
+                RelationType::new(default.iter().map(|(_, typ)| typ.clone()).collect()),
             ))
         })
     }
@@ -1172,7 +1183,7 @@ impl MirRelationExpr {
         self,
         id_gen: &mut IdGen,
         keys_and_values: MirRelationExpr,
-        default: Vec<(Datum<'static>, ScalarType)>,
+        default: Vec<(Datum<'static>, ColumnType)>,
     ) -> MirRelationExpr {
         keys_and_values.let_in(id_gen, |id_gen, get_keys_and_values| {
             get_keys_and_values.clone().union(self.anti_lookup(
@@ -1183,11 +1194,23 @@ impl MirRelationExpr {
         })
     }
 
-    /// True iff the expression contains a `NullaryFunc::MzLogicalTimestamp`.
-    pub fn contains_temporal(&mut self) -> bool {
-        let mut contains = false;
-        self.visit_scalars_mut(&mut |e| contains = contains || e.contains_temporal());
-        contains
+    /// Passes the collection through unchanged, but informs the optimizer that `keys` are primary keys.
+    pub fn declare_keys(self, keys: Vec<Vec<usize>>) -> Self {
+        Self::DeclareKeys {
+            input: Box::new(self),
+            keys,
+        }
+    }
+
+    /// Returns whether this collection is just a `Get` wrapping an underlying bare source.
+    pub fn is_trivial_source(&self) -> bool {
+        matches!(
+            self,
+            MirRelationExpr::Get {
+                id: Id::LocalBareSource,
+                ..
+            }
+        )
     }
 
     /// Applies a fallible immutable `f` to each child of type `MirRelationExpr`.
@@ -1340,18 +1363,6 @@ impl MirRelationExpr {
     }
 }
 
-impl CollectionPlan for MirRelationExpr {
-    fn depends_on_into(&self, out: &mut BTreeSet<GlobalId>) {
-        if let MirRelationExpr::Get {
-            id: Id::Global(id), ..
-        } = self
-        {
-            out.insert(*id);
-        }
-        self.visit_children(|expr| expr.depends_on_into(out))
-    }
-}
-
 #[derive(Debug)]
 struct MirRelationExprVisitor {
     recursion_guard: RecursionGuard,
@@ -1413,6 +1424,9 @@ impl MirRelationExprVisitor {
             MirRelationExpr::ArrangeBy { input, .. } => {
                 f(input)?;
             }
+            MirRelationExpr::DeclareKeys { input, .. } => {
+                f(input)?;
+            }
         }
         Ok(())
     }
@@ -1466,6 +1480,9 @@ impl MirRelationExprVisitor {
             MirRelationExpr::ArrangeBy { input, .. } => {
                 f(input)?;
             }
+            MirRelationExpr::DeclareKeys { input, .. } => {
+                f(input)?;
+            }
         }
         Ok(())
     }
@@ -1515,6 +1532,9 @@ impl MirRelationExprVisitor {
             MirRelationExpr::ArrangeBy { input, .. } => {
                 f(input);
             }
+            MirRelationExpr::DeclareKeys { input, .. } => {
+                f(input);
+            }
         }
     }
 
@@ -1561,6 +1581,9 @@ impl MirRelationExprVisitor {
                 }
             }
             MirRelationExpr::ArrangeBy { input, .. } => {
+                f(input);
+            }
+            MirRelationExpr::DeclareKeys { input, .. } => {
                 f(input);
             }
         }
@@ -1787,6 +1810,7 @@ impl MirRelationExprVisitor {
             }
             | MirRelationExpr::Negate { input: _ }
             | MirRelationExpr::Threshold { input: _ }
+            | MirRelationExpr::DeclareKeys { input: _, keys: _ }
             | MirRelationExpr::Union { base: _, inputs: _ } => Ok(()),
         }
     }
@@ -1827,7 +1851,7 @@ impl CheckedRecursion for MirRelationExprVisitor {
 }
 
 /// Specification for an ordering by a column.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, MzReflect)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, MzStructReflect)]
 pub struct ColumnOrder {
     /// The column index.
     pub column: usize,
@@ -1841,14 +1865,14 @@ impl fmt::Display for ColumnOrder {
         write!(
             f,
             "#{} {}",
-            self.column,
+            self.column.to_string(),
             if self.desc { "desc" } else { "asc" }
         )
     }
 }
 
 /// Describes an aggregation expression.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect)]
 pub struct AggregateExpr {
     /// Names the aggregation function.
     pub func: AggregateFunc,
@@ -1900,14 +1924,16 @@ impl AggregateExpr {
     pub fn on_unique(&self, input_type: &RelationType) -> MirScalarExpr {
         match self.func {
             // Count is one if non-null, and zero if null.
-            AggregateFunc::Count => self
-                .expr
-                .clone()
-                .call_unary(UnaryFunc::IsNull(crate::func::IsNull))
-                .if_then_else(
-                    MirScalarExpr::literal_ok(Datum::Int64(0), ScalarType::Int64),
-                    MirScalarExpr::literal_ok(Datum::Int64(1), ScalarType::Int64),
-                ),
+            AggregateFunc::Count => {
+                let column_type = self.typ(&input_type);
+                self.expr
+                    .clone()
+                    .call_unary(UnaryFunc::IsNull(crate::func::IsNull))
+                    .if_then_else(
+                        MirScalarExpr::literal_ok(Datum::Int64(0), column_type.scalar_type.clone()),
+                        MirScalarExpr::literal_ok(Datum::Int64(1), column_type.scalar_type),
+                    )
+            }
 
             // SumInt16 takes Int16s as input, but outputs Int64s.
             AggregateFunc::SumInt16 => self
@@ -1923,7 +1949,7 @@ impl AggregateExpr {
 
             // SumInt64 takes Int64s as input, but outputs numerics.
             AggregateFunc::SumInt64 => self.expr.clone().call_unary(UnaryFunc::CastInt64ToNumeric(
-                scalar_func::CastInt64ToNumeric(Some(NumericMaxScale::ZERO)),
+                scalar_func::CastInt64ToNumeric(Some(0)),
             )),
 
             // JsonbAgg takes _anything_ as input, but must output a Jsonb array.
@@ -1957,21 +1983,16 @@ impl AggregateExpr {
 
             // RowNumber takes a list of records and outputs a list containing exactly 1 element
             AggregateFunc::RowNumber { .. } => {
-                let list = self
+                let record = self
                     .expr
                     .clone()
                     // extract the list within the record
-                    .call_unary(UnaryFunc::RecordGet(0));
-
-                // extract the expression within the list
-                let record = MirScalarExpr::CallVariadic {
-                    func: VariadicFunc::ListIndex,
-                    exprs: vec![
-                        list,
+                    .call_unary(UnaryFunc::RecordGet(0))
+                    // extract the expression within the list
+                    .call_binary(
                         MirScalarExpr::literal_ok(Datum::Int64(1), ScalarType::Int64),
-                    ],
-                };
-
+                        BinaryFunc::ListIndex,
+                    );
                 MirScalarExpr::CallVariadic {
                     func: VariadicFunc::ListCreate {
                         elem_type: self
@@ -2041,7 +2062,7 @@ impl fmt::Display for AggregateExpr {
 }
 
 /// Describe a join implementation in dataflow.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzEnumReflect)]
 pub enum JoinImplementation {
     /// Perform a sequence of binary differential dataflow joins.
     ///
@@ -2099,99 +2120,43 @@ impl RowSetFinishing {
             && self.offset == 0
             && self.project.iter().copied().eq(0..arity)
     }
-    /// Determines the index of the (Row, count) pair, and the
-    /// index into the count within that pair, corresponding to a particular offset.
-    ///
-    /// For example, if `self.offset` is 42, and `rows` is
-    /// `&[(_, 10), (_, 17), (_, 20), (_, 11)]`,
-    /// then this function will return `(2, 15)`, because after applying
-    /// the offset, we will start at the row/diff pair in position 2,
-    /// and skip 15 of the 20 rows that that entry represents.
-    fn find_offset(&self, rows: &[(Row, NonZeroUsize)]) -> (usize, usize) {
-        let mut offset_remaining = self.offset;
-        for (i, (_, count)) in rows.iter().enumerate() {
-            let count = count.get();
-            if count > offset_remaining {
-                return (i, offset_remaining);
-            }
-            offset_remaining -= count;
-        }
-        // The offset is past the end of the rows; we will
-        // return nothing.
-        (rows.len(), 0)
-    }
-    /// Applies finishing actions to a row set,
-    /// and unrolls it to a unary representation.
-    pub fn finish(&self, mut rows: Vec<(Row, NonZeroUsize)>) -> Vec<Row> {
-        let mut left_datum_vec = mz_repr::DatumVec::new();
-        let mut right_datum_vec = mz_repr::DatumVec::new();
-        let sort_by = |(left, _): &(Row, _), (right, _): &(Row, _)| {
+    /// Applies finishing actions to a row set.
+    pub fn finish(&self, rows: &mut Vec<Row>) {
+        let mut left_datum_vec = repr::DatumVec::new();
+        let mut right_datum_vec = repr::DatumVec::new();
+        let mut sort_by = |left: &Row, right: &Row| {
             let left_datums = left_datum_vec.borrow_with(left);
             let right_datums = right_datum_vec.borrow_with(right);
             compare_columns(&self.order_by, &left_datums, &right_datums, || {
                 left.cmp(&right)
             })
         };
-        rows.sort_by(sort_by);
-
-        let (offset_nth_row, offset_kth_copy) = self.find_offset(&rows);
-
-        // Adjust the first returned row's count to account for the offset.
-        if let Some((_, nth_diff)) = rows.get_mut(offset_nth_row) {
-            // Justification for `unwrap`:
-            // we only get here if we return from `get_offset`
-            // having found something to return,
-            // which can only happen if the count of
-            // this row is greater than the offset remaining.
-            *nth_diff = NonZeroUsize::new(nth_diff.get() - offset_kth_copy).unwrap();
-        }
-
-        let limit = self.limit.unwrap_or(std::usize::MAX);
-
-        // The code below is logically equivalent to:
-        //
-        // let mut total = 0;
-        // for (_, count) in &rows[offset_nth_row..] {
-        //     total += count.get();
-        // }
-        // let return_size = std::cmp::min(total, limit);
-        //
-        // but it breaks early if the limit is reached, instead of scanning the entire code.
-        let return_size = rows[offset_nth_row..]
-            .iter()
-            .try_fold(0, |sum, (_, count)| {
-                let new_sum = sum + count.get();
-                if new_sum > limit {
-                    None
-                } else {
-                    Some(new_sum)
+        let offset = self.offset;
+        if offset > rows.len() {
+            *rows = Vec::new();
+        } else {
+            if let Some(limit) = self.limit {
+                let offset_plus_limit = offset + limit;
+                if rows.len() > offset_plus_limit {
+                    pdqselect::select_by(rows, offset_plus_limit, &mut sort_by);
+                    rows.truncate(offset_plus_limit);
                 }
-            })
-            .unwrap_or(limit);
-
-        let mut ret = Vec::with_capacity(return_size);
-        let mut remaining = limit;
-        let mut row_buf = Row::default();
-        let mut datum_vec = mz_repr::DatumVec::new();
-        for (row, count) in &rows[offset_nth_row..] {
-            if remaining == 0 {
-                break;
             }
-            let count = std::cmp::min(count.get(), remaining);
-            for _ in 0..count {
-                let new_row = {
+            if offset > 0 {
+                pdqselect::select_by(rows, offset, &mut sort_by);
+                rows.drain(..offset);
+            }
+            rows.sort_by(&mut sort_by);
+            let mut row_packer = Row::default();
+            let mut datum_vec = repr::DatumVec::new();
+            for row in rows.iter_mut() {
+                *row = {
                     let datums = datum_vec.borrow_with(&row);
-                    row_buf
-                        .packer()
-                        .extend(self.project.iter().map(|i| &datums[*i]));
-                    row_buf.clone()
+                    row_packer.extend(self.project.iter().map(|i| &datums[*i]));
+                    row_packer.finish_and_reuse()
                 };
-                ret.push(new_row);
             }
-            remaining -= count;
         }
-
-        ret
     }
 }
 

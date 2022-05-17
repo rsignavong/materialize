@@ -9,9 +9,9 @@
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 
-use mz_repr::adt::datetime::DateTimeField;
-use mz_repr::adt::interval::Interval;
-use mz_repr::strconv;
+use repr::adt::datetime::DateTimeField;
+use repr::adt::interval::Interval;
+use repr::strconv;
 
 #[test]
 fn test_parse_date() {
@@ -322,48 +322,38 @@ fn test_parse_interval_monthlike() {
 fn test_parse_interval_durationlike() {
     use DateTimeField::*;
 
-    run_test_parse_interval_durationlike("10", Interval::new(0, 0, 10 * 1_000_000).unwrap());
+    run_test_parse_interval_durationlike("10", Interval::new(0, 10, 0).unwrap());
 
-    run_test_parse_interval_durationlike_from_sql("10", Day, Interval::new(0, 10, 0).unwrap());
+    run_test_parse_interval_durationlike_from_sql(
+        "10",
+        Day,
+        Interval::new(0, 10 * 24 * 60 * 60, 0).unwrap(),
+    );
 
     run_test_parse_interval_durationlike_from_sql(
         "10",
         Hour,
-        Interval::new(0, 0, 10 * 60 * 60 * 1_000_000).unwrap(),
+        Interval::new(0, 10 * 60 * 60, 0).unwrap(),
     );
 
     run_test_parse_interval_durationlike_from_sql(
         "10",
         Minute,
-        Interval::new(0, 0, 10 * 60 * 1_000_000).unwrap(),
+        Interval::new(0, 10 * 60, 0).unwrap(),
     );
 
-    run_test_parse_interval_durationlike_from_sql(
-        "10",
-        Second,
-        Interval::new(0, 0, 10 * 1_000_000).unwrap(),
-    );
+    run_test_parse_interval_durationlike_from_sql("10", Second, Interval::new(0, 10, 0).unwrap());
 
-    run_test_parse_interval_durationlike("0.01", Interval::new(0, 0, 10_000).unwrap());
+    run_test_parse_interval_durationlike("0.01", Interval::new(0, 0, 10_000_000).unwrap());
 
     run_test_parse_interval_durationlike(
         "1 2:3:4.5",
-        Interval::new(
-            0,
-            1,
-            (2 * 60 * 60 * 1_000_000) + (3 * 60 * 1_000_000) + (4 * 1_000_000) + 500_000,
-        )
-        .unwrap(),
+        Interval::new(0, 93_784, 500_000_000).unwrap(),
     );
 
     run_test_parse_interval_durationlike(
         "-1 2:3:4.5",
-        Interval::new(
-            0,
-            -1,
-            (2 * 60 * 60 * 1_000_000) + (3 * 60 * 1_000_000) + (4 * 1_000_000) + 500_000,
-        )
-        .unwrap(),
+        Interval::new(0, -79_015, -500_000_000).unwrap(),
     );
 
     fn run_test_parse_interval_durationlike(s: &str, expected: Interval) {
@@ -375,7 +365,7 @@ fn test_parse_interval_durationlike() {
         d: DateTimeField,
         expected: Interval,
     ) {
-        let actual = strconv::parse_interval_w_disambiguator(s, None, d).unwrap();
+        let actual = strconv::parse_interval_w_disambiguator(s, d).unwrap();
         assert_eq!(actual, expected);
     }
 }
@@ -386,76 +376,42 @@ fn test_parse_interval_full() {
 
     run_test_parse_interval_full(
         "6-7 1 2:3:4.5",
-        Interval::new(
-            79,
-            1,
-            (2 * 60 * 60 * 1_000_000) + (3 * 60 * 1_000_000) + (4 * 1_000_000) + 500_000,
-        )
-        .unwrap(),
+        Interval::new(79, 93_784, 500_000_000).unwrap(),
     );
 
     run_test_parse_interval_full(
         "-6-7 1 2:3:4.5",
-        Interval::new(
-            -79,
-            1,
-            (2 * 60 * 60 * 1_000_000) + (3 * 60 * 1_000_000) + (4 * 1_000_000) + 500_000,
-        )
-        .unwrap(),
+        Interval::new(-79, 93_784, 500_000_000).unwrap(),
     );
 
     run_test_parse_interval_full(
         "6-7 -1 -2:3:4.5",
-        Interval::new(
-            79,
-            -1,
-            (-2 * 60 * 60 * 1_000_000) + (-3 * 60 * 1_000_000) + (-4 * 1_000_000) + -500_000,
-        )
-        .unwrap(),
+        Interval::new(79, -93_784, -500_000_000).unwrap(),
     );
 
     run_test_parse_interval_full(
         "-6-7 -1 -2:3:4.5",
-        Interval::new(
-            -79,
-            -1,
-            (-2 * 60 * 60 * 1_000_000) + (-3 * 60 * 1_000_000) + (-4 * 1_000_000) + -500_000,
-        )
-        .unwrap(),
+        Interval::new(-79, -93_784, -500_000_000).unwrap(),
     );
 
     run_test_parse_interval_full(
         "-6-7 1 -2:3:4.5",
-        Interval::new(
-            -79,
-            1,
-            (-2 * 60 * 60 * 1_000_000) + (-3 * 60 * 1_000_000) + (-4 * 1_000_000) + -500_000,
-        )
-        .unwrap(),
+        Interval::new(-79, 79_015, 500_000_000).unwrap(),
     );
 
     run_test_parse_interval_full(
         "-6-7 -1 2:3:4.5",
-        Interval::new(
-            -79,
-            -1,
-            (2 * 60 * 60 * 1_000_000) + (3 * 60 * 1_000_000) + (4 * 1_000_000) + 500_000,
-        )
-        .unwrap(),
+        Interval::new(-79, -79_015, -500_000_000).unwrap(),
     );
 
-    run_test_parse_interval_full_from_sql(
-        "-6-7 1",
-        Minute,
-        Interval::new(-79, 0, 1 * 60 * 1_000_000).unwrap(),
-    );
+    run_test_parse_interval_full_from_sql("-6-7 1", Minute, Interval::new(-79, 60, 0).unwrap());
 
     fn run_test_parse_interval_full(s: &str, expected: Interval) {
         let actual = strconv::parse_interval(s).unwrap();
         assert_eq!(actual, expected);
     }
     fn run_test_parse_interval_full_from_sql(s: &str, d: DateTimeField, expected: Interval) {
-        let actual = strconv::parse_interval_w_disambiguator(s, None, d).unwrap();
+        let actual = strconv::parse_interval_w_disambiguator(s, d).unwrap();
         assert_eq!(actual, expected);
     }
 }
@@ -492,10 +448,9 @@ fn miri_test_format_list() {
     ];
     let mut out = String::new();
     strconv::format_list(&mut out, &list, |lw, el| match el {
-        None => Ok::<_, ()>(lw.write_null()),
-        Some(el) => Ok(strconv::format_string(lw.nonnull_buffer(), el)),
-    })
-    .unwrap();
+        None => lw.write_null(),
+        Some(el) => strconv::format_string(lw.nonnull_buffer(), el),
+    });
     assert_eq!(
         out,
         r#"{a,"a\"b","",NULL,"NULL",nUlL,"  spaces ","a,b","\\","a\\b\"c\\d\""}"#

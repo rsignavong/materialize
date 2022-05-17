@@ -11,88 +11,51 @@
 //! we can ingest it.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use criterion::measurement::{Measurement, WallTime};
-use criterion::{Bencher, BenchmarkGroup, BenchmarkId, Throughput};
+use criterion::measurement::Measurement;
+use criterion::{criterion_group, criterion_main, Bencher, BenchmarkId, Criterion, Throughput};
 use differential_dataflow::operators::Count;
 use differential_dataflow::AsCollection;
-use mz_ore::cast::CastFrom;
-use mz_ore::metrics::MetricsRegistry;
-use mz_persist::s3::{S3Blob, S3BlobConfig};
+use ore::cast::CastFrom;
+use ore::metrics::MetricsRegistry;
 use timely::dataflow::operators::Map;
 use timely::dataflow::ProbeHandle;
-use timely::progress::Antichain;
 use timely::Config;
-use tokio::runtime::Runtime as AsyncRuntime;
 
-use mz_persist::client::RuntimeClient;
-use mz_persist::error::{Error, ErrorLog};
-use mz_persist::file::FileBlob;
-use mz_persist::location::{Blob, LockInfo};
-use mz_persist::operators::source::PersistedSource;
-use mz_persist::runtime::{self, RuntimeConfig};
-use mz_persist::workload::{self, DataGenerator};
+use persist::error::{Error, ErrorLog};
+use persist::file::FileBlob;
+use persist::indexed::runtime::{self, RuntimeClient, RuntimeConfig};
+use persist::operators::source::PersistedSource;
+use persist::storage::{Blob, LockInfo};
+use persist::workload::{self, DataGenerator};
 
-pub fn bench_load(data: &DataGenerator, g: &mut BenchmarkGroup<'_, WallTime>) {
-    let config =
-        futures_executor::block_on(S3BlobConfig::new_for_test()).expect("failed to load s3 config");
-    let config = match config {
-        Some(config) => config,
-        None => return,
-    };
+pub fn bench_end_to_end(c: &mut Criterion) {
+    let mut group = c.benchmark_group("end_to_end");
 
-    g.throughput(Throughput::Bytes(data.goodput_bytes()));
-    g.bench_function(BenchmarkId::new("s3", data.goodput_pretty()), move |b| {
-        b.iter(|| bench_load_s3_one_iter(&data, &config).expect("failed to run load iter"))
-    });
-}
+    let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+    let nonce = "end_to_end".to_string();
+    let collection_name = "end_to_end".to_string();
+    let mut runtime = create_runtime(temp_dir.path(), &nonce).expect("missing runtime");
+    let (write, _read) = runtime.create_or_load(&collection_name);
+    let data = DataGenerator::default();
+    let goodput_bytes = workload::load(&write, &data, true).expect("error writing data");
+    group.throughput(Throughput::Bytes(goodput_bytes));
+    let expected_frontier = u64::cast_from(data.record_count);
+    runtime.stop().expect("runtime shut down cleanly");
 
-// NB: This makes sure to start a new runtime for each iter to ensure the work
-// done in each is as equal as possible.
-fn bench_load_s3_one_iter(data: &DataGenerator, config: &S3BlobConfig) -> Result<(), Error> {
-    let async_runtime = Arc::new(AsyncRuntime::new()?);
-
-    let config = config.clone_with_new_uuid_prefix();
-    let async_guard = async_runtime.enter();
-    let s3_blob =
-        S3Blob::open_exclusive(config, LockInfo::new_no_reentrance("bench_load_s3".into()))?;
-    drop(async_guard);
-
-    let mut runtime = runtime::start(
-        RuntimeConfig::default(),
-        ErrorLog,
-        s3_blob,
-        mz_build_info::DUMMY_BUILD_INFO,
-        &MetricsRegistry::new(),
-        None,
-    )?;
-    let (write, _read) = runtime.create_or_load("end_to_end");
-    workload::load(&write, &data, true)?;
-    runtime.stop()
-}
-
-pub fn bench_replay(data: &DataGenerator, g: &mut BenchmarkGroup<'_, WallTime>) {
-    g.throughput(Throughput::Bytes(data.goodput_bytes()));
-    g.bench_function(BenchmarkId::new("file", data.goodput_pretty()), move |b| {
-        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
-        let nonce = "end_to_end".to_string();
-        let collection_name = "end_to_end".to_string();
-        let mut runtime = create_runtime(temp_dir.path(), &nonce).expect("missing runtime");
-        let (write, _read) = runtime.create_or_load(&collection_name);
-        workload::load(&write, &data, true).expect("error writing data");
-        let expected_frontier = u64::cast_from(data.record_count);
-        runtime.stop().expect("runtime shut down cleanly");
-
-        bench_read_persisted_source(
-            1,
-            temp_dir.path().to_path_buf(),
-            nonce,
-            collection_name,
-            expected_frontier,
-            b,
-        )
-    });
+    group.bench_function(
+        BenchmarkId::new("end_to_end", data.goodput_pretty()),
+        move |b| {
+            bench_read_persisted_source(
+                1,
+                temp_dir.path().to_path_buf(),
+                nonce.clone(),
+                collection_name.clone(),
+                expected_frontier,
+                b,
+            )
+        },
+    );
 }
 
 fn bench_read_persisted_source<M: Measurement>(
@@ -118,7 +81,7 @@ fn bench_read_persisted_source<M: Measurement>(
 
             worker.dataflow(|scope| {
                 scope
-                    .persisted_source(read, &Antichain::from_elem(0))
+                    .persisted_source(read)
                     .flat_map(move |(data, time, diff)| match data {
                         Err(_err) => None,
                         Ok((key, _value)) => Some({
@@ -156,9 +119,15 @@ fn create_runtime(base_path: &Path, nonce: &str) -> Result<RuntimeClient, Error>
         RuntimeConfig::default(),
         ErrorLog,
         FileBlob::open_exclusive(blob_dir.into(), lock_info)?,
-        mz_build_info::DUMMY_BUILD_INFO,
+        build_info::DUMMY_BUILD_INFO,
         &MetricsRegistry::new(),
         None,
     )?;
     Ok(runtime)
 }
+
+criterion_group! {
+    benches,
+    bench_end_to_end,
+}
+criterion_main!(benches);

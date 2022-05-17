@@ -49,7 +49,7 @@ const INLINE_BUF_LEN: usize = 8;
 /// # fn handle_http<S>(stream: S) -> std::io::Result<()> { Ok(()) }
 /// # fn handle_foo<S>(stream: S) -> std::io::Result<()> { Ok(()) }
 /// # use tokio::io::{AsyncRead, AsyncReadExt};
-/// # use mz_ore::netio::SniffingStream;
+/// # use ore::netio::SniffingStream;
 ///
 /// async fn handle_connection<S>(stream: S) -> std::io::Result<()>
 /// where

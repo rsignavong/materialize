@@ -60,16 +60,11 @@
 //! type, we can specialize and render the dataflow to compute those aggregations in the correct order, and
 //! return the output arrangement directly and avoid the extra collation arrangement.
 
-use mz_expr::permutation_for_arrangement;
-use mz_expr::AggregateExpr;
-use mz_expr::AggregateFunc;
-use mz_expr::MirScalarExpr;
-use mz_ore::soft_assert_or_log;
+use expr::AggregateExpr;
+use expr::AggregateFunc;
+use ore::soft_assert_or_log;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::collections::HashMap;
-
-use super::AvailableCollections;
 
 /// This enum represents the three potential types of aggregations.
 #[derive(Copy, Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -100,7 +95,7 @@ pub enum ReductionType {
 /// shape / general computation of the rendered dataflow graph
 /// in this plan, and then make actually rendering the graph
 /// be as simple (and compiler verifiable) as possible.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ReducePlan {
     /// Plan for not computing any aggregations, just determining the set of
     /// distinct keys.
@@ -129,7 +124,7 @@ pub enum ReducePlan {
 /// apply only to the distinct set of values. We need
 /// to apply a distinct operator to those before we
 /// combine them with everything else.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccumulablePlan {
     /// All of the aggregations we were asked to compute, stored
     /// in order.
@@ -150,7 +145,7 @@ pub struct AccumulablePlan {
 /// with monotonic plans, but otherwise, we need to render
 /// them with a reduction tree that splits the inputs into
 /// small, and then progressively larger, buckets
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum HierarchicalPlan {
     /// Plan hierarchical aggregations under monotonic inputs.
     Monotonic(MonotonicPlan),
@@ -166,7 +161,7 @@ pub enum HierarchicalPlan {
 /// append only, so we can change our computation to
 /// only retain the "best" value in the diff field, instead
 /// of holding onto all values.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonotonicPlan {
     /// All of the aggregations we were asked to compute.
     pub aggr_funcs: Vec<AggregateFunc>,
@@ -185,7 +180,7 @@ pub struct MonotonicPlan {
 /// fraction of the original input) and redo the reduction in another
 /// layer. Effectively, we'll construct a min / max heap out of a series
 /// of reduce operators (each one is a separate layer).
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BucketedPlan {
     /// All of the aggregations we were asked to compute.
     pub aggr_funcs: Vec<AggregateFunc>,
@@ -211,7 +206,7 @@ pub struct BucketedPlan {
 /// were only asked to compute a single aggregation, we can skip
 /// that step and return the arrangement provided by computing the aggregation
 /// directly.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum BasicPlan {
     /// Plan for rendering a single basic aggregation. Here, the
     /// first element denotes the index in the set of inputs
@@ -229,7 +224,7 @@ pub enum BasicPlan {
 /// types.
 ///
 /// TODO: could we express this as a delta join
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CollationPlan {
     /// Accumulable aggregation results to collate, if any.
     pub accumulable: Option<AccumulablePlan>,
@@ -433,52 +428,44 @@ impl ReducePlan {
     /// This is likely either an empty vector, for no arrangement,
     /// or a singleton vector containing the list of expressions
     /// that key a single arrangement.
-    pub fn keys(&self, key_arity: usize, arity: usize) -> AvailableCollections {
+    pub fn keys(&self, key_arity: usize) -> Vec<Vec<expr::MirScalarExpr>> {
+        // Accumulate keys into this vector, and return it.
+        let mut keys = Vec::new();
         match self {
-            ReducePlan::DistinctNegated => AvailableCollections::new_raw(),
+            ReducePlan::DistinctNegated => {}
             _ => {
-                let key = (0..key_arity)
-                    .map(mz_expr::MirScalarExpr::Column)
-                    .collect::<Vec<_>>();
-                let (permutation, thinning) = permutation_for_arrangement(&key, arity);
-                AvailableCollections::new_arranged(vec![(key, permutation, thinning)])
+                keys.push((0..key_arity).map(expr::MirScalarExpr::Column).collect());
             }
         }
+        keys
     }
 }
 
 /// Plan for extracting keys and values in preparation for a reduction.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyValPlan {
     /// Extracts the columns used as the key.
-    pub key_plan: mz_expr::SafeMfpPlan,
+    pub key_plan: expr::SafeMfpPlan,
     /// Extracts the columns used to feed the aggregations.
-    pub val_plan: mz_expr::SafeMfpPlan,
+    pub val_plan: expr::SafeMfpPlan,
 }
 
 impl KeyValPlan {
     /// Create a new [KeyValPlan] from aggregation arguments.
     pub fn new(
         input_arity: usize,
-        group_key: &[MirScalarExpr],
+        group_key: &[expr::MirScalarExpr],
         aggregates: &[AggregateExpr],
-        input_permutation_and_new_arity: Option<(HashMap<usize, usize>, usize)>,
     ) -> Self {
         // Form an operator for evaluating key expressions.
-        let mut key_mfp = mz_expr::MapFilterProject::new(input_arity)
+        let mut key_mfp = expr::MapFilterProject::new(input_arity)
             .map(group_key.iter().cloned())
             .project(input_arity..(input_arity + group_key.len()));
-        if let Some((input_permutation, new_arity)) = input_permutation_and_new_arity.clone() {
-            key_mfp.permute(input_permutation, new_arity);
-        }
 
         // Form an operator for evaluating value expressions.
-        let mut val_mfp = mz_expr::MapFilterProject::new(input_arity)
+        let mut val_mfp = expr::MapFilterProject::new(input_arity)
             .map(aggregates.iter().map(|a| a.expr.clone()))
             .project(input_arity..(input_arity + aggregates.len()));
-        if let Some((input_permutation, new_arity)) = input_permutation_and_new_arity {
-            val_mfp.permute(input_permutation, new_arity);
-        }
 
         key_mfp.optimize();
         let key_plan = key_mfp.into_plan().unwrap().into_nontemporal().unwrap();

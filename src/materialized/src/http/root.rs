@@ -14,8 +14,6 @@ use std::future::Future;
 use askama::Template;
 use futures::future;
 use hyper::{Body, Method, Request, Response, StatusCode};
-#[cfg(feature = "dev-web")]
-use tracing::debug;
 
 use crate::http::util;
 use crate::BUILD_INFO;
@@ -30,7 +28,7 @@ struct HomeTemplate<'a> {
 
 pub fn handle_home(
     _: Request<Body>,
-    _: &mut mz_coord::SessionClient,
+    _: &mut coord::SessionClient,
 ) -> impl Future<Output = anyhow::Result<Response<Body>>> {
     future::ok(util::template_response(HomeTemplate {
         version: BUILD_INFO.version,
@@ -41,7 +39,7 @@ pub fn handle_home(
 
 pub fn handle_static(
     req: Request<Body>,
-    _: &mut mz_coord::SessionClient,
+    _: &mut coord::SessionClient,
 ) -> Result<Response<Body>, anyhow::Error> {
     if req.method() == Method::GET {
         let path = req.uri().path();
@@ -81,7 +79,7 @@ fn get_static_file(path: &str) -> Option<Body> {
     match fs::read(dev_path).or_else(|_| fs::read(prod_path)) {
         Ok(contents) => Some(Body::from(contents)),
         Err(e) => {
-            debug!("dev-web failed to load static file: {}: {}", path, e);
+            log::debug!("dev-web failed to load static file: {}: {}", path, e);
             None
         }
     }

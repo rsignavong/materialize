@@ -22,7 +22,7 @@ use std::fmt;
 use std::mem;
 
 use crate::ast::display::{self, AstDisplay, AstFormatter};
-use crate::ast::{AstInfo, Ident, OrderByExpr, Query, UnresolvedObjectName, Value};
+use crate::ast::{AstInfo, DataType, Ident, OrderByExpr, Query, UnresolvedObjectName, Value};
 
 /// An SQL expression of any type.
 ///
@@ -81,14 +81,6 @@ pub enum Expr<T: AstInfo> {
         subquery: Box<Query<T>>,
         negated: bool,
     },
-    /// `<expr> [ NOT ] {LIKE, ILIKE} <pattern> [ ESCAPE <escape> ]`
-    Like {
-        expr: Box<Expr<T>>,
-        pattern: Box<Expr<T>>,
-        escape: Option<Box<Expr<T>>>,
-        case_insensitive: bool,
-        negated: bool,
-    },
     /// `<expr> [ NOT ] BETWEEN <low> AND <high>`
     Between {
         expr: Box<Expr<T>>,
@@ -105,20 +97,18 @@ pub enum Expr<T: AstInfo> {
     /// CAST an expression to a different data type e.g. `CAST(foo AS VARCHAR(123))`
     Cast {
         expr: Box<Expr<T>>,
-        data_type: T::DataType,
+        data_type: DataType<T>,
     },
     /// `expr COLLATE collation`
     Collate {
         expr: Box<Expr<T>>,
         collation: UnresolvedObjectName,
     },
-    /// COALESCE(<expr>, ...) or GREATEST(<expr>, ...) or LEAST(<expr>, ...)
+    /// COALESCE(<expr>, ...)
     ///
-    /// While COALESCE/GREATEST/LEAST have the same syntax as a function call,
-    /// their semantics are extremely unusual, and are better captured with a
-    /// dedicated AST node.
-    HomogenizingFunction {
-        function: HomogenizingFunction,
+    /// While COALESCE has the same syntax as a function call, its semantics are
+    /// extremely unusual, and are better captured with a dedicated AST node.
+    Coalesce {
         exprs: Vec<Expr<T>>,
     },
     /// NULLIF(expr, expr)
@@ -182,12 +172,16 @@ pub enum Expr<T: AstInfo> {
     },
     /// `ARRAY[<expr>*]`
     Array(Vec<Expr<T>>),
-    ArraySubquery(Box<Query<T>>),
     /// `LIST[<expr>*]`
     List(Vec<Expr<T>>),
     ListSubquery(Box<Query<T>>),
-    /// `<expr>([<expr>(:<expr>)?])+`
-    Subscript {
+    /// `<expr>[<expr>]`
+    SubscriptIndex {
+        expr: Box<Expr<T>>,
+        subscript: Box<Expr<T>>,
+    },
+    /// `<expr>[<expr>:<expr>(, <expr>?:<expr>?)*]`
+    SubscriptSlice {
         expr: Box<Expr<T>>,
         positions: Vec<SubscriptPosition<T>>,
     },
@@ -265,31 +259,6 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                 f.write_node(&subquery);
                 f.write_str(")");
             }
-            Expr::Like {
-                expr,
-                pattern,
-                escape,
-                case_insensitive,
-                negated,
-            } => {
-                f.write_node(&expr);
-                f.write_str(match (*case_insensitive, *negated) {
-                    (false, false) => " ~~ ",
-                    (false, true) => " !~~ ",
-                    (true, false) => " ~~* ",
-                    (true, true) => " !~~* ",
-                });
-                match escape {
-                    Some(escape) => {
-                        f.write_str("like_escape(");
-                        f.write_node(&pattern);
-                        f.write_str(", ");
-                        f.write_node(escape);
-                        f.write_str(")");
-                    }
-                    None => f.write_node(&pattern),
-                }
-            }
             Expr::Between {
                 expr,
                 negated,
@@ -337,7 +306,7 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                         | Expr::Function { .. }
                         | Expr::Identifier { .. }
                         | Expr::Collate { .. }
-                        | Expr::HomogenizingFunction { .. }
+                        | Expr::Coalesce { .. }
                         | Expr::NullIf { .. }
                 );
                 if needs_wrap {
@@ -355,9 +324,8 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                 f.write_str(" COLLATE ");
                 f.write_node(&collation);
             }
-            Expr::HomogenizingFunction { function, exprs } => {
-                f.write_node(function);
-                f.write_str("(");
+            Expr::Coalesce { exprs } => {
+                f.write_str("COALESCE(");
                 f.write_node(&display::comma_separated(&exprs));
                 f.write_str(")");
             }
@@ -459,11 +427,6 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                 }
                 f.write_str("]");
             }
-            Expr::ArraySubquery(s) => {
-                f.write_str("ARRAY(");
-                f.write_node(&s);
-                f.write_str(")");
-            }
             Expr::List(exprs) => {
                 let mut exprs = exprs.iter().peekable();
                 f.write_str("LIST[");
@@ -480,21 +443,16 @@ impl<T: AstInfo> AstDisplay for Expr<T> {
                 f.write_node(&s);
                 f.write_str(")");
             }
-            Expr::Subscript { expr, positions } => {
+            Expr::SubscriptIndex { expr, subscript } => {
                 f.write_node(&expr);
                 f.write_str("[");
-
-                let mut first = true;
-
-                for p in positions {
-                    if first {
-                        first = false
-                    } else {
-                        f.write_str("][");
-                    }
-                    f.write_node(p);
-                }
-
+                f.write_node(subscript);
+                f.write_str("]");
+            }
+            Expr::SubscriptSlice { expr, positions } => {
+                f.write_node(&expr);
+                f.write_str("[");
+                f.write_node(&display::comma_separated(positions));
                 f.write_str("]");
             }
         }
@@ -601,69 +559,51 @@ impl<T: AstInfo> Expr<T> {
     }
 }
 
-/// A reference to an operator.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Op {
-    /// Any namespaces that preceded the operator.
-    pub namespace: Vec<Ident>,
-    /// The operator itself.
-    pub op: String,
+pub enum Op {
+    Bare(String),
+    Qualified { schema: Vec<Ident>, name: String },
 }
 
 impl AstDisplay for Op {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        if self.namespace.is_empty() {
-            f.write_str(&self.op)
-        } else {
-            f.write_str("OPERATOR(");
-            for name in &self.namespace {
-                f.write_node(name);
-                f.write_str(".");
+        match self {
+            Op::Bare(s) => f.write_str(s),
+            Op::Qualified { schema, name } => {
+                f.write_str("OPERATOR(");
+                for part in schema {
+                    f.write_node(part);
+                    f.write_str(".");
+                }
+                f.write_str(&name);
+                f.write_str(")");
             }
-            f.write_str(&self.op);
-            f.write_str(")");
         }
     }
 }
 impl_display!(Op);
 
 impl Op {
-    /// Constructs a new unqualified operator reference.
-    pub fn bare<S>(op: S) -> Op
+    // returns the bare operator name in all cases, rather than the fully qualified name
+    pub fn op_str(&self) -> &str {
+        match self {
+            Op::Bare(name) => &*name,
+            Op::Qualified { schema: _, name } => &*name,
+        }
+    }
+
+    pub fn bare<S>(name: S) -> Op
     where
         S: Into<String>,
     {
-        Op {
-            namespace: vec![],
-            op: op.into(),
-        }
+        Op::Bare(name.into())
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum HomogenizingFunction {
-    Coalesce,
-    Greatest,
-    Least,
-}
-
-impl AstDisplay for HomogenizingFunction {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        match self {
-            HomogenizingFunction::Coalesce => f.write_str("COALESCE"),
-            HomogenizingFunction::Greatest => f.write_str("GREATEST"),
-            HomogenizingFunction::Least => f.write_str("LEAST"),
-        }
-    }
-}
-impl_display!(HomogenizingFunction);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SubscriptPosition<T: AstInfo> {
     pub start: Option<Expr<T>>,
     pub end: Option<Expr<T>>,
-    // i.e. did this subscript include a colon
-    pub explicit_slice: bool,
 }
 
 impl<T: AstInfo> AstDisplay for SubscriptPosition<T> {
@@ -671,11 +611,9 @@ impl<T: AstInfo> AstDisplay for SubscriptPosition<T> {
         if let Some(start) = &self.start {
             f.write_node(start);
         }
-        if self.explicit_slice {
-            f.write_str(":");
-            if let Some(end) = &self.end {
-                f.write_node(end);
-            }
+        f.write_str(":");
+        if let Some(end) = &self.end {
+            f.write_node(end);
         }
     }
 }

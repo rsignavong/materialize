@@ -10,7 +10,7 @@
 //! Transform column references in a `Map` into a `Project`.
 
 use crate::TransformArgs;
-use mz_expr::{MirRelationExpr, MirScalarExpr};
+use expr::{MirRelationExpr, MirScalarExpr};
 
 /// Transform column references in a `Map` into a `Project`, or repeated
 /// aggregations in a `Reduce` into a `Project`.

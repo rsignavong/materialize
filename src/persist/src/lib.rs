@@ -7,32 +7,26 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Persistence for differential dataflow collections
+//! Persistence for Materialize dataflows.
 
-#![doc = include_str!("../README.md")]
 #![warn(missing_docs, missing_debug_implementations)]
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::clone_on_ref_ptr
+    clippy::cast_sign_loss
 )]
 
 use std::fmt;
 
-pub mod cfg;
-pub mod client;
 pub mod error;
 pub mod file;
 pub mod gen;
 pub mod indexed;
-pub mod location;
 pub mod mem;
 pub mod operators;
 pub mod pfuture;
-pub mod runtime;
 pub mod s3;
-pub mod sqlite;
+pub mod storage;
 pub mod unreliable;
 pub mod workload;
 
@@ -55,5 +49,5 @@ pub mod nemesis;
 // - Equality edge cases around all the various timestamp/frontier checks.
 
 /// A type usable as a persisted key or value.
-pub trait Data: Clone + mz_persist_types::Codec + fmt::Debug + Ord {}
-impl<T: Clone + mz_persist_types::Codec + fmt::Debug + Ord> Data for T {}
+pub trait Data: Clone + persist_types::Codec + fmt::Debug + Ord {}
+impl<T: Clone + persist_types::Codec + fmt::Debug + Ord> Data for T {}

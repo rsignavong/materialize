@@ -20,19 +20,25 @@ $ kafka-create-topic topic=t0
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'missing_topic'
   WITH (kafka_time_offset=1)
   FORMAT TEXT
-contains:topic missing_topic does not exist
+topic missing_topic does not exist
 
 ! CREATE MATERIALIZED SOURCE pick_one
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t0-${testdrive.seed}'
   WITH (kafka_time_offset=1, start_offset=1)
   FORMAT TEXT
-contains:`start_offset` and `kafka_time_offset` cannot be set at the same time.
+`start_offset` and `kafka_time_offset` cannot be set at the same time.
+
+! CREATE MATERIALIZED SOURCE byo
+  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t0-${testdrive.seed}'
+  WITH (kafka_time_offset=1, consistency_topic="t0")
+  FORMAT TEXT
+`start_offset` is not yet implemented for non-realtime consistency sources.
 
 ! CREATE MATERIALIZED SOURCE not_a_number
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-t0-${testdrive.seed}'
   WITH (kafka_time_offset="not_a_number")
   FORMAT TEXT
-contains:`kafka_time_offset` must be a number
+`kafka_time_offset` must be a number
 
 #
 # Append-Only
@@ -334,85 +340,3 @@ pie       4
 
 > SELECT SUM((statistics->'topics'->'testdrive-t4-${testdrive.seed}'->'partitions'->'0'->'msgs')::int) from mz_kafka_source_statistics;
 2
-
-#
-# UPSERT + AVRO
-#
-
-$ set keyschema={
-    "type": "record",
-    "name": "Key",
-    "fields": [
-        {"name": "id", "type": "long"}
-    ]
-  }
-
-$ set schema={
-    "type" : "record",
-    "name" : "envelope",
-    "fields" : [
-      {
-        "name": "before",
-        "type": [
-          {
-            "name": "row",
-            "type": "record",
-            "fields": [
-              {
-                  "name": "id",
-                  "type": "long"
-              },
-              {
-                "name": "creature",
-                "type": "string"
-              }]
-           },
-           "null"
-         ]
-      },
-      {
-        "name": "after",
-        "type": ["row", "null"]
-      }
-    ]
-  }
-
-$ kafka-create-topic topic=dbzupsert
-
-$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} publish=true timestamp=1
-{"id": 1} {"before": {"row": {"id": 1, "creature": "fish"}}, "after": {"row": {"id": 1, "creature": "mudskipper"}}}
-{"id": 1} {"before": {"row": {"id": 1, "creature": "mudskipper"}}, "after": {"row": {"id": 1, "creature": "salamander"}}}
-{"id": 1} {"before": {"row": {"id": 1, "creature": "salamander"}}, "after": {"row": {"id": 1, "creature": "lizard"}}}
-
-$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} publish=true timestamp=2
-{"id": 1} {"before": {"row": {"id": 1, "creature": "lizard"}}, "after": {"row": {"id": 1, "creature": "dino"}}}
-
-$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} publish=true timestamp=3
-{"id": 2} {"before": null, "after": {"row": {"id": 2, "creature": "archeopteryx"}}}
-{"id": 2} {"before": {"row": {"id": 2, "creature": "archeopteryx"}}, "after": {"row": {"id": 2, "creature": "velociraptor"}}}
-
-# test duplicates
-$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} publish=true timestamp=4
-{"id": 3} {"before": {"row": {"id": 3, "creature": "protoceratops"}}, "after": {"row": {"id": 3, "creature": "triceratops"}}}
-{"id": 3} {"before": {"row": {"id": 3, "creature": "protoceratops"}}, "after": {"row": {"id": 3, "creature": "triceratops"}}}
-
-# test removal and reinsertion
-$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} publish=true timestamp=5
-{"id": 4} {"before": null, "after": {"row": {"id": 4, "creature": "moros"}}}
-
-$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} publish=true timestamp=6
-{"id": 4} {"before": {"row": {"id": 4, "creature": "trex"}}, "after": null}
-
-$ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} publish=true timestamp=7
-{"id": 4} {"before": {"row": {"id": 4, "creature": "trex"}}, "after": {"row": {"id": 4, "creature": "chicken"}}}
-
-> CREATE MATERIALIZED SOURCE upsert_time_skip
-  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-dbzupsert-${testdrive.seed}'
-  WITH (kafka_time_offset = 6)
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
-  ENVELOPE DEBEZIUM UPSERT
-
-> SELECT * FROM upsert_time_skip
-id creature
------------
-4  chicken

@@ -53,10 +53,10 @@ Rochester      NY        14618   2
   FROM KAFKA BROKER 'foo' TOPIC 'bar'
   COMPRESSION GZIP
   FORMAT AVRO USING SCHEMA 'schema';
-contains:Expected end of statement, found COMPRESSION
+Expected end of statement, found COMPRESSION
 
 ! CREATE SOURCE f
   FROM KINESIS ARN 'foo'
   COMPRESSION GZIP
   FORMAT BYTES;
-contains:Expected end of statement, found COMPRESSION
+Expected end of statement, found COMPRESSION

@@ -7,21 +7,19 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use anyhow::bail;
-
 /// Unescapes a testdrive byte string.
 ///
 /// The escape character is `\` and the only interesting escape sequence is
 /// `\xNN`, where each `N` is a valid hexadecimal digit. All other characters
 /// following a backslash are taken literally.
-pub fn unescape(s: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
+pub fn unescape(s: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = vec![];
     let mut s = s.iter().copied().fuse();
     while let Some(b) = s.next() {
         match b {
             b'\\' if s.next() == Some(b'x') => match (next_hex(&mut s), next_hex(&mut s)) {
                 (Some(c1), Some(c0)) => out.push((c1 << 4) + c0),
-                _ => bail!("invalid hexadecimal escape"),
+                _ => return Err("invalid hexadecimal escape".into()),
             },
             b'\\' => continue,
             _ => out.push(b),

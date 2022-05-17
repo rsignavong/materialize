@@ -2,45 +2,27 @@
 
 [dbt] adapter for [Materialize].
 
-For a complete step-by-step guide on how to use dbt and Materialize, check the [documentation](https://materialize.com/docs/guides/dbt/).
-
 ## Installation
 
-`dbt-materialize` is available on [PyPI]. To install the latest version via `pip` (optionally using a virtual environment),
+dbt-materialize is available on [PyPI]. To install the latest version via pip,
 run:
 
 ```nofmt
-python3 -m venv dbt-venv         # create the virtual environment
-source dbt-venv/bin/activate     # activate the virtual environment
-pip install dbt-materialize      # install the adapter
+pip install dbt-materialize
 ```
-
-## Requirements
-
-<!-- If you update this, bump the constraint in connections.py too. -->
-`dbt-materialize` requires Materialize v0.20.0+.
 
 ## Configuring your profile
 
-To connect to a Materialize instance, use the reference [profile configuration](https://docs.getdbt.com/reference/warehouse-profiles/materialize-profile#connecting-to-materialize-with-dbt-materialize) in your
-connection profile:
+[Materialize] is based on the PostgreSQL database protocol, so use the
+[dbt-postgres settings](https://docs.getdbt.com/docs/profile-postgres) in your
+connection profile, with the following alterations:
 
 ```yml
-dbt-materialize:
-  target: dev
-  outputs:
-    dev:
-      type: materialize
-      threads: 1
-      host: [host]
-      port: [port]
-      user: materialize
-      pass: [password]
-      dbname: [database]
-      schema: [name of your dbt schema]
+type: materialize
+user: materialize
 ```
 
-Complete sample profiles (including for [Materialize Cloud](https://materialize.com/docs/cloud/get-started-with-cloud/#sign-up)) can be found in
+Complete sample profiles can be found in
 [sample_profiles.yml](dbt/include/materialize/sample_profiles.yml).
 
 ## Supported Features
@@ -53,7 +35,7 @@ Type               | Supported? | Details
 `view`             | YES        | Creates a [view].
 `materializedview` | YES        | Creates a [materialized view].
 `table`            | YES        | Creates a [materialized view]. (Actual table support pending [#5266].)
-`index`            | YES         | (Deprecated) Creates an index. Use the `indexes` config to create indexes on `materializedview`, `view` or `source` relations instead.
+`index`            | YES        | Creates an [index].
 `sink`             | YES        | Creates a [sink].
 `ephemeral`        | YES        | Executes queries using CTEs.
 `incremental`      | NO         | Use the `materializedview` materialization instead! dbt's incremental models are valuable because they only spend your time and money transforming your new data as it arrives. Luckily, this is exactly what Materialize's materialized views were built to do! Better yet, our materialized views will always return up-to-date results without manual or configured refreshes. For more information, check out [our documentation](https://materialize.com/docs/).
@@ -63,8 +45,6 @@ Type               | Supported? | Details
 Macro | Purpose
 ------|----------
 `mz_generate_name(identifier)` | Generates a fully-qualified name (including the database and schema) given an object name.
-
-We provide a `materialize-dbt-utils` package with Materialize-specific implementations of dispatched macros from `dbt-utils`. To use this package in your dbt project, check the latest installation instructions in [dbt Hub](https://hub.getdbt.com/materializeinc/materialize_dbt_utils/latest/).
 
 ### Seeds
 

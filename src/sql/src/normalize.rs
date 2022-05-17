@@ -16,35 +16,27 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Context};
-use itertools::Itertools;
+use anyhow::{anyhow, bail};
 
-use mz_dataflow_types::sources::{AwsAssumeRole, AwsConfig, AwsCredentials, SerdeUri};
-use mz_repr::ColumnName;
-use mz_sql_parser::ast::display::AstDisplay;
-use mz_sql_parser::ast::visit_mut::{self, VisitMut};
-use mz_sql_parser::ast::{
-    AstInfo, CreateIndexStatement, CreateSecretStatement, CreateSinkStatement,
-    CreateSourceStatement, CreateTableStatement, CreateTypeAs, CreateTypeStatement,
-    CreateViewStatement, Function, FunctionArgs, Ident, IfExistsBehavior, Op, Query, SqlOption,
-    Statement, TableFactor, TableFunction, UnresolvedObjectName, UnresolvedSchemaName, Value,
-    ViewDefinition,
+use dataflow_types::{AwsConfig, AwsCredentials};
+use repr::ColumnName;
+use sql_parser::ast::display::AstDisplay;
+use sql_parser::ast::visit_mut::{self, VisitMut};
+use sql_parser::ast::{
+    AstInfo, CreateIndexStatement, CreateSinkStatement, CreateSourceStatement,
+    CreateTableStatement, CreateTypeStatement, CreateViewStatement, Function, FunctionArgs, Ident,
+    IfExistsBehavior, Query, Raw, SqlOption, Statement, TableFactor, TableFunction,
+    UnresolvedObjectName, Value, ViewDefinition,
 };
 
-use crate::names::{
-    Aug, FullObjectName, PartialObjectName, PartialSchemaName, RawDatabaseSpecifier,
-};
+use crate::names::{DatabaseSpecifier, FullName, PartialName};
 use crate::plan::error::PlanError;
+use crate::plan::query::{resolve_names_stmt, Aug};
 use crate::plan::statement::StatementContext;
 
 /// Normalizes a single identifier.
 pub fn ident(ident: Ident) -> String {
     ident.as_str().into()
-}
-
-/// Normalizes a single identifier.
-pub fn ident_ref(ident: &Ident) -> &str {
-    ident.as_str()
 }
 
 /// Normalizes an identifier that represents a column name.
@@ -53,13 +45,11 @@ pub fn column_name(id: Ident) -> ColumnName {
 }
 
 /// Normalizes an unresolved object name.
-pub fn unresolved_object_name(
-    mut name: UnresolvedObjectName,
-) -> Result<PartialObjectName, PlanError> {
+pub fn unresolved_object_name(mut name: UnresolvedObjectName) -> Result<PartialName, PlanError> {
     if name.0.len() < 1 || name.0.len() > 3 {
         return Err(PlanError::MisqualifiedName(name.to_string()));
     }
-    let out = PartialObjectName {
+    let out = PartialName {
         item: ident(
             name.0
                 .pop()
@@ -70,41 +60,6 @@ pub fn unresolved_object_name(
     };
     assert!(name.0.is_empty());
     Ok(out)
-}
-
-/// Normalizes an unresolved schema name.
-pub fn unresolved_schema_name(
-    mut name: UnresolvedSchemaName,
-) -> Result<PartialSchemaName, PlanError> {
-    if name.0.len() < 1 || name.0.len() > 2 {
-        return Err(PlanError::MisqualifiedName(name.to_string()));
-    }
-    let out = PartialSchemaName {
-        schema: ident(
-            name.0
-                .pop()
-                .expect("name checked to have at least one component"),
-        ),
-        database: name.0.pop().map(ident),
-    };
-    assert!(name.0.is_empty());
-    Ok(out)
-}
-
-/// Normalizes an operator reference.
-///
-/// Qualified operators outside of the pg_catalog schema are rejected.
-pub fn op(op: &Op) -> Result<&str, PlanError> {
-    if !op.namespace.is_empty()
-        && (op.namespace.len() != 1 || op.namespace[0].as_str() != "pg_catalog")
-    {
-        sql_bail!(
-            "operator does not exist: {}.{}",
-            op.namespace.iter().map(|n| n.to_string()).join("."),
-            op.op,
-        )
-    }
-    Ok(&op.op)
 }
 
 /// Normalizes a list of `WITH` options.
@@ -127,7 +82,7 @@ pub fn options<T: AstInfo>(options: &[SqlOption<T>]) -> BTreeMap<String, Value> 
 
 /// Normalizes `WITH` option keys without normalizing their corresponding
 /// values.
-pub fn option_objects(options: &[SqlOption<Aug>]) -> BTreeMap<String, SqlOption<Aug>> {
+pub fn option_objects(options: &[SqlOption<Raw>]) -> BTreeMap<String, SqlOption<Raw>> {
     options
         .iter()
         .map(|o| (ident(o.name().clone()), o.clone()))
@@ -137,32 +92,14 @@ pub fn option_objects(options: &[SqlOption<Aug>]) -> BTreeMap<String, SqlOption<
 /// Unnormalizes an object name.
 ///
 /// This is the inverse of the [`unresolved_object_name`] function.
-pub fn unresolve(name: FullObjectName) -> UnresolvedObjectName {
+pub fn unresolve(name: FullName) -> UnresolvedObjectName {
     let mut out = vec![];
-    if let RawDatabaseSpecifier::Name(n) = name.database {
+    if let DatabaseSpecifier::Name(n) = name.database {
         out.push(Ident::new(n));
     }
     out.push(Ident::new(name.schema));
     out.push(Ident::new(name.item));
     UnresolvedObjectName(out)
-}
-
-/// Converts an `UnresolvedObjectName` to a `FullObjectName` if the
-/// `UnresolvedObjectName` is fully specified. Otherwise returns an error.
-pub fn full_name(mut raw_name: UnresolvedObjectName) -> Result<FullObjectName, anyhow::Error> {
-    match raw_name.0.len() {
-        3 => Ok(FullObjectName {
-            item: ident(raw_name.0.pop().unwrap()),
-            schema: ident(raw_name.0.pop().unwrap()),
-            database: RawDatabaseSpecifier::Name(ident(raw_name.0.pop().unwrap())),
-        }),
-        2 => Ok(FullObjectName {
-            item: ident(raw_name.0.pop().unwrap()),
-            schema: ident(raw_name.0.pop().unwrap()),
-            database: RawDatabaseSpecifier::Ambient,
-        }),
-        _ => bail!("unresolved name {} not fully qualified", raw_name),
-    }
 }
 
 /// Normalizes a `CREATE` statement.
@@ -175,26 +112,33 @@ pub fn full_name(mut raw_name: UnresolvedObjectName) -> Result<FullObjectName, a
 /// objects that are persisted in the catalog.
 pub fn create_statement(
     scx: &StatementContext,
-    mut stmt: Statement<Aug>,
+    stmt: Statement<Raw>,
 ) -> Result<String, anyhow::Error> {
+    let mut stmt = resolve_names_stmt(scx.catalog, stmt)?;
+
     let allocate_name = |name: &UnresolvedObjectName| -> Result<_, PlanError> {
-        Ok(unresolve(scx.allocate_full_name(
-            unresolved_object_name(name.clone())?,
-        )?))
+        Ok(unresolve(
+            scx.allocate_name(unresolved_object_name(name.clone())?),
+        ))
     };
 
     let allocate_temporary_name = |name: &UnresolvedObjectName| -> Result<_, PlanError> {
-        Ok(unresolve(scx.allocate_temporary_full_name(
+        Ok(unresolve(scx.allocate_temporary_name(
             unresolved_object_name(name.clone())?,
         )))
+    };
+
+    let resolve_item = |name: &UnresolvedObjectName| -> Result<_, PlanError> {
+        let item = scx.resolve_item(name.clone())?;
+        Ok(unresolve(item.name().clone()))
     };
 
     fn normalize_function_name(
         scx: &StatementContext,
         name: &mut UnresolvedObjectName,
     ) -> Result<(), PlanError> {
-        let item = scx.resolve_function(name.clone())?;
-        *name = unresolve(scx.catalog.resolve_full_name(item.name()));
+        let full_name = scx.resolve_function(name.clone())?;
+        *name = unresolve(full_name.name().clone());
         Ok(())
     }
 
@@ -278,6 +222,23 @@ pub fn create_statement(
                 _ => visit_mut::visit_table_factor_mut(self, table_factor),
             }
         }
+
+        fn visit_unresolved_object_name_mut(
+            &mut self,
+            unresolved_object_name: &'ast mut UnresolvedObjectName,
+        ) {
+            // Single-part object names can refer to CTEs in addition to
+            // catalog objects.
+            if let [ident] = unresolved_object_name.0.as_slice() {
+                if self.ctes.contains(ident) {
+                    return;
+                }
+            }
+            match self.scx.resolve_item(unresolved_object_name.clone()) {
+                Ok(full_name) => *unresolved_object_name = unresolve(full_name.name().clone()),
+                Err(e) => self.err = Some(e),
+            };
+        }
     }
 
     // Think very hard before changing any of the branches in this match
@@ -333,17 +294,17 @@ pub fn create_statement(
 
         Statement::CreateSink(CreateSinkStatement {
             name,
+            from,
             connector: _,
             with_options: _,
-            in_cluster: _,
             format: _,
             envelope: _,
             with_snapshot: _,
             as_of: _,
             if_not_exists,
-            ..
         }) => {
             *name = allocate_name(name)?;
+            *from = resolve_item(from)?;
             *if_not_exists = false;
         }
 
@@ -377,12 +338,12 @@ pub fn create_statement(
 
         Statement::CreateIndex(CreateIndexStatement {
             name: _,
-            in_cluster: _,
+            on_name,
             key_parts,
             with_options: _,
             if_not_exists,
-            ..
         }) => {
+            *on_name = resolve_item(on_name)?;
             let mut normalizer = QueryNormalizer::new(scx);
             if let Some(key_parts) = key_parts {
                 for key_part in key_parts {
@@ -395,39 +356,22 @@ pub fn create_statement(
             *if_not_exists = false;
         }
 
-        Statement::CreateType(CreateTypeStatement { name, as_type, .. }) => match as_type {
-            CreateTypeAs::List { with_options } | CreateTypeAs::Map { with_options } => {
-                *name = allocate_name(name)?;
-                let mut normalizer = QueryNormalizer::new(scx);
-                for option in with_options {
-                    match option {
-                        SqlOption::DataType { data_type, .. } => {
-                            normalizer.visit_data_type_mut(data_type);
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                if let Some(err) = normalizer.err {
-                    return Err(err.into());
-                }
-            }
-            CreateTypeAs::Record { column_defs } => {
-                let mut normalizer = QueryNormalizer::new(scx);
-                for c in column_defs {
-                    normalizer.visit_column_def_mut(c);
-                }
-                if let Some(err) = normalizer.err {
-                    return Err(err.into());
-                }
-            }
-        },
-        Statement::CreateSecret(CreateSecretStatement {
-            name,
-            if_not_exists,
-            value: _,
+        Statement::CreateType(CreateTypeStatement {
+            name, with_options, ..
         }) => {
             *name = allocate_name(name)?;
-            *if_not_exists = false;
+            let mut normalizer = QueryNormalizer::new(scx);
+            for option in with_options {
+                match option {
+                    SqlOption::DataType { data_type, .. } => {
+                        normalizer.visit_data_type_mut(data_type);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if let Some(err) = normalizer.err {
+                return Err(err.into());
+            }
         }
 
         _ => unreachable!(),
@@ -437,7 +381,7 @@ pub fn create_statement(
 }
 
 macro_rules! with_option_type {
-    ($name:expr, String) => {
+    ($name:ident, String) => {
         match $name {
             Some(crate::ast::WithOptionValue::Value(crate::ast::Value::String(value))) => value,
             Some(crate::ast::WithOptionValue::ObjectName(name)) => {
@@ -446,7 +390,7 @@ macro_rules! with_option_type {
             _ => ::anyhow::bail!("expected String"),
         }
     };
-    ($name:expr, bool) => {
+    ($name:ident, bool) => {
         match $name {
             Some(crate::ast::WithOptionValue::Value(crate::ast::Value::Boolean(value))) => value,
             // Bools, if they have no '= value', are true.
@@ -454,33 +398,17 @@ macro_rules! with_option_type {
             _ => ::anyhow::bail!("expected bool"),
         }
     };
-    ($name:expr, Interval) => {
+    ($name:ident, Interval) => {
         match $name {
             Some(crate::ast::WithOptionValue::Value(Value::String(value))) => {
-                mz_repr::strconv::parse_interval(&value)?
+                ::repr::strconv::parse_interval(&value)?
             }
             Some(crate::ast::WithOptionValue::Value(Value::Interval(interval))) => {
-                mz_repr::strconv::parse_interval(&interval.value)?
+                ::repr::strconv::parse_interval(&interval.value)?
             }
             _ => ::anyhow::bail!("expected Interval"),
         }
     };
-}
-
-/// Ensures that the given set of options are empty, useful for validating that
-/// `WITH` options are all real, used options
-pub(crate) fn ensure_empty_options<V>(
-    with_options: &BTreeMap<String, V>,
-    context: &str,
-) -> Result<(), anyhow::Error> {
-    if !with_options.is_empty() {
-        bail!(
-            "unexpected parameters for {}: {}",
-            context,
-            with_options.keys().join(",")
-        )
-    }
-    Ok(())
 }
 
 /// This macro accepts a struct definition and will generate it and a `try_from`
@@ -552,60 +480,34 @@ pub fn aws_config(
         _ => Ok(None),
     };
 
-    let credentials = match extract("profile")? {
-        Some(profile_name) => {
-            for name in &["access_key_id", "secret_access_key", "token"] {
-                let extracted = extract(name);
-                if matches!(extracted, Ok(Some(_)) | Err(_)) {
-                    bail!(
-                        "AWS profile cannot be set in combination with '{0}', \
-                         configure '{0}' inside the profile file",
-                        name
-                    );
-                }
-            }
-            AwsCredentials::Profile { profile_name }
-        }
-        None => {
-            let access_key_id = extract("access_key_id")?;
-            let secret_access_key = extract("secret_access_key")?;
-            let session_token = extract("token")?;
-            let credentials = match (access_key_id, secret_access_key, session_token) {
-                (None, None, None) => AwsCredentials::Default,
-                (Some(access_key_id), Some(secret_access_key), session_token) => {
-                    AwsCredentials::Static {
-                        access_key_id,
-                        secret_access_key,
-                        session_token,
-                    }
-                }
-                (Some(_), None, _) => {
-                    bail!("secret_acccess_key must be specified if access_key_id is specified")
-                }
-                (None, Some(_), _) => {
-                    bail!("secret_acccess_key cannot be specified without access_key_id")
-                }
-                (None, None, Some(_)) => bail!("token cannot be specified without access_key_id"),
-            };
-
-            credentials
-        }
-    };
-
     let region = match region {
-        Some(region) => Some(region),
-        None => extract("region")?,
+        Some(region) => region,
+        None => extract("region")?.ok_or_else(|| anyhow!("region is required"))?,
     };
-    let endpoint = match extract("endpoint")? {
-        None => None,
-        Some(endpoint) => Some(SerdeUri(endpoint.parse().context("parsing AWS endpoint")?)),
+
+    let endpoint = extract("endpoint")?;
+
+    let access_key_id = extract("access_key_id")?;
+    let secret_access_key = extract("secret_access_key")?;
+    let session_token = extract("token")?;
+    let credentials = match (access_key_id, secret_access_key, session_token) {
+        (None, None, None) => None,
+        (Some(access_key_id), Some(secret_access_key), session_token) => Some(AwsCredentials {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        }),
+        (Some(_), None, _) => {
+            bail!("secret_acccess_key must be specified if access_key_id is specified")
+        }
+        (None, Some(_), _) => bail!("secret_acccess_key cannot be specified without access_key_id"),
+        (None, None, Some(_)) => bail!("token cannot be specified without access_key_id"),
     };
-    let arn = extract("role_arn")?;
+
     Ok(AwsConfig {
         credentials,
         region,
         endpoint,
-        role: arn.map(|arn| AwsAssumeRole { arn }),
     })
 }
 
@@ -613,27 +515,24 @@ pub fn aws_config(
 mod tests {
     use std::error::Error;
 
-    use mz_ore::collections::CollectionExt;
+    use ore::collections::CollectionExt;
 
     use super::*;
     use crate::catalog::DummyCatalog;
-    use crate::names::resolve_names_stmt;
 
     #[test]
     fn normalized_create() -> Result<(), Box<dyn Error>> {
-        let scx = &mut StatementContext::new(None, &DummyCatalog);
+        let scx = &StatementContext::new(None, &DummyCatalog);
 
-        let parsed = mz_sql_parser::parser::parse_statements(
+        let parsed = sql_parser::parser::parse_statements(
             "create materialized view foo as select 1 as bar",
         )?
         .into_element();
 
-        let (stmt, _) = resolve_names_stmt(scx, parsed)?;
-
         // Ensure that all identifiers are quoted.
         assert_eq!(
             r#"CREATE VIEW "dummy"."public"."foo" AS SELECT 1 AS "bar""#,
-            create_statement(scx, stmt)?,
+            create_statement(scx, parsed)?,
         );
 
         Ok(())

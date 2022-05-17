@@ -7,36 +7,32 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::path::Path;
+use std::fs;
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use futures::executor::block_on;
 use lazy_static::lazy_static;
-use prost::Message;
-use protobuf_native::compiler::{SourceTreeDescriptorDatabase, VirtualSourceTree};
-use protobuf_native::MessageLite;
+use protobuf::Message;
+use regex::Regex;
+use repr::strconv;
 use semver::Version;
+use tempfile;
 use tokio::fs::File;
-use tracing::warn;
 
-use mz_dataflow_types::client::DEFAULT_COMPUTE_INSTANCE_ID;
-use mz_dataflow_types::postgres_source::PostgresSourceDetails;
-use mz_ore::collections::CollectionExt;
-use mz_postgres_util::publication_info;
-use mz_repr::strconv;
-use mz_sql::ast::display::AstDisplay;
-use mz_sql::ast::visit_mut::{self, VisitMut};
-use mz_sql::ast::{
+use mz_protoc::Protoc;
+use ore::collections::CollectionExt;
+use sql::ast::display::AstDisplay;
+use sql::ast::visit_mut::{self, VisitMut};
+use sql::ast::{
     AvroSchema, CreateIndexStatement, CreateSinkStatement, CreateSourceConnector,
     CreateSourceFormat, CreateSourceStatement, CreateTableStatement, CreateTypeStatement,
     CreateViewStatement, CsrConnectorAvro, CsrConnectorProto, CsrSeed, CsrSeedCompiled,
-    CsrSeedCompiledEncoding, CsrSeedCompiledOrLegacy, CsvColumns, Format, Function, Ident,
-    ProtobufSchema, Raw, RawIdent, RawObjectName, SqlOption, Statement, TableFunction,
-    UnresolvedDataType, UnresolvedObjectName, Value, ViewDefinition, WithOption, WithOptionValue,
+    CsrSeedCompiledEncoding, CsrSeedCompiledOrLegacy, CsvColumns, DataType, Format, Function,
+    Ident, ProtobufSchema, Raw, RawName, SqlOption, Statement, TableFunction, UnresolvedObjectName,
+    Value, ViewDefinition, WithOption, WithOptionValue,
 };
-use mz_sql::names::resolve_names_stmt;
-use mz_sql::plan::StatementContext;
-use mz_sql_parser::ast::CreateTypeAs;
+use sql::plan::resolve_names_stmt;
+use uuid::Uuid;
 
 use crate::catalog::storage::Transaction;
 use crate::catalog::{Catalog, ConnCatalog, SerializedCatalogItem};
@@ -44,7 +40,7 @@ use crate::catalog::{MZ_CATALOG_SCHEMA, MZ_INTERNAL_SCHEMA, PG_CATALOG_SCHEMA};
 
 fn rewrite_items<F>(tx: &Transaction, mut f: F) -> Result<(), anyhow::Error>
 where
-    F: FnMut(&mut mz_sql::ast::Statement<Raw>) -> Result<(), anyhow::Error>,
+    F: FnMut(&mut sql::ast::Statement<Raw>) -> Result<(), anyhow::Error>,
 {
     let items = tx.load_items()?;
     for (id, name, def) in items {
@@ -54,7 +50,7 @@ where
             table_persist_name,
             source_persist_details,
         } = serde_json::from_slice(&def)?;
-        let mut stmt = mz_sql::parse::parse(&create_sql)?.into_element();
+        let mut stmt = sql::parse::parse(&create_sql)?.into_element();
 
         f(&mut stmt)?;
 
@@ -76,8 +72,6 @@ lazy_static! {
     static ref VER_0_9_1: Version = Version::new(0, 9, 1);
     static ref VER_0_9_2: Version = Version::new(0, 9, 2);
     static ref VER_0_9_13: Version = Version::new(0, 9, 13);
-    static ref VER_0_20_0: Version = Version::new(0, 20, 0);
-    static ref VER_0_23_0: Version = Version::new(0, 23, 0);
 }
 
 pub(crate) fn migrate(catalog: &mut Catalog) -> Result<(), anyhow::Error> {
@@ -89,13 +83,13 @@ pub(crate) fn migrate(catalog: &mut Catalog) -> Result<(), anyhow::Error> {
         // non-semver versions are less than that.
         Err(_) => Version::new(0, 0, 0),
     };
+
     let mut tx = storage.transaction()?;
     // First, do basic AST -> AST transformations.
     rewrite_items(&tx, |stmt| {
         ast_rewrite_type_references_0_6_1(stmt)?;
         ast_use_pg_catalog_0_7_1(stmt)?;
         ast_insert_default_confluent_wire_format_0_7_1(stmt)?;
-        ast_remove_csr_confluent_wire_format_0_19_0(stmt)?;
         if catalog_version < *VER_0_9_1 {
             ast_rewrite_pg_catalog_char_to_text_0_9_1(stmt)?;
         }
@@ -104,13 +98,6 @@ pub(crate) fn migrate(catalog: &mut Catalog) -> Result<(), anyhow::Error> {
         }
         if catalog_version < *VER_0_9_13 {
             ast_rewrite_kafka_protobuf_source_text_to_compiled_0_9_13(stmt)?;
-        }
-        if catalog_version < *VER_0_20_0 {
-            ast_rewrite_ccsr_with_options_to_compiled_0_20_0(stmt)?;
-        }
-        if catalog_version < *VER_0_23_0 {
-            ast_rewrite_pgcdc_with_details_0_23_0(stmt)?;
-            ast_rewrite_index_sink_cluster_default_0_23_0(stmt)?;
         }
         Ok(())
     })?;
@@ -150,141 +137,58 @@ pub(crate) fn migrate(catalog: &mut Catalog) -> Result<(), anyhow::Error> {
 // AST migrations -- Basic AST -> AST transformations
 // ****************************************************************************
 
-// Connects to source postgres database, captures state of the publication and
-// serializes this into a string in the `details` field. This is the same logic
-// used during purification starting in 0.23.0
-fn ast_rewrite_pgcdc_with_details_0_23_0(
-    stmt: &mut mz_sql::ast::Statement<Raw>,
-) -> Result<(), anyhow::Error> {
-    if let Statement::CreateSource(CreateSourceStatement { connector, .. }) = stmt {
-        match connector {
-            CreateSourceConnector::Postgres {
-                conn,
-                publication,
-                slot,
-                details,
-            } => {
-                // Assume existing details are correct
-                if details.is_some() {
-                    return Ok(());
-                }
-                let res = block_on(publication_info(conn, publication));
-                match res {
-                    Ok(tables) => {
-                        let details_proto = PostgresSourceDetails {
-                            tables: tables.into_iter().map(|t| t.into()).collect(),
-                            slot: slot.clone().expect("slot must exist"),
-                        };
-                        *details = Some(hex::encode(details_proto.encode_to_vec()));
-                    }
-                    Err(e) => bail!(e),
-                }
-            }
-            _ => (),
-        }
-    }
-    Ok(())
-}
-
-/// Adds the default cluster to all existing indexes and sinks.
-fn ast_rewrite_index_sink_cluster_default_0_23_0(
-    stmt: &mut mz_sql::ast::Statement<Raw>,
-) -> Result<(), anyhow::Error> {
-    match stmt {
-        Statement::CreateIndex(CreateIndexStatement {
-            in_cluster: in_cluster @ None,
-            ..
-        })
-        | Statement::CreateSink(CreateSinkStatement {
-            in_cluster: in_cluster @ None,
-            ..
-        }) => {
-            *in_cluster = Some(RawIdent::Resolved(DEFAULT_COMPUTE_INSTANCE_ID.to_string()));
-        }
-        _ => (),
-    };
-
-    Ok(())
-}
-
-// Copies `ssl_` options to CSR connectors that defaulted to Kafka ssl values
-// from when that was the default
-fn ast_rewrite_ccsr_with_options_to_compiled_0_20_0(
-    stmt: &mut mz_sql::ast::Statement<Raw>,
-) -> Result<(), anyhow::Error> {
-    struct OptionRemover;
-    impl<'ast> VisitMut<'ast, Raw> for OptionRemover {
-        fn visit_create_source_statement_mut(
-            &mut self,
-            node: &'ast mut CreateSourceStatement<Raw>,
-        ) {
-            let with_options = match &mut node.format {
-                CreateSourceFormat::Bare(Format::Avro(AvroSchema::Csr { csr_connector })) => {
-                    Some(&mut csr_connector.with_options)
-                }
-                CreateSourceFormat::Bare(Format::Protobuf(ProtobufSchema::Csr {
-                    csr_connector,
-                })) => Some(&mut csr_connector.with_options),
-                _ => None,
-            };
-
-            if let Some(with_options) = with_options {
-                for option_to_consider in [
-                    "ssl_ca_location",
-                    "ssl_key_location",
-                    "ssl_certificate_location",
-                ] {
-                    if !with_options
-                        .iter()
-                        .any(|opt| option_to_consider == opt.name().as_str())
-                    {
-                        if let Some(found_option) = node
-                            .with_options
-                            .iter()
-                            .find(|opt| option_to_consider == opt.name().as_str())
-                        {
-                            with_options.push(found_option.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(OptionRemover.visit_statement_mut(stmt))
-}
-
 /// Rewrites Protobuf sources to store the compiled bytes rather than the text
 /// of the schema.
 fn ast_rewrite_kafka_protobuf_source_text_to_compiled_0_9_13(
-    stmt: &mut mz_sql::ast::Statement<Raw>,
+    stmt: &mut sql::ast::Statement<Raw>,
 ) -> Result<(), anyhow::Error> {
     fn compile_proto(schema: &str) -> Result<CsrSeedCompiledEncoding, anyhow::Error> {
-        // Compile .proto files into a file descriptor set.
-        let path = Path::new("migration.proto");
-        let mut source_tree = VirtualSourceTree::new();
-        source_tree
-            .as_mut()
-            .add_file(path, schema.as_bytes().to_vec());
-        let mut db = SourceTreeDescriptorDatabase::new(source_tree.as_mut());
-        let fds = db.as_mut().build_file_descriptor_set(&[path])?;
+        let temp_schema_name: String = Uuid::new_v4().to_simple().to_string();
+        let include_dir = tempfile::tempdir()?;
+        let schema_path = include_dir.path().join(&temp_schema_name);
+        let schema_bytes = strconv::parse_bytes(schema)?;
+        fs::write(&schema_path, &schema_bytes)?;
 
-        // Ensure there is exactly one message in the file.
-        let primary_fd = fds.file(0);
-        let message_name = match primary_fd.message_type_size() {
-            1 => String::from_utf8_lossy(primary_fd.message_type(0).name()).into_owned(),
-            0 => bail!("Protobuf schema for source contains no messages"),
-            _ => bail!("Protobuf schema for source contains multiple messages"),
-        };
+        match Protoc::new()
+            .include(include_dir.path())
+            .input(schema_path)
+            .parse()
+        {
+            Ok(fds) => {
+                let message_name = fds
+                    .file
+                    .iter()
+                    .find(|f| f.get_name() == temp_schema_name)
+                    .map(|file| file.message_type.first())
+                    .flatten()
+                    .map(|message| format!(".{}", message.get_name()))
+                    .ok_or_else(|| anyhow!("unable to compile temporary schema"))?;
+                let mut schema = String::new();
+                strconv::format_bytes(&mut schema, &fds.write_to_bytes()?);
+                Ok(CsrSeedCompiledEncoding {
+                    schema,
+                    message_name,
+                })
+            }
+            Err(e) => {
+                lazy_static! {
+                    static ref MISSING_IMPORT_ERROR: Regex = Regex::new(
+                        r#"protobuf path \\"(?P<reference>.*)\\" is not found in import path"#
+                    )
+                    .unwrap();
+                }
 
-        // Encode the file descriptor set into a SQL byte string.
-        let mut schema = String::new();
-        strconv::format_bytes(&mut schema, &fds.serialize()?);
-
-        Ok(CsrSeedCompiledEncoding {
-            schema,
-            message_name,
-        })
+                // Make protobuf import errors more user-friendly.
+                if let Some(captures) = MISSING_IMPORT_ERROR.captures(&e.to_string()) {
+                    bail!(
+                        "unsupported protobuf schema reference {}",
+                        &captures["reference"]
+                    )
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     fn do_upgrade(seed: &mut CsrSeedCompiledOrLegacy) -> Result<(), anyhow::Error> {
@@ -348,7 +252,7 @@ fn ast_rewrite_kafka_protobuf_source_text_to_compiled_0_9_13(
 /// actually `text` references. All `char` references going forward will
 /// properly behave as `bpchar` references.
 fn ast_rewrite_pg_catalog_char_to_text_0_9_1(
-    stmt: &mut mz_sql::ast::Statement<Raw>,
+    stmt: &mut sql::ast::Statement<Raw>,
 ) -> Result<(), anyhow::Error> {
     struct TypeNormalizer;
 
@@ -360,13 +264,13 @@ fn ast_rewrite_pg_catalog_char_to_text_0_9_1(
     }
 
     impl<'ast> VisitMut<'ast, Raw> for TypeNormalizer {
-        fn visit_data_type_mut(&mut self, data_type: &'ast mut UnresolvedDataType) {
-            if let UnresolvedDataType::Other { name, typ_mod } = data_type {
+        fn visit_data_type_mut(&mut self, data_type: &'ast mut DataType<Raw>) {
+            if let DataType::Other { name, typ_mod } = data_type {
                 if name.name() == &*CHAR_REFERENCE {
                     let t = TEXT_REFERENCE.clone();
                     *name = match name {
-                        RawObjectName::Name(_) => RawObjectName::Name(t),
-                        RawObjectName::Id(id, _) => RawObjectName::Id(id.clone(), t),
+                        RawName::Name(_) => RawName::Name(t),
+                        RawName::Id(id, _) => RawName::Id(id.clone(), t),
                     };
                     *typ_mod = vec![];
                 }
@@ -403,7 +307,6 @@ fn ast_rewrite_pg_catalog_char_to_text_0_9_1(
 
         Statement::CreateIndex(CreateIndexStatement {
             name: _,
-            in_cluster: _,
             on_name: _,
             key_parts,
             with_options,
@@ -419,19 +322,14 @@ fn ast_rewrite_pg_catalog_char_to_text_0_9_1(
             }
         }
 
-        Statement::CreateType(CreateTypeStatement { name: _, as_type }) => {
-            match as_type {
-                CreateTypeAs::List { with_options } | CreateTypeAs::Map { with_options } => {
-                    for option in with_options {
-                        TypeNormalizer.visit_sql_option_mut(option);
-                    }
-                }
-                CreateTypeAs::Record { column_defs } => {
-                    for column in column_defs {
-                        TypeNormalizer.visit_column_def_mut(column);
-                    }
-                }
-            };
+        Statement::CreateType(CreateTypeStatement {
+            name: _,
+            as_type: _,
+            with_options,
+        }) => {
+            for option in with_options {
+                TypeNormalizer.visit_sql_option_mut(option);
+            }
         }
 
         // At the time the migration was written, sinks and sources
@@ -454,7 +352,7 @@ fn ast_rewrite_pg_catalog_char_to_text_0_9_1(
 // This gives us flexibility to change the default to `false` in the future,
 // if desired.
 fn ast_insert_default_confluent_wire_format_0_7_1(
-    stmt: &mut mz_sql::ast::Statement<Raw>,
+    stmt: &mut sql::ast::Statement<Raw>,
 ) -> Result<(), anyhow::Error> {
     match stmt {
         Statement::CreateSource(CreateSourceStatement {
@@ -495,31 +393,6 @@ fn ast_insert_default_confluent_wire_format_0_7_1(
     Ok(())
 }
 
-fn ast_remove_csr_confluent_wire_format_0_19_0(
-    stmt: &mut mz_sql::ast::Statement<Raw>,
-) -> Result<(), anyhow::Error> {
-    match stmt {
-        Statement::CreateSource(CreateSourceStatement {
-            format:
-                CreateSourceFormat::Bare(Format::Avro(AvroSchema::Csr {
-                    csr_connector:
-                        CsrConnectorAvro {
-                            ref mut with_options,
-                            ..
-                        },
-                })),
-            ..
-        }) => with_options.retain(|with_option| {
-            !matches!(
-                with_option,
-                SqlOption::Value { name, .. } if name == &Ident::new("confluent_wire_format")
-            )
-        }),
-        _ => {}
-    }
-    Ok(())
-}
-
 // Rewrites all function references to have `pg_catalog` qualification; this
 // is necessary to support resolving all built-in functions to the catalog.
 // (At the time of writing Materialize did not support user-defined
@@ -527,14 +400,14 @@ fn ast_remove_csr_confluent_wire_format_0_19_0(
 //
 // The approach is to prepend `pg_catalog` to all `UnresolvedObjectName`
 // names that could refer to functions.
-fn ast_use_pg_catalog_0_7_1(stmt: &mut mz_sql::ast::Statement<Raw>) -> Result<(), anyhow::Error> {
+fn ast_use_pg_catalog_0_7_1(stmt: &mut sql::ast::Statement<Raw>) -> Result<(), anyhow::Error> {
     fn normalize_function_name(name: &mut UnresolvedObjectName) {
         if name.0.len() == 1 {
             let func_name = name.to_string();
             for (schema, funcs) in &[
-                (PG_CATALOG_SCHEMA, &*mz_sql::func::PG_CATALOG_BUILTINS),
-                (MZ_CATALOG_SCHEMA, &*mz_sql::func::MZ_CATALOG_BUILTINS),
-                (MZ_INTERNAL_SCHEMA, &*mz_sql::func::MZ_INTERNAL_BUILTINS),
+                (PG_CATALOG_SCHEMA, &*sql::func::PG_CATALOG_BUILTINS),
+                (MZ_CATALOG_SCHEMA, &*sql::func::MZ_CATALOG_BUILTINS),
+                (MZ_INTERNAL_SCHEMA, &*sql::func::MZ_INTERNAL_BUILTINS),
             ] {
                 if funcs.contains_key(func_name.as_str()) {
                     *name = UnresolvedObjectName(vec![Ident::new(*schema), name.0.remove(0)]);
@@ -577,7 +450,6 @@ fn ast_use_pg_catalog_0_7_1(stmt: &mut mz_sql::ast::Statement<Raw>) -> Result<()
 
         Statement::CreateIndex(CreateIndexStatement {
             name: _,
-            in_cluster: _,
             on_name: _,
             key_parts,
             with_options: _,
@@ -592,7 +464,6 @@ fn ast_use_pg_catalog_0_7_1(stmt: &mut mz_sql::ast::Statement<Raw>) -> Result<()
 
         Statement::CreateSink(CreateSinkStatement {
             name: _,
-            in_cluster: _,
             from: _,
             connector: _,
             with_options: _,
@@ -607,12 +478,9 @@ fn ast_use_pg_catalog_0_7_1(stmt: &mut mz_sql::ast::Statement<Raw>) -> Result<()
             }
         }
 
-        // At the time the migration was written, tables, sources, secrets and
+        // At the time the migration was written, tables, sources, and
         // types could not contain references to functions.
-        Statement::CreateTable(_)
-        | Statement::CreateSource(_)
-        | Statement::CreateType(_)
-        | Statement::CreateSecret(_) => {}
+        Statement::CreateTable(_) | Statement::CreateSource(_) | Statement::CreateType(_) => {}
 
         _ => bail!("catalog item contained inappropriate statement: {}", stmt),
     };
@@ -629,13 +497,13 @@ fn ast_use_pg_catalog_0_7_1(stmt: &mut mz_sql::ast::Statement<Raw>) -> Result<()
 /// items at this point, e.g. attempting to plan any item with a dependency
 /// will fail.
 fn ast_rewrite_type_references_0_6_1(
-    stmt: &mut mz_sql::ast::Statement<Raw>,
+    stmt: &mut sql::ast::Statement<Raw>,
 ) -> Result<(), anyhow::Error> {
     struct TypeNormalizer;
 
     impl<'ast> VisitMut<'ast, Raw> for TypeNormalizer {
-        fn visit_data_type_mut(&mut self, data_type: &'ast mut UnresolvedDataType) {
-            if let UnresolvedDataType::Other { name, .. } = data_type {
+        fn visit_data_type_mut(&mut self, data_type: &'ast mut DataType<Raw>) {
+            if let DataType::Other { name, .. } = data_type {
                 let mut unresolved_name = name.name().clone();
                 if unresolved_name.0.len() == 1 {
                     unresolved_name = UnresolvedObjectName(vec![
@@ -644,8 +512,8 @@ fn ast_rewrite_type_references_0_6_1(
                     ]);
                 }
                 *name = match name {
-                    RawObjectName::Name(_) => RawObjectName::Name(unresolved_name),
-                    RawObjectName::Id(id, _) => RawObjectName::Id(id.clone(), unresolved_name),
+                    RawName::Name(_) => RawName::Name(unresolved_name),
+                    RawName::Id(id, _) => RawName::Id(id.clone(), unresolved_name),
                 }
             }
         }
@@ -680,7 +548,6 @@ fn ast_rewrite_type_references_0_6_1(
 
         Statement::CreateIndex(CreateIndexStatement {
             name: _,
-            in_cluster: _,
             on_name: _,
             key_parts,
             with_options,
@@ -696,22 +563,20 @@ fn ast_rewrite_type_references_0_6_1(
             }
         }
 
-        Statement::CreateType(CreateTypeStatement { name: _, as_type }) => match as_type {
-            CreateTypeAs::List { with_options } | CreateTypeAs::Map { with_options } => {
-                for option in with_options {
-                    TypeNormalizer.visit_sql_option_mut(option);
-                }
+        Statement::CreateType(CreateTypeStatement {
+            name: _,
+            as_type: _,
+            with_options,
+        }) => {
+            for option in with_options {
+                TypeNormalizer.visit_sql_option_mut(option);
             }
-            CreateTypeAs::Record { column_defs } => {
-                for column in column_defs {
-                    TypeNormalizer.visit_column_def_mut(column);
-                }
-            }
-        },
+        }
 
-        // At the time the migration was written, secrets, sinks and sources
+        // At the time the migration was written, sinks and sources
         // could not contain references to types.
-        Statement::CreateSource(_) | Statement::CreateSink(_) | Statement::CreateSecret(_) => {}
+        Statement::CreateSource(_) | Statement::CreateSink(_) => {}
+
         _ => bail!("catalog item contained inappropriate statement: {}", stmt),
     };
 
@@ -724,7 +589,7 @@ fn ast_rewrite_type_references_0_6_1(
 /// to in the future correctly loosen the semantics of our column aliases syntax to not exactly
 /// match the number of columns in a source.
 fn ast_rewrite_csv_column_aliases_0_9_2(
-    stmt: &mut mz_sql::ast::Statement<Raw>,
+    stmt: &mut sql::ast::Statement<Raw>,
 ) -> Result<(), anyhow::Error> {
     let (connector, col_names, columns, delimiter) =
         if let Statement::CreateSource(CreateSourceStatement {
@@ -761,9 +626,7 @@ fn ast_rewrite_csv_column_aliases_0_9_2(
                 Ok(Some(f))
             })?;
 
-            block_on(async {
-                mz_sql::pure::purify_csv(file, &connector, *delimiter, columns).await
-            })?;
+            block_on(async { sql::pure::purify_csv(file, &connector, *delimiter, columns).await })?;
         }
         Ok(())
     })();
@@ -773,7 +636,7 @@ fn ast_rewrite_csv_column_aliases_0_9_2(
     // they match then everything will work out. If they don't match, then at least there isn't
     // a catalog corruption error.
     if let Err(e) = result {
-        warn!(
+        log::warn!(
             "Error retrieving column names from file ({}) \
                  using previously defined column aliases",
             e
@@ -795,15 +658,14 @@ fn ast_rewrite_csv_column_aliases_0_9_2(
 // rewrite their dependents.
 fn semantic_use_id_for_table_format_0_7_1(
     cat: &ConnCatalog,
-    stmt: &mut mz_sql::ast::Statement<Raw>,
+    stmt: &mut sql::ast::Statement<Raw>,
 ) -> Result<(), anyhow::Error> {
     // Resolve Statement<Raw> to Statement<Aug>
-    let (resolved, _) =
-        resolve_names_stmt(&mut StatementContext::new(None, cat), stmt.clone()).unwrap();
+    let resolved = resolve_names_stmt(cat, stmt.clone()).unwrap();
     // Use consistent intermediary format between Aug and Raw.
     let create_sql = resolved.to_ast_string_stable();
     // Convert Statement<Aug> to Statement<Raw> (Aug is a subset of Raw's
     // semantics) and reassign to `stmt`.
-    *stmt = mz_sql::parse::parse(&create_sql)?.into_element();
+    *stmt = sql::parse::parse(&create_sql)?.into_element();
     Ok(())
 }

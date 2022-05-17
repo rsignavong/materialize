@@ -18,19 +18,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use tempfile::TempDir;
+use tempfile::NamedTempFile;
 
-use mz_coord::catalog::{Catalog, CatalogItem, Op, Table, SYSTEM_CONN_ID};
-use mz_coord::session::{Session, DEFAULT_DATABASE_NAME};
-use mz_ore::now::NOW_ZERO;
-use mz_repr::RelationDesc;
-use mz_sql::ast::{Expr, Statement};
-use mz_sql::catalog::CatalogDatabase;
-use mz_sql::names::{
-    resolve_names, ObjectQualifiers, QualifiedObjectName, ResolvedDatabaseSpecifier,
-};
-use mz_sql::plan::{PlanContext, QueryContext, QueryLifetime, StatementContext};
-use mz_sql::DEFAULT_SCHEMA;
+use coord::catalog::{Catalog, CatalogItem, Table};
+use coord::session::Session;
+use expr::GlobalId;
+use ore::now::NOW_ZERO;
+use repr::RelationDesc;
+use sql::ast::{Expr, Statement};
+use sql::names::{DatabaseSpecifier, FullName};
+use sql::plan::{resolve_names, PlanContext, QueryContext, QueryLifetime, StatementContext};
 
 // This morally tests the name resolution stuff, but we need access to a
 // catalog.
@@ -38,56 +35,40 @@ use mz_sql::DEFAULT_SCHEMA;
 #[tokio::test]
 async fn datadriven() {
     datadriven::walk_async("tests/testdata", |mut f| async {
-        let data_dir = TempDir::new().unwrap();
-        let mut catalog = Catalog::open_debug(data_dir.path(), NOW_ZERO.clone())
+        let catalog_file = NamedTempFile::new().unwrap();
+        let mut catalog = Catalog::open_debug(catalog_file.path(), NOW_ZERO.clone())
             .await
             .unwrap();
+        let mut id: u32 = 1;
         f.run(|test_case| -> String {
             match test_case.directive.as_str() {
                 "add-table" => {
-                    let id = catalog.allocate_user_id().unwrap();
-                    let oid = catalog.allocate_oid().unwrap();
-                    let database_id = catalog
-                        .resolve_database(DEFAULT_DATABASE_NAME)
-                        .unwrap()
-                        .id();
-                    let database_spec = ResolvedDatabaseSpecifier::Id(database_id);
-                    let schema_spec = catalog
-                        .resolve_schema_in_database(&database_spec, DEFAULT_SCHEMA, SYSTEM_CONN_ID)
-                        .unwrap()
-                        .id
-                        .clone();
-                    catalog
-                        .transact(
-                            vec![Op::CreateItem {
-                                id,
-                                oid,
-                                name: QualifiedObjectName {
-                                    qualifiers: ObjectQualifiers {
-                                        database_spec,
-                                        schema_spec,
-                                    },
-                                    item: test_case.input.trim_end().to_string(),
-                                },
-                                item: CatalogItem::Table(Table {
-                                    create_sql: "TODO".to_string(),
-                                    desc: RelationDesc::empty(),
-                                    defaults: vec![Expr::null(); 0],
-                                    conn_id: None,
-                                    depends_on: vec![],
-                                    persist_name: None,
-                                }),
-                            }],
-                            |_| Ok(()),
-                        )
-                        .unwrap();
-                    format!("{}\n", id)
+                    let _ = catalog.insert_item(
+                        GlobalId::User(id.into()),
+                        id,
+                        FullName {
+                            database: DatabaseSpecifier::Name("materialize".into()),
+                            schema: "public".into(),
+                            item: test_case.input.trim_end().to_string(),
+                        },
+                        CatalogItem::Table(Table {
+                            create_sql: "TODO".to_string(),
+                            desc: RelationDesc::empty(),
+                            defaults: vec![Expr::null(); 0],
+                            conn_id: None,
+                            depends_on: vec![],
+                            persist: None,
+                        }),
+                    );
+                    id += 1;
+                    format!("{}\n", GlobalId::User((id - 1).into()))
                 }
                 "resolve" => {
+                    // let catalog = catalog.for_system_session();
                     let sess = Session::dummy();
                     let catalog = catalog.for_session(&sess);
 
-                    let parsed = mz_sql::parse::parse(&test_case.input).unwrap();
+                    let parsed = sql::parse::parse(&test_case.input).unwrap();
                     let pcx = &PlanContext::zero();
                     let scx = StatementContext::new(Some(pcx), &catalog);
                     let mut qcx =

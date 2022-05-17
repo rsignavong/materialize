@@ -30,53 +30,53 @@ c c
 
 # joined tables collide
 ! SELECT * FROM a, a;
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 ! SELECT * FROM b, (SELECT * FROM a, a);
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 ! SELECT * FROM other.a, other.a;
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 ! SELECT * FROM a LEFT JOIN a ON TRUE;
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 ! SELECT * FROM (a NATURAL JOIN b) NATURAL JOIN a;
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 ! SELECT * FROM (a NATURAL JOIN b) NATURAL JOIN b;
-contains:table name "b" specified more than once
+table name "b" specified more than once
 
 ! DELETE FROM a USING a;
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 # alias introduces collision
 ! SELECT * FROM a, b AS a;
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 ! SELECT * FROM a, other.a AS a;
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 ! SELECT * FROM a AS z, b AS z;
-contains:table name "z" specified more than once
+table name "z" specified more than once
 
 ! SELECT * FROM a, (SELECT * FROM a) AS a;
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 # table function names
 ! SELECT * FROM generate_series, generate_series(1,2)
-contains:table name "generate_series" specified more than once
+table name "generate_series" specified more than once
 
 ! SELECT * FROM a AS generate_series, generate_series(1,2)
-contains:table name "generate_series" specified more than once
+table name "generate_series" specified more than once
 
 ! SELECT * FROM generate_series AS a, generate_series(1,2) AS a
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 ! SELECT * FROM a, generate_series(1,2) AS a
-contains:table name "a" specified more than once
+table name "a" specified more than once
 
 # CTEs
 
 ! WITH a AS (SELECT 1) SELECT * FROM a, a;
-contains:table name "a" specified more than once
+table name "a" specified more than once

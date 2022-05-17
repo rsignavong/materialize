@@ -35,7 +35,7 @@ In terms of SQL, sources are similar to a combination of tables and
 clients.
 
 - Like tables, sources are structured components that users can read from.
-- Like clients, sources are responsible for reading data. External
+- Like clients, sources are responsible for writing data. External
   sources provide all of the underlying data to process.
 
 By looking at what comprises a source, we can develop a sense for how this
@@ -78,8 +78,8 @@ What Materialize actually does with the data it receives depends on the
 Envelope | Action
 ---------|-------
 **Append-only** | Inserts all received data; does not support updates or deletes.
-**Debezium** | Treats data as wrapped in a "diff envelope" that indicates whether the record is an insertion, deletion, or update. The Debezium envelope is only supported by sources published to Kafka by [Debezium].<br/><br/>For more information, see [`CREATE SOURCE`: Kafka&mdash;Using Debezium](/sql/create-source/kafka/#using-debezium).
-**Upsert** | Treats data as having a key and a value. New records with non-null value that have the same key as a preexisting record in the dataflow will replace the preexisting record. New records with null value that have the same key as preexisting record will cause the preexisting record to be deleted. <br/><br/>For more information, see [`CREATE SOURCE`: &mdash;Handling upserts](/sql/create-source/kafka/#handling-upserts)
+**Debezium** | Treats data as wrapped in a "diff envelope" that indicates whether the record is an insertion, deletion, or update. The Debezium envelope is only supported by sources published to Kafka by [Debezium].<br/><br/>For more information, see [`CREATE SOURCE`: Avro over Kafka&mdash;Debezium envelope details](/sql/create-source/avro-kafka/#debezium-envelope-details).
+**Upsert** | Treats data as having a key and a value. New records with non-null value that have the same key as a preexisting record in the dataflow will replace the preexisting record. New records with null value that have the same key as preexisting record will cause the preexisting record to be deleted. <br/><br/>For more information, see [`CREATE SOURCE`: Avro over Kafka&mdash;Upsert envelope details](/sql/create-source/avro-kafka/#upsert-envelope-details)
 
 ### Materialized sources
 
@@ -185,23 +185,6 @@ change data capture (CDC) producers for the given source or view.
 
 Currently, Materialize only supports sending sink data to Kafka or Avro OCFs,
 encoded in Avro with the [Debezium diff envelope](/sql/create-sink#debezium-envelope-details).
-
-## Clusters
-
-{{< experimental >}}
-The concept of a cluster
-{{< /experimental >}}
-
-A cluster is a set of compute resources that have been allocated to maintain
-indexes and sinks. The `materialized` process provides one local cluster named
-`default` that represents the compute resources of the local machine. In
-a forthcoming version of [Materialize Cloud](/cloud), you will be able to
-dynamically create and drop clusters to allocate and deallocate compute
-resources on demand.
-
-Clusters are still under active development and are not yet meant for general
-use. They are described here because some non-experimental features (e.g.,
-[`SHOW INDEX`](/sql/show-indexes)) already make reference to clusters.
 
 ## Related pages
 

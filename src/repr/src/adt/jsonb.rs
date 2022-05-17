@@ -33,7 +33,7 @@
 //! parsed, the underlying [`Row`] can be extracted with [`Jsonb::into_row`].
 //!
 //! ```
-//! # use mz_repr::adt::jsonb::Jsonb;
+//! # use repr::adt::jsonb::Jsonb;
 //! let jsonb: Jsonb = r#"{"a": 1, "b": 2}"#.parse()?;
 //! let row = jsonb.into_row();
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -42,7 +42,7 @@
 //! If the source JSON is in bytes, use [`Jsonb::from_slice`] instead:
 //!
 //! ```
-//! # use mz_repr::adt::jsonb::Jsonb;
+//! # use repr::adt::jsonb::Jsonb;
 //! let jsonb = Jsonb::from_slice(br#"{"a": 1, "b": 2}"#);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -53,7 +53,7 @@
 //! The alternate format produces pretty output.
 //!
 //! ```
-//! # use mz_repr::adt::jsonb::Jsonb;
+//! # use repr::adt::jsonb::Jsonb;
 //! # let jsonb: Jsonb = "null".parse().unwrap();
 //! format!("compressed: {}", jsonb);
 //! format!("pretty: {:#}", jsonb);
@@ -66,12 +66,11 @@
 //! copy.
 //!
 //! ```rust
-//! # use mz_repr::adt::jsonb::JsonbPacker;
-//! # use mz_repr::{Datum, Row};
+//! # use repr::adt::jsonb::JsonbPacker;
+//! # use repr::{Datum, Row};
 //! let mut row = Row::default();
-//! let mut packer = row.packer();
-//! packer.push(Datum::Int32(42));
-//! JsonbPacker::new(&mut packer).pack_str("[1, 2]")?;
+//! row.push(Datum::Int32(42));
+//! row = JsonbPacker::new(row).pack_str("[1, 2]")?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -87,7 +86,7 @@ use serde::ser::{Serialize, SerializeMap, SerializeSeq, SerializeStruct, Seriali
 use self::vec_stack::VecStack;
 use crate::adt::numeric::Numeric;
 use crate::strconv;
-use crate::{Datum, Row, RowPacker};
+use crate::{Datum, Row};
 
 /// An owned JSON value backed by a [`Row`].
 ///
@@ -107,8 +106,7 @@ impl Jsonb {
     /// Errors if any of the contained integers cannot be represented exactly as
     /// an [`f64`].
     pub fn from_serde_json(val: serde_json::Value) -> Result<Self, anyhow::Error> {
-        let mut row = Row::default();
-        JsonbPacker::new(&mut row.packer()).pack_serde_json(val)?;
+        let row = JsonbPacker::new(Row::default()).pack_serde_json(val)?;
         Ok(Jsonb { row })
     }
 
@@ -117,8 +115,7 @@ impl Jsonb {
     /// Errors if the slice is not valid JSON or if any of the contained
     /// integers cannot be represented exactly as an [`f64`].
     pub fn from_slice(buf: &[u8]) -> Result<Jsonb, anyhow::Error> {
-        let mut row = Row::default();
-        JsonbPacker::new(&mut row.packer()).pack_slice(buf)?;
+        let row = JsonbPacker::new(Row::default()).pack_slice(buf)?;
         Ok(Jsonb { row })
     }
 
@@ -139,8 +136,7 @@ impl FromStr for Jsonb {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut row = Row::default();
-        JsonbPacker::new(&mut row.packer()).pack_str(s)?;
+        let row = JsonbPacker::new(Row::default()).pack_str(s)?;
         Ok(Jsonb { row })
     }
 }
@@ -213,53 +209,57 @@ impl fmt::Display for JsonbRef<'_> {
     }
 }
 
-/// A JSON deserializer that decodes directly into an existing [`RowPacker`].
+/// A JSON deserializer that decodes directly into an existing [`Row`].
+///
+/// The `JsonbPacker` takes ownership of the `Row` and returns ownership after
+/// successfully packing one JSON object. Packing multiple JSON objects in
+/// sequence requires constructing multiple `JsonbPacker`s. This somewhat
+/// irritating API is required to preserve the safety properties of the `Row`,
+/// which require that no one observe the state of the `Row` after a decoding
+/// error.
 #[derive(Debug)]
-pub struct JsonbPacker<'a, 'row> {
-    packer: &'a mut RowPacker<'row>,
+pub struct JsonbPacker {
+    row: Row,
 }
 
-impl<'a, 'row> JsonbPacker<'a, 'row> {
+impl JsonbPacker {
     /// Constructs a new `JsonbPacker` that will pack into `row`.
-    pub fn new(packer: &'a mut RowPacker<'row>) -> JsonbPacker<'a, 'row> {
-        JsonbPacker { packer }
+    pub fn new(row: Row) -> JsonbPacker {
+        JsonbPacker { row }
     }
 
     /// Packs a [`serde_json::Value`].
     ///
     /// Errors if any of the contained integers cannot be represented exactly as
     /// an [`f64`].
-    pub fn pack_serde_json(self, val: serde_json::Value) -> Result<(), anyhow::Error> {
+    pub fn pack_serde_json(self, val: serde_json::Value) -> Result<Row, anyhow::Error> {
         let mut commands = vec![];
         Collector(&mut commands).deserialize(val)?;
-        pack(self.packer, &commands);
-        Ok(())
+        Ok(pack(self.row, &commands))
     }
 
     /// Parses and packs a JSON-formatted byte slice.
     ///
     /// Errors if the slice is not valid JSON or if any of the contained
     /// integers cannot be represented exactly as an [`f64`].
-    pub fn pack_slice(self, buf: &[u8]) -> Result<(), anyhow::Error> {
+    pub fn pack_slice(self, buf: &[u8]) -> Result<Row, anyhow::Error> {
         let mut commands = vec![];
         let mut deserializer = serde_json::Deserializer::from_slice(buf);
         Collector(&mut commands).deserialize(&mut deserializer)?;
         deserializer.end()?;
-        pack(self.packer, &commands);
-        Ok(())
+        Ok(pack(self.row, &commands))
     }
 
     /// Parses and packs a JSON-formatted string.
     ///
     /// Errors if the string is not valid or JSON or if any of the contained
     /// integers cannot be represented exactly as an [`f64`].
-    pub fn pack_str(self, s: &str) -> Result<(), anyhow::Error> {
+    pub fn pack_str(self, s: &str) -> Result<Row, anyhow::Error> {
         let mut commands = vec![];
         let mut deserializer = serde_json::Deserializer::from_str(s);
         Collector(&mut commands).deserialize(&mut deserializer)?;
         deserializer.end()?;
-        pack(self.packer, &commands);
-        Ok(())
+        Ok(pack(self.row, &commands))
     }
 }
 
@@ -473,14 +473,15 @@ struct DictEntry<'a> {
     val: &'a [Command<'a>],
 }
 
-fn pack(packer: &mut RowPacker, value: &[Command]) {
+fn pack(mut packer: Row, value: &[Command]) -> Row {
     let mut buf = vec![];
-    pack_value(packer, VecStack::new(&mut buf), value);
+    pack_value(&mut packer, VecStack::new(&mut buf), value);
+    packer
 }
 
 #[inline]
 fn pack_value<'a, 'scratch>(
-    packer: &mut RowPacker,
+    packer: &mut Row,
     scratch: VecStack<'scratch, DictEntry<'a>>,
     value: &'a [Command<'a>],
 ) {
@@ -502,14 +503,14 @@ fn pack_value<'a, 'scratch>(
 
 /// Packs a sequence of values as an ordered list.
 fn pack_list<'a, 'scratch>(
-    packer: &mut RowPacker,
+    row: &mut Row,
     mut scratch: VecStack<'scratch, DictEntry<'a>>,
     mut values: &'a [Command<'a>],
 ) {
-    packer.push_list_with(|packer| {
+    row.push_list_with(|row| {
         while !values.is_empty() {
             let value = extract_value(&mut values);
-            pack_value(packer, scratch.fresh(), value);
+            pack_value(row, scratch.fresh(), value);
         }
     })
 }
@@ -521,7 +522,7 @@ fn pack_list<'a, 'scratch>(
 /// Multiple values for the same key are detected and only
 /// the last value is kept.
 fn pack_dict<'a, 'scratch>(
-    packer: &mut RowPacker,
+    row: &mut Row,
     mut scratch: VecStack<'scratch, DictEntry<'a>>,
     mut entries: &'a [Command<'a>],
 ) {
@@ -540,12 +541,12 @@ fn pack_dict<'a, 'scratch>(
     // value for the key, as ordered by appearance in the source JSON, per
     // PostgreSQL's implementation.
     scratch.sort_by_key(|entry| entry.key);
-    packer.push_dict_with(|packer| {
+    row.push_dict_with(|row| {
         for i in 0..scratch.len() {
             if i == scratch.len() - 1 || scratch[i].key != scratch[i + 1].key {
                 let DictEntry { key, val } = scratch[i];
-                packer.push(Datum::String(key));
-                pack_value(packer, scratch.fresh(), val);
+                row.push(Datum::String(key));
+                pack_value(row, scratch.fresh(), val);
             }
         }
     });

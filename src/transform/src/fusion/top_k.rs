@@ -10,7 +10,7 @@
 //! Fuses a sequence of `TopK` operators in to one `TopK` operator
 
 use crate::TransformArgs;
-use mz_expr::MirRelationExpr;
+use expr::MirRelationExpr;
 
 /// Fuses a sequence of `TopK` operators in to one `TopK` operator if
 /// they happen to share the same grouping and ordering key.

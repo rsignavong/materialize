@@ -17,38 +17,43 @@ use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use mz_ore::{result::ResultExt, str::separated, str::StrExt};
+use ore::{result::ResultExt, str::separated, str::StrExt};
 
-pub use mz_lowertest_derive::MzReflect;
+pub use lowertest_derive::{gen_reflect_info_func, MzEnumReflect, MzStructReflect};
 
-/* #region Parts of the public interface related to collecting information
-about the fields of structs and enums. */
-
-/// For [`to_json`] to create deserializable JSON for an instance of an type,
-/// the type must derive this trait.
-pub trait MzReflect {
-    /// Adds names and types of the fields of the struct or enum to `rti`.
-    ///
-    /// The corresponding implementation of this method will be recursively
-    /// called for each type referenced by the struct or enum.
-    /// Check out the crate README for more details.
-    fn add_to_reflected_type_info(rti: &mut ReflectedTypeInfo);
-}
-
-/// Info that must be combined with a spec to form deserializable JSON.
+/// A trait for listing the variants of an enum and the fields of each variant.
 ///
-/// To add information required to construct a struct or enum,
-/// call `Type::add_to_reflected_type_info(enum_dict, struct_dict)`
-#[derive(Debug, Default)]
-pub struct ReflectedTypeInfo {
-    pub enum_dict:
-        HashMap<&'static str, HashMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>>,
-    pub struct_dict: HashMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>,
+/// The information listed about the fields help build a JSON string that can
+/// be correctly deserialized into the enum.
+pub trait MzEnumReflect {
+    /// Returns a mapping of the variants of an enum to its fields.
+    ///
+    /// The first vector comprises the names of the variant's fields. It is
+    /// empty if the variant has no fields or if the variant's fields are
+    /// unnamed.
+    ///
+    /// The second vector comprises the types of the variant's fields. It is
+    /// empty if the variant has no fields.
+    fn mz_enum_reflect() -> HashMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>;
 }
 
-/* #endregion */
+/// A trait for listing the fields of a struct.
+///
+/// The information listed about the fields help build a JSON string that can
+/// be correctly deserialized into the struct.
+pub trait MzStructReflect {
+    /// Returns the fields of a struct.
+    ///
+    /// The first vector comprises the names of the struct's fields. It is
+    /// empty if the struct has no fields or if the struct's fields are
+    /// unnamed.
+    ///
+    /// The second vector comprises the types of the struct's fields. It is
+    /// empty if the struct has no fields.
+    fn mz_struct_reflect() -> (Vec<&'static str>, Vec<&'static str>);
+}
 
-/* #region Public Utilities */
+/* #region Utilities */
 
 /// Converts `s` into a [proc_macro2::TokenStream]
 pub fn tokenize(s: &str) -> Result<TokenStream, String> {
@@ -253,6 +258,19 @@ where
     } else {
         Ok(None)
     }
+}
+
+/// Info that must be combined with a spec to form deserializable JSON.
+///
+/// To add information about an enum, call
+/// `enum_dict.insert("EnumType", EnumType::mz_enum_reflect())`
+/// To add information about a struct, call
+/// `struct_dict.insert("StructType", StructType::mz_struct_reflect())`
+#[derive(Debug)]
+pub struct ReflectedTypeInfo {
+    pub enum_dict:
+        HashMap<&'static str, HashMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>>,
+    pub struct_dict: HashMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>,
 }
 
 /// A trait for extending and/or overriding the default test case syntax.
@@ -637,7 +655,7 @@ where
                     if let Some((names, types)) = enum_dict.get(&variant[..]) {
                         return format!(
                             "({} {})",
-                            variant,
+                            variant.to_string(),
                             from_json_fields(data, names, types, rti, ctx)
                         );
                     }
@@ -731,7 +749,7 @@ transformations. */
 
 fn normalize_type_name(type_name: &str) -> String {
     // Normalize the type name by stripping whitespace.
-    let type_name = type_name.replace(' ', "");
+    let type_name = type_name.replace(" ", "");
     // Eliminate outer `Option<>` and `Box<>` from type names because they are
     // inconsequential when it comes to creating a correctly deserializable JSON
     // string.
@@ -764,7 +782,7 @@ fn find_next_type_in_tuple(type_name: &str, prev_elem_end: usize) -> Option<(usi
     // whatever comes before the comma after the last ')'.
     let mut current_elem_end = type_name[current_elem_begin..]
         .find(',')
-        .unwrap_or(type_name.len());
+        .unwrap_or_else(|| type_name.len());
     if let Some(l_paren_pos) = type_name[current_elem_begin..].find('(') {
         if l_paren_pos < current_elem_end {
             if let Some(r_paren_pos) = type_name[current_elem_begin..].rfind(')') {
@@ -772,7 +790,7 @@ fn find_next_type_in_tuple(type_name: &str, prev_elem_end: usize) -> Option<(usi
                     + r_paren_pos
                     + type_name[(current_elem_begin + r_paren_pos)..]
                         .find(',')
-                        .unwrap_or(type_name.len());
+                        .unwrap_or_else(|| type_name.len());
             }
         }
     };

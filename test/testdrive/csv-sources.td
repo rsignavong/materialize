@@ -19,12 +19,12 @@ place""",CA,92679
   FROM FILE '${testdrive.temp-dir}/static.csv'
   WITH (badoption=true)
   FORMAT CSV WITH 3 COLUMNS
-contains:unexpected parameters for CREATE SOURCE: badoption
+unexpected parameters for CREATE SOURCE: badoption
 
 ! CREATE SOURCE mismatched_column_count
   FROM FILE '${testdrive.temp-dir}/static.csv'
   FORMAT CSV WITH 2 COLUMNS
-contains:Specified column count (WITH 2 COLUMNS) does not match number of columns in CSV file (3)
+Specified column count (WITH 2 COLUMNS) does not match number of columns in CSV file (3)
 
 > CREATE MATERIALIZED SOURCE matching_column_names
   FROM FILE '${testdrive.temp-dir}/static.csv'
@@ -47,12 +47,12 @@ Rochester NY 14618 1
 ! CREATE SOURCE mismatched_column_names
   FROM FILE '${testdrive.temp-dir}/static.csv'
   FORMAT CSV WITH HEADER (cities, country, zip)
-contains:Header columns do not match named columns from CREATE SOURCE statement. First mismatched columns: cities != city
+Header columns do not match named columns from CREATE SOURCE statement. First mismatched columns: cities != city
 
 ! CREATE SOURCE mismatched_column_names_count
   FROM FILE '${testdrive.temp-dir}/static.csv'
   FORMAT CSV WITH HEADER (cities, state)
-contains:Named column count (2) does not match number of columns discovered (3)
+Named column count (2) does not match number of columns discovered (3)
 
 # Static CSV without headers.
 > CREATE MATERIALIZED SOURCE static_csv
@@ -149,10 +149,10 @@ $ file-delete path=deleting.csv
 > CREATE INDEX i ON deleting_csv(city,state,zip)
 
 ! SELECT * FROM deleting_csv
-regex:Source error: .*: file IO: file source: unable to open file at path
+Source error: materialize.public.deleting_csv: file IO: file source: unable to open file at path
 
 ! CREATE SOURCE should_fail FROM FILE '/'
-contains:/ is a directory.
+/ is a directory.
 
 # Static malformed CSV
 $ file-append path=malformed.csv
@@ -167,7 +167,7 @@ badint,
   FORMAT CSV WITH HEADER
 
 ! SELECT * FROM malformed_csv
-contains:Decode error: Text: CSV error at record number 3: expected 2 columns, got 1.
+Decode error: Text: CSV error at record number 3: expected 2 columns, got 1.
 
 # Static non-utf-8 CSV
 $ file-append path=bad-text.csv
@@ -179,7 +179,7 @@ Dollars,Category
   FORMAT CSV WITH HEADER
 
 ! SELECT * FROM bad_text_csv
-contains:Decode error: Text: CSV error at record number 2: invalid UTF-8
+Decode error: Text: CSV error at record number 2: invalid UTF-8
 
 # CSV file with comma in header
 

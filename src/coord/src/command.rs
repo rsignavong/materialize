@@ -16,12 +16,12 @@ use derivative::Derivative;
 use serde::Serialize;
 use tokio::sync::oneshot;
 
-use mz_dataflow_types::PeekResponseUnary;
-use mz_expr::GlobalId;
-use mz_ore::str::StrExt;
-use mz_repr::{Row, ScalarType};
-use mz_sql::ast::{FetchDirection, NoticeSeverity, ObjectType, Raw, Statement};
-use mz_sql::plan::ExecuteTimeout;
+use dataflow_types::PeekResponse;
+use expr::GlobalId;
+use ore::str::StrExt;
+use repr::Row;
+use sql::ast::{FetchDirection, ObjectType, Raw, Statement};
+use sql::plan::ExecuteTimeout;
 use tokio::sync::watch;
 
 use crate::error::CoordError;
@@ -31,15 +31,14 @@ use crate::session::{EndTransactionAction, RowBatchStream, Session};
 pub enum Command {
     Startup {
         session: Session,
-        create_user_if_not_exists: bool,
-        cancel_tx: Arc<watch::Sender<Canceled>>,
+        cancel_tx: Arc<watch::Sender<Cancelled>>,
         tx: oneshot::Sender<Response<StartupResponse>>,
     },
 
     Declare {
         name: String,
         stmt: Statement<Raw>,
-        param_types: Vec<Option<ScalarType>>,
+        param_types: Vec<Option<pgrepr::Type>>,
         session: Session,
         tx: oneshot::Sender<Response<()>>,
     },
@@ -47,7 +46,7 @@ pub enum Command {
     Describe {
         name: String,
         stmt: Option<Statement<Raw>>,
-        param_types: Vec<Option<ScalarType>>,
+        param_types: Vec<Option<pgrepr::Type>>,
         session: Session,
         tx: oneshot::Sender<Response<()>>,
     },
@@ -105,7 +104,7 @@ pub struct Response<T> {
     pub session: Session,
 }
 
-pub type RowsFuture = Pin<Box<dyn Future<Output = PeekResponseUnary> + Send>>;
+pub type RowsFuture = Pin<Box<dyn Future<Output = PeekResponse> + Send>>;
 
 /// The response to [`ConnClient::startup`](crate::ConnClient::startup).
 #[derive(Debug)]
@@ -165,18 +164,18 @@ pub enum ExecuteResponse {
     AlteredObject(ObjectType),
     // The index was altered.
     AlteredIndexLogicalCompaction,
-    // The query was canceled.
-    Canceled,
+    // The query was cancelled.
+    Cancelled,
     /// The requested cursor was closed.
     ClosedCursor,
     CopyTo {
-        format: mz_sql::plan::CopyFormat,
+        format: sql::plan::CopyFormat,
         resp: Box<ExecuteResponse>,
     },
     CopyFrom {
         id: GlobalId,
         columns: Vec<usize>,
-        params: mz_sql::plan::CopyParams,
+        params: sql::plan::CopyParams,
     },
     /// The requested database was created.
     CreatedDatabase {
@@ -188,16 +187,8 @@ pub enum ExecuteResponse {
     },
     /// The requested role was created.
     CreatedRole,
-    /// The requested compute instance was created.
-    CreatedComputeInstance {
-        existed: bool,
-    },
     /// The requested index was created.
     CreatedIndex {
-        existed: bool,
-    },
-    /// The requested secret was created.
-    CreatedSecret {
         existed: bool,
     },
     /// The requested sink was created.
@@ -232,8 +223,6 @@ pub enum ExecuteResponse {
     DiscardedTemp,
     /// All state associated with the session has been discarded.
     DiscardedAll,
-    /// The requested compute instance was dropped.
-    DroppedComputeInstance,
     /// The requested database was dropped.
     DroppedDatabase,
     /// The requested role was dropped.
@@ -252,8 +241,6 @@ pub enum ExecuteResponse {
     DroppedSink,
     /// The requested type was dropped.
     DroppedType,
-    /// The requested secret was dropped.
-    DroppedSecret,
     /// The provided query was empty.
     EmptyQuery,
     /// Fetch results from a cursor.
@@ -286,10 +273,6 @@ pub enum ExecuteResponse {
     },
     /// The specified number of rows were updated in the requested table.
     Updated(usize),
-    /// Raise a warning.
-    Raise {
-        severity: NoticeSeverity,
-    },
 }
 
 /// The response to [`SessionClient::simple_execute`](crate::SessionClient::simple_execute).
@@ -306,10 +289,10 @@ pub struct SimpleResult {
 
 /// The state of a cancellation request.
 #[derive(Debug, Clone, Copy)]
-pub enum Canceled {
+pub enum Cancelled {
     /// A cancellation request has occurred.
-    Canceled,
+    Cancelled,
     /// No cancellation request has yet occurred, or a previous request has been
     /// cleared.
-    NotCanceled,
+    NotCancelled,
 }

@@ -22,8 +22,8 @@
 //! we may find joins with zero or one input, which can be further simplified.
 
 use crate::TransformArgs;
-use mz_expr::{MirRelationExpr, MirScalarExpr};
-use mz_repr::RelationType;
+use expr::{MirRelationExpr, MirScalarExpr};
+use repr::RelationType;
 
 /// Fuses multiple `Join` operators into one `Join` operator.
 ///
@@ -169,7 +169,7 @@ impl JoinBuilder {
     }
 
     fn build(mut self) -> MirRelationExpr {
-        mz_expr::canonicalize::canonicalize_equivalence_classes(&mut self.equivalences);
+        expr::canonicalize::canonicalize_equivalence_classes(&mut self.equivalences);
 
         // If `inputs` is now empty or a singleton (without constraints),
         // we can remove the join.
@@ -187,7 +187,7 @@ impl JoinBuilder {
             _ => MirRelationExpr::Join {
                 inputs: self.inputs,
                 equivalences: self.equivalences,
-                implementation: mz_expr::JoinImplementation::Unimplemented,
+                implementation: expr::JoinImplementation::Unimplemented,
             },
         };
 

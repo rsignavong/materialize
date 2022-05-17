@@ -38,7 +38,7 @@
 4 5 be
 
 ! UPDATE t SET i = '4'::text
-contains:SET clause does not support casting from text to integer
+SET clause does not support casting from text to integer
 
 > DELETE FROM t WHERE i < 4
 
@@ -46,7 +46,7 @@ contains:SET clause does not support casting from text to integer
 4 5 be
 
 ! UPDATE t SET f = 'a'
-contains:invalid input syntax for type double precision
+invalid input syntax for type double precision
 
 # Ensure that we can update after an error.
 > UPDATE t SET f = 6::FLOAT
@@ -67,30 +67,30 @@ contains:invalid input syntax for type double precision
 > CREATE MATERIALIZED VIEW v (a) AS SELECT 4;
 
 ! UPDATE t SET i = i + 1 WHERE i IN (SELECT a FROM v);
-contains:invalid selection
+invalid selection
 
 ! UPDATE v SET a = 1
-contains:cannot mutate view
+cannot mutate view
 
 ! UPDATE mz_tables SET a = 1
-contains:cannot mutate system table
+cannot mutate system table
 
 ! UPDATE t SET a = 1
-contains:unknown column a
+unknown column a
 
 ! UPDATE t SET i = 1 WHERE a = 1
-contains:column "a" does not exist
+column "a" does not exist
 
 ! UPDATE t SET i = 1 WHERE i = 'a'
-contains:invalid input syntax for type integer
+invalid input syntax for type integer
 
 ! UPDATE t SET i = 1, i = 1
-contains:column i set twice
+column i set twice
 
 > BEGIN
 
 ! UPDATE t SET i = 1
-contains:cannot be run inside a transaction block
+cannot be run inside a transaction block
 
 > ROLLBACK
 
@@ -99,14 +99,14 @@ contains:cannot be run inside a transaction block
 
 > INSERT INTO t DEFAULT VALUES;
 ! UPDATE t SET i = 1
-contains:cannot be run inside a transaction block
+cannot be run inside a transaction block
 
 > ROLLBACK
 
 > BEGIN
 
 ! DELETE FROM t
-contains:cannot be run inside a transaction block
+cannot be run inside a transaction block
 
 > ROLLBACK
 
@@ -217,7 +217,7 @@ DELETE FROM c WHERE a < 3;
 
 # Lateral subqueries cannot access `FROM` table
 ! DELETE FROM t3 USING lateral (SELECT t3.x FROM t1) t4 WHERE true;
-contains:column "t3.x" does not exist
+column "t3.x" does not exist
 
 # ...unless it's explicitly brought into scope
 > DELETE FROM t3 USING lateral (SELECT t3.x FROM t3) t4 WHERE true;

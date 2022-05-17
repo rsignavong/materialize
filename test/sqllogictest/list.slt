@@ -22,7 +22,7 @@ SELECT (LIST[1,2,3])::text
 ----
 {1,2,3}
 
-query error LIST types integer and integer list cannot be matched
+query error LIST expression cannot be cast to uniform type: integer vs integer list
 SELECT LIST[1,LIST[2,3]]
 
 query T
@@ -65,7 +65,7 @@ SELECT (LIST[[[[1], [2]]], [[[3]]]])::text
 {{{{1},{2}}},{{{3}}}}
 
 # List(Int) cannot be cast to List(List(Int))
-query error LIST could not convert type integer to integer list
+query error LIST expression cannot be cast to uniform type: integer vs integer list
 SELECT LIST[1, null] :: INT LIST LIST
 
 query T
@@ -108,22 +108,9 @@ SELECT LIST [1, 2, 3][100]
 ----
 NULL
 
-# negative
-query R
-SELECT LIST [1, 2, 3][-1]
-----
-NULL
-
-# exceeds maximum layer
-query error cannot index into
+# exceeds maximum dimension
+query error cannot subscript type integer
 SELECT LIST [1, 2, 3][1][1]
-
-# exceeds maximum layer
-query error cannot subscript
-SELECT LIST[1,2,3][1:1][1][1:1];
-
-query error cannot subscript
-SELECT LIST[1,2,3][1][1:1][1];
 
 # 🔬🔬 list slices
 
@@ -151,7 +138,7 @@ SELECT (LIST [1, 2, 3][:])::text
 query T
 SELECT (LIST [1, 2, 3][100:])::text
 ----
-{}
+NULL
 
 # end exceeds maximum index
 query T
@@ -159,19 +146,22 @@ SELECT (LIST [1, 2, 3][:100])::text
 ----
 {1,2,3}
 
-# 🔬🔬 list repeated slices
+# exceeds maximum dimension
+query error cannot slice into 2 layers; list only has 1 layer
+SELECT LIST [1, 2, 3][:, :]
 
+# successive slices
 query T
-SELECT (LIST [1, 2, 3, 4, 5][3:5][1:2][:])::text
+SELECT (LIST [1, 2, 3][2:3][1:1])::text
 ----
-{3,4}
+{2}
 
 # 🔬🔬 list slices + index
 
 query T
-SELECT (LIST [[1],[2],[3]][2:3])[2]::text
+SELECT (LIST [1, 2, 3][2:3][2])::text
 ----
-{3}
+3
 
 # 🔬 list list subscripts
 
@@ -203,8 +193,8 @@ SELECT (LIST [[1, 2, 3], [4, 5]][100][1])::text
 ----
 NULL
 
-# exceeds maximum layer
-query error cannot index into
+# exceeds maximum dimension
+query error cannot subscript type integer
 SELECT LIST [[1, 2, 3], [4, 5]][1][1][1]
 
 # 🔬🔬 list list slices
@@ -215,76 +205,77 @@ SELECT (LIST [[1, 2, 3], [4, 5]][2:2])::text
 {{4,5}}
 
 query T
+SELECT (LIST [[1, 2, 3], [4, 5]][1:2, 2:3])::text
+----
+{{2,3},{5}}
+
+query T
 SELECT (LIST [[1, 2, 3], [4, 5]][2:])::text
 ----
 {{4,5}}
 
+query T
+SELECT (LIST [[1, 2, 3], [4, 5]][:2, 2:])::text
+----
+{{2,3},{5}}
+
+query T
+SELECT (LIST [[1, 2, 3], [4, 5]][:, 2:])::text
+----
+{{2,3},{5}}
+
+# start exceeds maximum index
+query T
+SELECT (LIST [[1, 2, 3], [4, 5]][100:, :])::text
+----
+NULL
+
+query T
+SELECT (LIST [[1, 2, 3], [4, 5]][:, 100:])::text
+----
+NULL
+
+# propagating NULL lists
+query T
+SELECT (LIST [[1, 2, 3], [4, 5]][:, 3:3])::text
+----
+{{3},NULL}
+
 # end exceeds maximum index
 query T
-SELECT (LIST [[1, 2, 3], [4, 5]][:100][:])::text
+SELECT (LIST [[1, 2, 3], [4, 5]][:100, :])::text
 ----
 {{1,2,3},{4,5}}
 
-# 🔬🔬🔬 index + slice
-
 query T
-SELECT list[list[1,2], list[3,4]][2][2:2]::text;
+SELECT (LIST [[1, 2, 3], [4, 5]][:, :100])::text
 ----
-{4}
+{{1,2,3},{4,5}}
 
+# exceeds maximum dimension
+query error cannot slice into 3 layers; list only has 2 layers
+SELECT LIST [[1, 2, 3], [4, 5]][:, :, :]
+
+# successive slice operations
 query T
-SELECT list[[1,2], list[3,4]][2][2:]::text;
+SELECT (LIST [[1, 2, 3], [4, 5]][2:2][1:1])::text
 ----
-{4}
-
-query T
-SELECT list[[1,2], list[3,4]][2][:2]::text;
-----
-{3,4}
-
-# 🔬🔬🔬 slice + index
-
-query T
-SELECT list[list[1,2], list[3,4]][2:2][2]::text;
-----
-NULL
-
-query T
-SELECT list[list[1,2], list[3,4]][:2][2]::text;
-----
-{3,4}
-
-query T
-SELECT list[[1,2], list[3,4]][2:][2]::text;
-----
-NULL
-
-# 🔬🔬🔬 layered list slices patterns, linear
-
-query T
-SELECT list[list[1,2], list[3,4]][1:2][2:2]::text;
-----
-{{3,4}}
-
-query T
-SELECT list[list[1,2], list[3,4]][:2][2:2]::text;
-----
-{{3,4}}
-
-query T
-SELECT list[list[1,2], list[3,4]][:2][2:]::text;
-----
-{{3,4}}
-
-query T
-SELECT list[list[1,2], list[3,4]][:][2:]::text;
-----
-{{3,4}}
+{{4,5}}
 
 # 🔬🔬 list list slices + index
 
 query T
-SELECT (LIST [[1, 2, 3], [4, 5]][2:2])[1][2]::text
+SELECT (LIST [[1, 2, 3], [4, 5]][1:2][2])::text
+----
+{4,5}
+
+query T
+SELECT (LIST [[1, 2, 3], [4, 5]][1:2][2][2:2])::text
+----
+{5}
+
+query T
+SELECT (LIST [[1, 2, 3], [4, 5]][1:2][2][2:2][1])::text
 ----
 5
 
@@ -328,13 +319,8 @@ SELECT LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][100][2][3]
 ----
 NULL
 
-query R
-SELECT LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][1][100][3]
-----
-NULL
-
-# exceeds maximum layer
-query error cannot index into
+# exceeds maximum dimension
+query error cannot subscript type integer
 SELECT LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][1][2][3][1]
 
 # 🔬🔬 list list list slices
@@ -344,11 +330,47 @@ SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][1:2])::text
 ----
 {{{1,2},{3,4,5}},{{6}}}
 
+query T
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, 1:1])::text
+----
+{{{1,2}},{{6}},{{7,8}}}
+
+query T
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, :, 1:1])::text
+----
+{{{1},{3}},{{6}},{{7},{9}}}
+
 # start exceeds maximum index
 query T
 SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][100:100])::text
 ----
-{}
+NULL
+
+query T
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, 100:100])::text
+----
+NULL
+
+query T
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, :, 100:100])::text
+----
+NULL
+
+query T
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, 100:100, :])::text
+----
+NULL
+
+# propagating NULL lists
+query T
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, 2:2])::text
+----
+{{{3,4,5}},NULL,{{9}}}
+
+query T
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, 2:2, 2:2])::text
+----
+{{{4}},NULL,NULL}
 
 # end exceeds maximum index
 query T
@@ -356,19 +378,53 @@ SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:100])::text
 ----
 {{{1,2},{3,4,5}},{{6}},{{7,8},{9}}}
 
-# 🔬🔬🔬 layered list repeated slices
+query T
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, :100])::text
+----
+{{{1,2},{3,4,5}},{{6}},{{7,8},{9}}}
 
 query T
-SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][2:3][:][2:2])::text
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, :, :100])::text
 ----
-{{{7,8},{9}}}
+{{{1,2},{3,4,5}},{{6}},{{7,8},{9}}}
+
+query T
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, :100, :100])::text
+----
+{{{1,2},{3,4,5}},{{6}},{{7,8},{9}}}
+
+# exceeds maximum dimension
+query error cannot slice into 4 layers; list only has 3 layers
+SELECT LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][:, :, :, :]
 
 # 🔬🔬 list list list slices + index
 
 query T
-SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][2:3])[2]::text
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][1:2][1])::text
 ----
-{{7,8},{9}}
+{{1,2},{3,4,5}}
+
+query T
+SELECT (LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][1:2][1][2:2][1])::text
+----
+{3,4,5}
+
+query R
+SELECT LIST [[[1, 2], [3, 4, 5]], [[6]], [[7, 8], [9]]][1:2][1][2:3][1][2:3][2]
+----
+5
+
+# 🔬 NULL expressions
+
+query R
+SELECT (LIST[[1, 2, 3], NULL, [4]]::INT LIST LIST)[2][1]
+----
+NULL
+
+query T
+SELECT ((LIST[[1, 2, 3], NULL, [4]]::INT LIST LIST)[2:3, 2:2])::text
+----
+NULL
 
 query T
 SELECT (LIST[1, 2, 3][NULL])::text
@@ -415,6 +471,11 @@ SELECT ((LIST [[1, NULL, 3], NULL, [4, NULL, 6]]::INT LIST LIST)[2:])::text
 ----
 {NULL,{4,NULL,6}}
 
+query T
+SELECT ((LIST [[1, NULL, 3], NULL, [4, NULL, 6]]::INT LIST LIST)[2:3][1])::text
+----
+NULL
+
 # 🔬🔬 Slices and NULLs
 
 # NULL literals are not touched by slice operations
@@ -422,6 +483,51 @@ query T
 SELECT ((LIST[NULL]::INT LIST)[1:1])::text
 ----
 {NULL}
+
+# Slicing into a NULL list produces an empty result expressed as NULL; if all
+# results are empty, reduce them all to a single NULL
+query T
+SELECT ((LIST[NULL, NULL]::INT LIST LIST)[:, 1:1])::text
+----
+NULL
+
+# Literal NULLs are NOT empty results and don't get reduced
+query T
+SELECT ((LIST[NULL, [NULL]]::INT LIST LIST)[:, 1:1])::text
+----
+{NULL,{NULL}}
+
+# Results can mix values and empty-results-as-NULLs
+query T
+SELECT ((LIST [[1, NULL, 3], NULL, [4, 5, 6]]::INT LIST LIST)[2:3, 2:2])::text
+----
+{NULL,{5}}
+
+# Results can mix NULL values and empty-results-as-NULLs
+query T
+SELECT ((LIST [[1, NULL, 3], NULL, [4, NULL, 6]]::INT LIST LIST)[2:3, 2:2])::text
+----
+{NULL,{NULL}}
+
+# Empty results across dimensions are still reduced
+query T
+SELECT ((LIST [[1, NULL, 3], NULL, [4, NULL, 6]]::INT LIST LIST)[2:3, 4:4])::text
+----
+NULL
+
+# Outer list's second position produces empty results, but third position
+# produces value, so cannot be totally reduced
+query T
+SELECT ((LIST [NULL, [NULL], [[NULL]]]::INT LIST LIST LIST)[:, :, :])::text
+----
+{NULL,NULL,{{NULL}}}
+
+# Third position returns empty results, along with the first and second
+# position, so all can be reduced to NULL
+query T
+SELECT ((LIST [NULL, [NULL], [[NULL]]]::INT LIST LIST LIST)[:, :, 2:2])::text
+----
+NULL
 
 # 🔬 Empty lists expressions
 
@@ -433,12 +539,17 @@ NULL
 query T
 SELECT ((LIST[]::INT LIST)[:])::text
 ----
-{}
+NULL
 
 query T
 SELECT ((LIST[]::INT LIST)[1:1])::text
 ----
-{}
+NULL
+
+query T
+SELECT ((LIST[]::INT LIST LIST)[1:1, 1:1])::text
+----
+NULL
 
 # 🔬 Other subscript values
 
@@ -447,7 +558,7 @@ SELECT ((LIST[]::INT LIST)[1:1])::text
 query T
 SELECT (LIST[1, 2, 3][2:1])::text
 ----
-{}
+NULL
 
 # 🔬🔬 Negative values
 
@@ -469,17 +580,17 @@ SELECT (LIST[1, 2, 3][-100:99])::text
 query T
 SELECT (LIST[1, 2, 3][-100:-99])::text
 ----
-{}
+NULL
 
 query T
 SELECT (LIST[1, 2, 3][-100:-101])::text
 ----
-{}
+NULL
 
 query T
 SELECT (LIST[1, 2, 3][:-100])::text
 ----
-{}
+NULL
 
 # 🔬🔬 min/max
 
@@ -496,12 +607,12 @@ NULL
 query T
 SELECT (LIST[1][9223372036854775807::bigint:9223372036854775807::bigint])::text
 ----
-{}
+NULL
 
 query T
 SELECT (LIST[1][9223372036854775807::bigint:-9223372036854775807::bigint])::text
 ----
-{}
+NULL
 
 query T
 SELECT (LIST[1][-9223372036854775807::bigint:9223372036854775807::bigint])::text
@@ -511,7 +622,7 @@ SELECT (LIST[1][-9223372036854775807::bigint:9223372036854775807::bigint])::text
 query T
 SELECT (LIST[1][-9223372036854775807::bigint:-9223372036854775807::bigint])::text
 ----
-{}
+NULL
 
 # 🔬 Non-int subscript values
 
@@ -557,19 +668,19 @@ SELECT (LIST[1,2,3][LIST[1][2.0 / 2]])::text
 query error invalid input syntax for type bigint: invalid digit found in string: "dog"
 SELECT LIST[1,2,3]['dog']
 
-query error subscripting does not support casting from date to bigint
+query error subscript \(indexing\) does not support casting from date to bigint
 SELECT LIST [[1, 2, 3], [4, 5]][DATE '2001-01-01']
 
-query error subscripting does not support casting from timestamp to bigint
+query error subscript \(indexing\) does not support casting from timestamp to bigint
 SELECT LIST [[1, 2, 3], [4, 5]][TIMESTAMP '2001-01-01']
 
 query error invalid input syntax for type bigint: invalid digit found in string: "dog"
 SELECT (LIST[1,2,3][1:'dog'])::text
 
-query error subscripting does not support casting from date to bigint
+query error subscript \(slicing\) does not support casting from date to bigint
 SELECT LIST [[1, 2, 3], [4, 5]][1:DATE '2001-01-01']
 
-query error subscripting does not support casting from timestamp to bigint
+query error subscript \(slicing\) does not support casting from timestamp to bigint
 SELECT LIST [[1, 2, 3], [4, 5]][1:TIMESTAMP '2001-01-01']
 
 # 🔬 Built-in functions
@@ -589,18 +700,6 @@ query T
 SELECT (list_append(LIST[[1], [2]], LIST[3]))::text
 ----
 {{1},{2},{3}}
-
-# 🔬🔬🔬🔬 polymorphism
-
-query T
-SELECT pg_typeof(list_append(LIST[1::int2], 1::int8))
-----
-bigint list
-
-query T
-SELECT pg_typeof(list_append(LIST[1::int8], 1::int2))
-----
-bigint list
 
 # 🔬🔬🔬 NULL elements
 
@@ -655,18 +754,16 @@ SELECT (list_append(NULL, NULL::INT LIST))::text
 
 # 🔬🔬🔬 errors
 
-query T
-SELECT list_append(NULL, NULL)::text
-----
-{NULL}
+query error Cannot call function list_append\(unknown, unknown\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+SELECT list_append(NULL, NULL)
 
-query error invalid input syntax for type integer
-SELECT list_append(LIST[1], 'a')::text
+query error
+SELECT list_append(LIST[1], 'a')
 
-query error arguments cannot be implicitly cast to any implementation's parameters
+query error
 SELECT list_append(LIST[1], LIST[2])
 
-query error arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
+query error
 SELECT list_append(1, LIST[1])
 
 # 🔬🔬 list_cat
@@ -712,18 +809,6 @@ SELECT (list_cat(NULL, NULL::INT LIST))::text
 ----
 NULL
 
-# 🔬🔬🔬🔬 polymorphism
-
-query T
-SELECT pg_typeof(list_cat(LIST[1::int2], LIST[1::int8]))
-----
-bigint list
-
-query T
-SELECT pg_typeof(list_cat(LIST[1::int8], LIST[1::int2]))
-----
-bigint list
-
 # 🔬🔬🔬 errors
 
 query error
@@ -735,81 +820,78 @@ SELECT list_cat('a', LIST[1])
 query error
 SELECT list_cat(LIST[1], LIST[[2]])
 
-# 🔬🔬 list_n_layers
+# 🔬🔬 list_ndims
 
 query R
-SELECT list_n_layers(LIST [1, 2, 3])
+SELECT list_ndims(LIST [1, 2, 3])
 ----
 1
 
 query R
-SELECT list_n_layers(LIST []::INT LIST)
+SELECT list_ndims(LIST []::INT LIST)
 ----
 1
 
 query R
-SELECT list_n_layers(LIST[[1],[1]])
+SELECT list_ndims(LIST[[1],[1]])
 ----
 2
 
 query R
-SELECT list_n_layers(LIST [[[1], [1]], [[1]]])
+SELECT list_ndims(LIST [[[1], [1]], [[1]]])
 ----
 3
 
 # 🔬🔬🔬 slices
 
 query R
-SELECT list_n_layers(LIST[[1],[1]][1:1])
+SELECT list_ndims(LIST[[1],[1]][1:1])
 ----
 2
 
 query R
-SELECT list_n_layers(LIST [[[1], [1]], [[1]]][1:2])
+SELECT list_ndims(LIST [[[1], [1]], [[1]]][1:2])
 ----
 3
 
 # 🔬🔬🔬 interior lists
 
 query R
-SELECT list_n_layers(LIST[[1],[1]][1])
+SELECT list_ndims(LIST[[1],[1]][1])
 ----
 1
 
 query R
-SELECT list_n_layers(LIST [[[1], [1]], [[1]]][1])
+SELECT list_ndims(LIST [[[1], [1]], [[1]]][1])
 ----
 2
 
 query R
-SELECT list_n_layers(LIST [[[1], [1]], [[1]]][1][1])
+SELECT list_ndims(LIST [[[1], [1]], [[1]]][1][1])
 ----
 1
 
 # 🔬🔬🔬 NULL elements
 
 query R
-SELECT list_n_layers(LIST[NULL]::INT LIST)
+SELECT list_ndims(LIST[NULL]::INT LIST)
 ----
 1
 
 query R
-SELECT list_n_layers(LIST[NULL]::INT LIST LIST)
+SELECT list_ndims(LIST[NULL]::INT LIST LIST)
 ----
 2
 
 query R
-SELECT list_n_layers(LIST[[1], NULL]::INT LIST LIST)
+SELECT list_ndims(LIST[[1], NULL]::INT LIST LIST)
 ----
 2
 
 query R
-SELECT list_n_layers((LIST[[1],NULL]::INT LIST LIST)[2])
+SELECT list_ndims((LIST[[1],NULL]::INT LIST LIST)[2])
 ----
 1
-
-query error could not determine polymorphic type because input has type unknown
-SELECT list_n_layers(NULL)
 
 # 🔬🔬 list_length
 
@@ -878,9 +960,6 @@ query R
 SELECT list_length((LIST[[1],NULL]::INT LIST LIST)[2])
 ----
 NULL
-
-query error could not determine polymorphic type because input has type unknown
-SELECT list_length(NULL)
 
 # 🔬🔬 list_length_max
 
@@ -997,26 +1076,23 @@ NULL
 
 # 🔬🔬🔬 errors
 
-query error invalid layer: 2; must use value within \[1, 1\]
+query error invalid dimension: 2; must use value within \[1, 1\]
 SELECT list_length_max((LIST[1]::INT LIST), 2)
 
-query error invalid layer: 2; must use value within \[1, 1\]
+query error invalid dimension: 2; must use value within \[1, 1\]
 SELECT list_length_max((LIST[NULL]::INT LIST), 2)
 
-query error invalid layer: 3; must use value within \[1, 2\]
+query error invalid dimension: 3; must use value within \[1, 2\]
 SELECT list_length_max((LIST[NULL]::INT LIST LIST), 3)
 
-query error invalid layer: 0; must use value within \[1, 1\]
+query error invalid dimension: 0; must use value within \[1, 1\]
 SELECT list_length_max((LIST[1]::INT LIST), 0)
 
-query error invalid layer: -1; must use value within \[1, 1\]
+query error invalid dimension: -1; must use value within \[1, 1\]
 SELECT list_length_max((LIST[1]::INT LIST), -1)
 
-query error invalid layer: -1; must use value within \[1, 1\]
+query error invalid dimension: -1; must use value within \[1, 1\]
 SELECT list_length_max((LIST[1]::INT LIST), LIST[-1][1])
-
-query error could not determine polymorphic type because input has type unknown
-SELECT list_length_max(NULL, 1)
 
 # 🔬🔬 list_prepend
 
@@ -1033,18 +1109,6 @@ query T
 SELECT (list_prepend(LIST[1], LIST[[2], [3]]))::text
 ----
 {{1},{2},{3}}
-
-# 🔬🔬🔬🔬 polymorphism
-
-query T
-SELECT pg_typeof(list_prepend(1::int2, LIST[1::int8]))
-----
-bigint list
-
-query T
-SELECT pg_typeof(list_prepend(1::int8, LIST[1::int2]))
-----
-bigint list
 
 # 🔬🔬🔬 NULL elements
 
@@ -1136,14 +1200,14 @@ query T
 SELECT unnest::text FROM unnest(NULL::int list)
 ----
 
-query error Cannot call function unnest\(unknown\): unable to determine which implementation to use; try providing explicit casts to match parameter types
+query error Cannot call function unnest\(unknown\): arguments cannot be implicitly cast to any implementation's parameters; try providing explicit casts
 SELECT * FROM unnest(NULL)
 
 # 🔬 List casts
 
 # 🔬🔬 Between lists
 
-# 🔬🔬🔬 Unlayered lists
+# 🔬🔬🔬 Single-dimensional lists
 
 query T
 SELECT (LIST['1']::int list)::text
@@ -1180,10 +1244,10 @@ NULL
 query error invalid input syntax for type integer: invalid digit found in string: "dog"
 SELECT (LIST['1', 'dog']::int list)::text
 
-query error LIST could not convert type date to integer
+query error CAST does not support casting from date list to integer list
 SELECT LIST[DATE '2008-02-01']::int list
 
-# 🔬🔬🔬 Layered and jagged lists
+# 🔬🔬🔬 Multi-dimensional and jagged lists
 
 query T
 SELECT (LIST[[1.4::float], [-1.5::float, 2.5::float]]::int list list)::text
@@ -1618,13 +1682,10 @@ query error invalid input syntax for type list: malformed literal; missing eleme
 SELECT ('{  ,a}'::text list)::text
 
 # 🔬🔬🔬🔬 homogeneous text lists
-query error char list not yet supported
-SELECT (LIST['ab'::char, 'cd'::varchar, 'ef'::text])::text
-
 query T
-SELECT (LIST['cd'::varchar, 'ef'::text])::text
+SELECT (LIST['ab'::char, 'cd'::varchar, 'ef'::text])::text
 ----
-{cd,ef}
+{a,cd,ef}
 
 # 🔬🔬 char lists
 # ensures that the list type does not pick up an elements' typmod
@@ -1684,7 +1745,7 @@ SELECT ('{1.2}'::numeric(38,5) list || '{2.3}'::numeric(38,0) list)::text;
 ----
 {1.2,2}
 
-# ...including on multiple layers
+# ...including on multiple dimensions
 query T
 SELECT ('{{1.2}}'::numeric(38,5) list list || '{{2.3}}'::numeric(38,0) list list)::text;
 ----
@@ -1701,18 +1762,6 @@ SELECT LIST[1.234::numeric(39,2), 2.345]::numeric(39, 2) list::text;
 ----
 {1.23,2.35}
 
-# 🔬🔬🔬🔬 polymorphic
-
-query T
-SELECT pg_typeof(LIST[1::int2] || LIST[2::int8])
-----
-bigint list
-
-query T
-SELECT pg_typeof(LIST[1::int8] || LIST[2::int2])
-----
-bigint list
-
 # 🔬🔬🔬 list + element
 
 query T
@@ -1725,18 +1774,6 @@ SELECT ('{1.2}'::numeric(38,5) list || '2.3'::numeric(38,0))::text;
 ----
 {1.2,2}
 
-# 🔬🔬🔬🔬 polymorphic
-
-query T
-SELECT pg_typeof(LIST[1::int2] || 2::int8)
-----
-bigint list
-
-query T
-SELECT pg_typeof(LIST[1::int8] || 2::int2)
-----
-bigint list
-
 # 🔬🔬🔬 element + list
 
 query T
@@ -1748,18 +1785,6 @@ query T
 SELECT ('1.2'::numeric(38,5) || '{2.3}'::numeric(38,0) list)::text;
 ----
 {1.2,2}
-
-# 🔬🔬🔬🔬 polymorphic
-
-query T
-SELECT pg_typeof(1::int2 || LIST[2::int8])
-----
-bigint list
-
-query T
-SELECT pg_typeof(1::int8 || LIST[2::int2])
-----
-bigint list
 
 # 🔬🔬🔬 list list + list (list + element)
 
@@ -2460,118 +2485,3 @@ query T
 SELECT sum(a ORDER BY b) FROM t2
 ----
 4
-
-# list_remove
-
-query T
-SELECT list_remove(LIST[1,2,3,2], 2)::text
-----
-{1,3}
-
-query T
-SELECT list_remove(LIST[1,2,3,2], 5)::text
-----
-{1,2,3,2}
-
-query T
-SELECT list_remove(LIST[1,2,3,NULL::INT], NULL::INT)::text
-----
-{1,2,3}
-
-query T
-SELECT list_remove(LIST[1,NULL::INT,2,3,NULL::INT], NULL::INT)::text
-----
-{1,2,3}
-
-query T
-SELECT list_remove(NULL::integer list, NULL::INT)::text
-----
-NULL
-
-query T
-SELECT list_remove(NULL::integer list, 1)::text
-----
-NULL
-
-query T
-SELECT list_remove(LIST[1,1,1], 1)::text
-----
-{}
-
-query T
-SELECT list_remove(LIST[[1,2],[1],[1,2,3], LIST[1]], LIST[1])::text
-----
-{{1,2},{1,2,3}}
-
-query T
-SELECT list_remove(LIST[[1,2],[1],[1,2,3],LIST[1]], LIST[1,2,3])::text
-----
-{{1,2},{1},{1}}
-
-## polymorphism
-
-query T
-SELECT pg_typeof(list_remove(LIST[1::int8,2,3,2], 2::int2))
-----
-bigint list
-
-query T
-SELECT pg_typeof(list_remove(LIST[1::int2,2,3,2], 2::int8))
-----
-bigint list
-
-# array to list
-query T
-SELECT '{1,2,3}'::int[]::int list::text;
-----
-{1,2,3}
-
-query T
-SELECT pg_typeof('{1,2,3}'::int[]::int list);
-----
-integer list
-
-query T
-SELECT '{}'::int[]::int list::text;
-----
-{}
-
-query T
-SELECT pg_typeof('{1,2,3}'::int[]::int list);
-----
-integer list
-
-query T
-SELECT NULL::int[]::int list::text;
-----
-NULL
-
-query T
-SELECT pg_typeof(NULL::int[]::int list);
-----
-integer list
-
-query error invalid input syntax for type array: parsing multi-dimensional arrays is not supported
-SELECT '{{1},{2},{3}}'::int[]::int list::text;
-
-# Verify nested lists
-statement ok
-CREATE TABLE users (id int not null, other_field int not null)
-
-statement ok
-CREATE TABLE customer (id int not null, first_name string not null, last_name string not null, zip string not null)
-
-statement ok
-INSERT INTO users VALUES (1, 10), (2, 5), (3, 8);
-
-statement ok
-INSERT INTO customer VALUES (1, 'alice', 'lasta', '10003'::text), (2, 'bob', 'lastb', '10013'::text), (3, 'charlie', 'lastc', '11217'::text);
-
-query error LIST could not convert type integer list to text list
-SELECT LIST[LIST[customer.first_name, customer.last_name], LIST[customer.zip], LIST[customer.id]]::text FROM customer JOIN users ON customer.id = users.id ORDER BY users.other_field DESC LIMIT 2
-
-query T
-SELECT LIST[LIST[customer.first_name, customer.last_name], LIST[customer.zip], LIST[customer.id::text]]::text FROM customer JOIN users ON customer.id = users.id ORDER BY users.other_field DESC LIMIT 2
-----
-{{alice,lasta},{10003},{1}}
-{{charlie,lastc},{11217},{3}}

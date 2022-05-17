@@ -24,9 +24,9 @@ use std::collections::HashMap;
 
 use itertools::Itertools;
 
-use mz_expr::{Id, JoinInputMapper, MirRelationExpr, MirScalarExpr, RECURSION_LIMIT};
-use mz_ore::stack::{CheckedRecursion, RecursionGuard};
-use mz_repr::{Row, RowPacker};
+use expr::{Id, JoinInputMapper, MirRelationExpr, MirScalarExpr, RECURSION_LIMIT};
+use ore::stack::{CheckedRecursion, RecursionGuard};
+use repr::Row;
 
 use crate::TransformArgs;
 
@@ -183,11 +183,10 @@ impl LiteralLifting {
 
                             let remove_extracted_literals = |row: &mut Row| {
                                 let mut new_row = Row::default();
-                                let mut packer = new_row.packer();
                                 let data = row.unpack();
                                 for i in 0..the_same.len() {
                                     if !the_same[i] {
-                                        packer.push(data[i]);
+                                        new_row.push(data[i]);
                                     }
                                 }
                                 *row = new_row;
@@ -210,9 +209,9 @@ impl LiteralLifting {
                             typ.keys.sort();
                             typ.keys.dedup();
 
-                            RowPacker::for_existing_row(row).truncate_datums(typ.arity());
+                            row.truncate_datums(typ.arity());
                             for (row, _cnt) in rows.iter_mut() {
-                                RowPacker::for_existing_row(row).truncate_datums(typ.arity());
+                                row.truncate_datums(typ.arity());
                             }
                         }
 
@@ -431,7 +430,7 @@ impl LiteralLifting {
                     }
 
                     if input_literals.iter().any(|l| !l.is_empty()) {
-                        *implementation = mz_expr::JoinImplementation::Unimplemented;
+                        *implementation = expr::JoinImplementation::Unimplemented;
 
                         // We should be able to install any literals in the
                         // equivalence relations, and then lift all literals
@@ -520,8 +519,8 @@ impl LiteralLifting {
                         }
                     }
 
-                    let eval_constant_aggr = |aggr: &mz_expr::AggregateExpr| {
-                        let temp = mz_repr::RowArena::new();
+                    let eval_constant_aggr = |aggr: &expr::AggregateExpr| {
+                        let temp = repr::RowArena::new();
                         let mut eval = aggr.expr.eval(&[], &temp);
                         if let Ok(param) = eval {
                             eval = Ok(aggr.func.eval(Some(param), &temp));
@@ -531,7 +530,7 @@ impl LiteralLifting {
                             // This type information should be available in the `a.expr` literal,
                             // but extracting it with pattern matching seems awkward.
                             aggr.func
-                                .output_type(aggr.expr.typ(&mz_repr::RelationType::empty()))
+                                .output_type(aggr.expr.typ(&repr::RelationType::empty()))
                                 .scalar_type,
                         )
                     };
@@ -622,6 +621,7 @@ impl LiteralLifting {
                     // Literals can just be lifted out of threshold.
                     self.action(input, gets)
                 }
+                MirRelationExpr::DeclareKeys { input, .. } => self.action(input, gets),
                 MirRelationExpr::Union { base, inputs } => {
                     let mut base_literals = self.action(base, gets)?;
 

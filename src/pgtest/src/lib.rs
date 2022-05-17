@@ -12,8 +12,7 @@
 //! messages](https://www.postgresql.org/docs/current/protocol-message-formats.html)
 //! to any Postgres-compatible server and record received messages.
 //!
-//! The following datadriven directives are supported. They support a
-//! `conn=name` argument to specify a non-default connection.
+//! The following datadriven directives are supported:
 //! - `send`: Sends input messages to the server. Arguments, if needed,
 //! are specified using JSON. Refer to the associated types to see
 //! supported arguments. Arguments can be omitted to use defaults.
@@ -37,8 +36,7 @@
 //! no_error_fields`.
 //! - `err_field_typs` specifies the set of error message fields
 //! ([reference](https://www.postgresql.org/docs/current/protocol-error-fields.html)).
-//! The default is `CMS` (code, message, severity).
-//! For example: `until err_field_typs=SC` would return the severity and code
+//! For example: `until err_field_typs=VC` would return the severity and code
 //! fields in any ErrorResponse message.
 //!
 //! For example, to execute a simple prepared statement:
@@ -59,33 +57,8 @@
 //! CommandComplete {"tag":"SELECT 1"}
 //! ReadyForQuery {"status":"I"}
 //! ```
-//!
-//! # Usage while writing tests
-//!
-//! The expected way to use this while writing tests is to generate output from a postgres server.
-//! Use the `pgtest-mz` directory if our output differs incompatibly from postgres.
-//! Write your test, excluding any lines after the `----` of the `until` directive.
-//! For example:
-//! ```pgtest
-//! send
-//! Query {"query": "SELECT 1"}
-//! ----
-//!
-//! until
-//! ReadyForQuery
-//! ----
-//! ```
-//! Then run the pgtest binary, enabling rewrites and pointing it at postgres:
-//! ```shell
-//! REWRITE=1 cargo run --bin mz-pgtest -- test/pgtest/test.pt --addr localhost:5432 --user postgres
-//! ```
-//! This will generate the expected output for the `until` directive.
-//! Now rerun against a running materialized server:
-//! ```shell
-//! cargo run --bin mz-pgtest -- test/pgtest/test.pt
-//! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
@@ -93,13 +66,12 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use bytes::{BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
-use mz_ore::collections::CollectionExt;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use postgres_protocol::IsNull;
 use serde::{Deserialize, Serialize};
 
-struct PgConn {
+pub struct PgTest {
     stream: TcpStream,
     recv_buf: BytesMut,
     send_buf: BytesMut,
@@ -107,33 +79,31 @@ struct PgConn {
     verbose: bool,
 }
 
-impl PgConn {
-    fn new(addr: &str, user: &str, timeout: Duration, verbose: bool) -> anyhow::Result<Self> {
-        let mut conn = Self {
+impl PgTest {
+    pub fn new(addr: &str, user: &str, timeout: Duration) -> anyhow::Result<Self> {
+        let mut pgtest = PgTest {
             stream: TcpStream::connect(addr)?,
             recv_buf: BytesMut::new(),
             send_buf: BytesMut::new(),
             timeout,
-            verbose,
+            verbose: std::env::var_os("PGTEST_VERBOSE").is_some(),
         };
-
-        conn.stream.set_read_timeout(Some(timeout))?;
-        conn.send(|buf| frontend::startup_message(vec![("user", user)], buf).unwrap())?;
-        match conn.recv()?.1 {
+        pgtest.stream.set_read_timeout(Some(timeout))?;
+        pgtest.send(|buf| frontend::startup_message(vec![("user", user)], buf).unwrap())?;
+        match pgtest.recv()?.1 {
             Message::AuthenticationOk => {}
             _ => bail!("expected AuthenticationOk"),
         };
-        conn.until(vec!["ReadyForQuery"], vec!['C', 'S', 'M'], HashSet::new())?;
-        Ok(conn)
+        pgtest.until(vec!["ReadyForQuery"], vec![], HashSet::new())?;
+        Ok(pgtest)
     }
-
-    fn send<F: Fn(&mut BytesMut)>(&mut self, f: F) -> anyhow::Result<()> {
+    pub fn send<F: Fn(&mut BytesMut)>(&mut self, f: F) -> anyhow::Result<()> {
         self.send_buf.clear();
         f(&mut self.send_buf);
         self.stream.write_all(&self.send_buf)?;
         Ok(())
     }
-    fn until(
+    pub fn until(
         &mut self,
         until: Vec<&str>,
         err_field_typs: Vec<char>,
@@ -330,58 +300,6 @@ impl PgConn {
     }
 }
 
-const DEFAULT_CONN: &str = "";
-
-pub struct PgTest {
-    addr: String,
-    user: String,
-    timeout: Duration,
-    conns: HashMap<String, PgConn>,
-    verbose: bool,
-}
-
-impl PgTest {
-    pub fn new(addr: String, user: String, timeout: Duration) -> anyhow::Result<Self> {
-        let verbose = std::env::var_os("PGTEST_VERBOSE").is_some();
-        let conn = PgConn::new(&addr, &user, timeout.clone(), verbose)?;
-        let mut conns = HashMap::new();
-        conns.insert(DEFAULT_CONN.to_string(), conn);
-
-        Ok(PgTest {
-            addr,
-            user,
-            timeout,
-            conns,
-            verbose,
-        })
-    }
-
-    fn get_conn(&mut self, name: Option<String>) -> anyhow::Result<&mut PgConn> {
-        let name = name.unwrap_or_else(|| DEFAULT_CONN.to_string());
-        if !self.conns.contains_key(&name) {
-            let conn = PgConn::new(&self.addr, &self.user, self.timeout.clone(), self.verbose)?;
-            self.conns.insert(name.clone(), conn);
-        }
-        Ok(self.conns.get_mut(&name).expect("must exist"))
-    }
-
-    pub fn send<F: Fn(&mut BytesMut)>(&mut self, conn: Option<String>, f: F) -> anyhow::Result<()> {
-        let conn = self.get_conn(conn)?;
-        conn.send(f)
-    }
-
-    pub fn until(
-        &mut self,
-        conn: Option<String>,
-        until: Vec<&str>,
-        err_field_typs: Vec<char>,
-        ignore: HashSet<String>,
-    ) -> anyhow::Result<Vec<String>> {
-        let conn = self.get_conn(conn)?;
-        conn.until(until, err_field_typs, ignore)
-    }
-}
-
 // Backend messages
 
 #[derive(Serialize)]
@@ -433,9 +351,7 @@ pub struct ErrorField {
 
 impl Drop for PgTest {
     fn drop(&mut self) {
-        for conn in self.conns.values_mut() {
-            let _ = conn.send(frontend::terminate);
-        }
+        let _ = self.send(frontend::terminate);
     }
 }
 
@@ -447,19 +363,14 @@ fn format_name(format: u8) -> String {
     }
 }
 
-pub fn walk(addr: String, user: String, timeout: Duration, dir: &str) {
-    datadriven::walk(dir, |tf| run_test(tf, addr.clone(), user.clone(), timeout));
+pub fn walk(addr: &str, user: &str, timeout: Duration, dir: &str) {
+    datadriven::walk(dir, |tf| run_test(tf, addr, user, timeout));
 }
 
-pub fn run_test(tf: &mut datadriven::TestFile, addr: String, user: String, timeout: Duration) {
+pub fn run_test(tf: &mut datadriven::TestFile, addr: &str, user: &str, timeout: Duration) {
     let mut pgt = PgTest::new(addr, user, timeout).unwrap();
     tf.run(|tc| -> String {
         let lines = tc.input.lines();
-        let mut args = tc.args.clone();
-        let conn: Option<String> = args
-            .remove("conn")
-            .map(|args| Some(args.into_first()))
-            .unwrap_or(None);
         match tc.directive.as_str() {
             "send" => {
                 for line in lines {
@@ -469,7 +380,7 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: String, user: String, timeo
                     let mut line = line.splitn(2, ' ');
                     let typ = line.next().unwrap_or("");
                     let args = line.next().unwrap_or("{}");
-                    pgt.send(conn.clone(), |buf| match typ {
+                    pgt.send(|buf| match typ {
                         "Query" => {
                             let v: Query = serde_json::from_str(args).unwrap();
                             frontend::query(&v.query, buf).unwrap();
@@ -541,6 +452,7 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: String, user: String, timeo
                 "".to_string()
             }
             "until" => {
+                let mut args = tc.args.clone();
                 // Our error field values don't always match postgres. Default to reporting
                 // the error code (C) and message (M), but allow the user to specify which ones
                 // they want.
@@ -549,7 +461,7 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: String, user: String, timeo
                 } else {
                     match args.remove("err_field_typs") {
                         Some(typs) => typs.join("").chars().collect(),
-                        None => vec!['C', 'S', 'M'],
+                        None => vec!['C', 'M'],
                     }
                 };
                 let mut ignore = HashSet::new();
@@ -563,7 +475,7 @@ pub fn run_test(tf: &mut datadriven::TestFile, addr: String, user: String, timeo
                 }
                 format!(
                     "{}\n",
-                    pgt.until(conn, lines.collect(), err_field_typs, ignore)
+                    pgt.until(lines.collect(), err_field_typs, ignore)
                         .unwrap()
                         .join("\n")
                 )

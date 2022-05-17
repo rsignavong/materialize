@@ -182,7 +182,7 @@ query T multiline
 EXPLAIN RAW PLAN FOR SELECT * FROM x, generate_series(1, a)
 ----
 %0 =
-| Get materialize.public.x (u2)
+| Get materialize.public.x (u3)
 
 %1 =
 | CallTable generate_series(1, #^0, 1)
@@ -196,7 +196,7 @@ query T multiline
 EXPLAIN RAW PLAN FOR SELECT * FROM x, generate_series(100::bigint, a)
 ----
 %0 =
-| Get materialize.public.x (u2)
+| Get materialize.public.x (u3)
 
 %1 =
 | CallTable generate_series(i32toi64(100), i32toi64(#^0), 1)
@@ -209,12 +209,8 @@ EOF
 query T multiline
 EXPLAIN PLAN FOR SELECT * FROM x, generate_series(1, 10)
 ----
-Source materialize.public.x (u2):
-| Project (#0, #1)
-
-Query:
 %0 =
-| Get materialize.public.x (u2)
+| Get materialize.public.x (u3)
 | ArrangeBy ()
 
 %1 =
@@ -229,12 +225,8 @@ EOF
 query T multiline
 EXPLAIN PLAN FOR SELECT * FROM x, generate_series(1, a)
 ----
-Source materialize.public.x (u2):
-| Project (#0, #1)
-
-Query:
 %0 =
-| Get materialize.public.x (u2)
+| Get materialize.public.x (u3)
 | FlatMap generate_series(1, #0, 1)
 
 EOF
@@ -242,13 +234,8 @@ EOF
 query T multiline
 EXPLAIN PLAN FOR SELECT * FROM x x1, x x2, generate_series(x1.a, x2.a) WHERE x1.b = x2.b
 ----
-Source materialize.public.x (u2):
-| Filter !(isnull(#1))
-| Project (#0, #1)
-
-Query:
 %0 = Let l0 =
-| Get materialize.public.x (u2)
+| Get materialize.public.x (u3)
 | Filter !(isnull(#1))
 
 %1 =
@@ -258,22 +245,17 @@ Query:
 %2 =
 | Join %1 %0 (= #1 #3)
 | | implementation = Differential %0 %1.(#1)
-| Project (#0..=#2)
+| Project (#0..#2)
 | FlatMap generate_series(#0, #2, 1)
-| Project (#0..=#2, #1, #3)
+| Project (#0..#2, #1, #3)
 
 EOF
 
 query T multiline
 EXPLAIN PLAN FOR SELECT * FROM x x1, x x2, generate_series(x1.a, x2.a) WHERE x1.b = x2.b
 ----
-Source materialize.public.x (u2):
-| Filter !(isnull(#1))
-| Project (#0, #1)
-
-Query:
 %0 = Let l0 =
-| Get materialize.public.x (u2)
+| Get materialize.public.x (u3)
 | Filter !(isnull(#1))
 
 %1 =
@@ -283,9 +265,9 @@ Query:
 %2 =
 | Join %1 %0 (= #1 #3)
 | | implementation = Differential %0 %1.(#1)
-| Project (#0..=#2)
+| Project (#0..#2)
 | FlatMap generate_series(#0, #2, 1)
-| Project (#0..=#2, #1, #3)
+| Project (#0..#2, #1, #3)
 
 EOF
 
@@ -294,13 +276,8 @@ EOF
 query T multiline
 EXPLAIN PLAN FOR SELECT * FROM x x1, x x2, generate_series(x1.a, x2.b) AS x3(b) WHERE x1.b = x2.b AND x1.a = x3.b
 ----
-Source materialize.public.x (u2):
-| Filter !(isnull(#1))
-| Project (#0, #1)
-
-Query:
 %0 = Let l0 =
-| Get materialize.public.x (u2)
+| Get materialize.public.x (u3)
 | Filter !(isnull(#1))
 
 %1 =
@@ -310,10 +287,10 @@ Query:
 %2 =
 | Join %1 %0 (= #1 #3)
 | | implementation = Differential %0 %1.(#1)
-| Project (#0..=#2)
+| Project (#0..#2)
 | FlatMap generate_series(#0, #1, 1)
 | Filter (#0 = #3)
-| Project (#0..=#2, #1, #3)
+| Project (#0..#2, #1, #3)
 
 EOF
 
@@ -486,10 +463,10 @@ SELECT information_schema._pg_expandarray(ARRAY[])
 query error cannot determine type of empty array
 SELECT * FROM information_schema._pg_expandarray(ARRAY[])
 
-query error could not determine polymorphic type because input has type unknown
+query error arguments cannot be implicitly cast
 SELECT * FROM information_schema._pg_expandarray(NULL)
 
-query error could not determine polymorphic type because input has type unknown
+query error arguments cannot be implicitly cast
 SELECT information_schema._pg_expandarray(NULL)
 
 query T colnames
@@ -750,13 +727,8 @@ jsonb_each
 (1,2)
 (3,4)
 
-query ITT colnames
-SELECT 1, jsonb_object_keys('{"1":2,"3":4}'::JSONB), jsonb_object_keys('{"1":2,"3":4,"5":6}'::JSONB) ORDER BY 3
-----
-?column? jsonb_object_keys jsonb_object_keys
-1  1  1
-1  3  3
-1  NULL  5
+query error multiple table functions in select projections not yet supported
+SELECT 1, jsonb_object_keys('{"1":2,"3":4}'::JSONB), jsonb_object_keys('{"1":2,"3":4,"5":6}'::JSONB) ORDER BY 1
 
 query T colnames
 SELECT jsonb_build_object(jsonb_object_keys('{"a":2, "b":3}'), 1, 'c', 3) ORDER BY 1
@@ -771,17 +743,13 @@ SELECT jsonb_build_object(jsonb_object_keys('{"a":2, "b":3}'), 1, 'c', 3), jsonb
 {"a":1,"c":3} {"a":1,"c":3}
 {"b":1,"c":3} {"b":1,"c":3}
 
-# TODO: query error argument 1: key must not be null
-query TT
-SELECT jsonb_build_object(jsonb_object_keys('{"a":2, "b":3}'), 1, 'c', 3), jsonb_build_object(jsonb_object_keys('{"a":2}'), 1, 'c', 3)
-----
-{"b":1,"c":3}  NULL
-{"a":1,"c":3}  {"a":1,"c":3}
+query error multiple table functions in select projections not yet supported
+SELECT jsonb_build_object(jsonb_object_keys('{"a":2, "b":3}'), 1, 'c', 3), jsonb_build_object(jsonb_object_keys('{"a":2}'), 1, 'c', 3);
 
-query error table functions are not allowed in other table functions
+query error multiple table functions in select projections not yet supported
 SELECT jsonb_array_elements(jsonb_array_elements('[[1,2],[3,4]]')), jsonb_array_elements(jsonb_array_elements('[[1],[3,4,5]]')) ORDER BY 1
 
-query error table functions are not allowed in other table functions
+query error multiple table functions in select projections not yet supported
 SELECT jsonb_array_elements(jsonb_array_elements('[[1,2],[3,4]]')), jsonb_array_elements('[7,8,9]') ORDER BY 1
 
 # Postgres explicitly disallows table funcs (although it uses "set-returning
@@ -990,30 +958,6 @@ SELECT * FROM generate_series('2020-01-01 22:00:00'::TIMESTAMPTZ, '2021-01-01 00
 query error step size cannot equal zero
 SELECT * FROM generate_series('2021-01-01 03:00:00'::TIMESTAMPTZ, '2021-01-03 00:00:00'::TIMESTAMPTZ, '0 day');
 
-query error step size cannot equal zero
-SELECT * FROM generate_series('2021-01-01 03:00:00'::TIMESTAMP, '2022-01-03 00:00:00'::TIMESTAMP, '1 month -30 day') ORDER BY 1;
-
-query error step size cannot equal zero
-SELECT * FROM generate_series('2021-01-01 03:00:00'::TIMESTAMP, '2022-01-03 00:00:00'::TIMESTAMP, '1 day -24 hr') ORDER BY 1;
-
-query T
-SELECT * FROM generate_series('2021-01-01 03:00:00'::TIMESTAMP, '2021-01-05 00:00:00'::TIMESTAMP, '1 day -12 hrs') ORDER BY 1;
-----
-2021-01-01 03:00:00
-2021-01-01 15:00:00
-2021-01-02 03:00:00
-2021-01-02 15:00:00
-2021-01-03 03:00:00
-2021-01-03 15:00:00
-2021-01-04 03:00:00
-2021-01-04 15:00:00
-
-query T
-SELECT * FROM generate_series('2021-01-01 03:00:00'::TIMESTAMP, '2021-02-01 00:00:00'::TIMESTAMP, '1 month -15 days') ORDER BY 1;
-----
-2021-01-01 03:00:00
-2021-01-17 03:00:00
-
 # Test ROWS FROM
 
 query I colnames
@@ -1179,82 +1123,20 @@ x y
 1 1
 2 2
 
-query II
-SELECT generate_series(1, 1), generate_series(2, 2)
-----
-1 2
-
 query IT colnames
 SELECT (information_schema._pg_expandarray(array[10])).x, information_schema._pg_expandarray(array[10])
 ----
 x _pg_expandarray
 10 (10,1)
 
-query IIITITT colnames
-SELECT
-    (information_schema._pg_expandarray(ARRAY[100])).*,
-    (information_schema._pg_expandarray(ARRAY[100])).x,
-    information_schema._pg_expandarray(ARRAY[100])::text,
-    generate_series(1, 2),
-    jsonb_array_elements('[3]'),
-    jsonb_array_elements('[4,5]')
-ORDER BY generate_series
-----
-x n x _pg_expandarray generate_series jsonb_array_elements jsonb_array_elements
-100 1 100 (100,1) 1 3 4
-NULL NULL NULL NULL 2 NULL 5
-
-query error column reference "generate_series" is ambiguous
-SELECT
-    generate_series(1, 2),
-    generate_series(1, 3)
-ORDER BY generate_series
-
-# Duplicate, identical table functions are not ambiguous.
-query II
-SELECT
-    generate_series(1, 2),
-    generate_series(1, 2)
-ORDER BY generate_series
-----
-1 1
-2 2
-
-query IIIT colnames,rowsort
-SELECT generate_series(1, 2), (information_schema._pg_expandarray(ARRAY[100])).*, jsonb_array_elements('[3]')::text ORDER BY 1
-----
-generate_series x n jsonb_array_elements
-1 100 1 3
-2 NULL NULL NULL
-
-query ITI colnames,rowsort
-SELECT generate_series(1, 2), information_schema._pg_expandarray(ARRAY[100])::text, generate_series(1, 3) ORDER BY 3
-----
-generate_series _pg_expandarray generate_series
-1 (100,1) 1
-2 NULL 2
-NULL NULL 3
-
-# Some error cases
-
-query error table functions are not allowed in WHERE clause
-SELECT 1 FROM t WHERE generate_series(1, 1) = 1
-
-# TODO: This error should complain about the DISTINCT.
-query error table functions are not allowed in SELECT clause
-SELECT generate_series(DISTINCT 1, 1)
+query error multiple table functions in select projections not yet supported
+SELECT generate_series(1, 1), generate_series(2, 2)
 
 # Subqueries avoid the uniqueness check.
 query II
 SELECT generate_series(1, 1), (SELECT generate_series(2, 2))
 ----
 1 2
-
-query error type integer is not composite
-SELECT (generate_series(1, 1)).*
-
-query error not a composite type
-SELECT (generate_series(1, 1)).generate_series
 
 # GENERATE_SUBSCRIPTS
 
@@ -1302,8 +1184,8 @@ SELECT generate_subscripts('{1,2,3,4}'::int[], 12345) AS s;
 query error parsing multi-dimensional arrays is not supported
 SELECT generate_subscripts('{{1,2,3,4}, {5,6,7,8}}'::int[], 1) AS s;
 
-query error table functions are not allowed in other table functions
-SELECT generate_subscripts('{1,2,3,4}'::int[], 1), repeat_row(generate_series(1, 1)) AS s
+query error multiple table functions in select projections not yet supported, see https://github.com/MaterializeInc/materialize/issues/1546 for more details
+SELECT generate_subscripts('{1,2,3,4}'::int[], 1), repeat_row(generate_series) AS s;
 
 # test lower bound, this should return indices 2,3,4
 # but currently we dont support this syntax
@@ -1322,9 +1204,6 @@ select generate_subscripts(ARRAY[ARRAY[1,2,3], ARRAY[4,5,6]], 2);
 1
 2
 3
-
-query error could not determine polymorphic type because input has type unknown
-SELECT generate_subscripts(NULL, 1)
 
 # Regression test for #9653: LATERAL column references in ROWS FROM
 
@@ -1357,10 +1236,3 @@ SELECT * FROM generate_series(1, 3) as foo(a), ROWS FROM (generate_series(foo.a,
 # Regression test for #9657
 statement ok
 create view bar as select * from y, rows from (generate_series(1, 2), jsonb_array_elements(y.a));
-
-# Regression for #10363
-query IT
-WITH a(x) AS (SELECT 'a') SELECT generate_series(1, 2), * FROM a ORDER BY generate_series
-----
-1 a
-2 a

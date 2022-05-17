@@ -9,17 +9,12 @@
 
 use std::error::Error;
 use std::fmt;
-use std::num::TryFromIntError;
 
-use dec::TryFromDecimalError;
-
-use mz_dataflow_types::sources::{ExternalSourceConnector, SourceConnector};
-use mz_expr::{EvalError, UnmaterializableFunc};
-use mz_ore::stack::RecursionLimitError;
-use mz_ore::str::StrExt;
-use mz_repr::NotNullViolation;
-use mz_sql::query_model::QGMError;
-use mz_transform::TransformError;
+use expr::EvalError;
+use ore::stack::RecursionLimitError;
+use ore::str::StrExt;
+use repr::NotNullViolation;
+use transform::TransformError;
 
 use crate::catalog;
 use crate::session::Var;
@@ -28,40 +23,27 @@ use crate::session::Var;
 #[derive(Debug)]
 pub enum CoordError {
     /// Query needs AS OF <time> or indexes to succeed.
+    // Embeded object is meant to be of structure Vec<(Objectname, Vec<Index names w/ enabled stats>)>.
     AutomaticTimestampFailure {
-        /// The names of any unmaterialized sources.
         unmaterialized: Vec<String>,
-        /// Vec<(Objectname, Vec<Index names w/ enabled stats>)>.
         disabled_indexes: Vec<(String, Vec<String>)>,
     },
     /// An error occurred in a catalog operation.
     Catalog(catalog::Error),
     /// The cached plan or descriptor changed.
     ChangedPlan,
-    /// The specified session parameter is constrained to a finite set of values.
-    ConstrainedParameter {
-        parameter: &'static (dyn Var + Send + Sync),
-        value: String,
-        valid_values: Option<Vec<&'static str>>,
-    },
+    /// The specified session parameter is constrained to its current value.
+    ConstrainedParameter(&'static (dyn Var + Send + Sync)),
     /// The cursor already exists.
     DuplicateCursor(String),
     /// An error while evaluating an expression.
     Eval(EvalError),
-    /// The specified parameter is fixed to a single specific value.
-    FixedValueParameter(&'static (dyn Var + Send + Sync)),
     /// The ID allocator exhausted all valid IDs.
     IdExhaustionError,
-    /// Unexpected internal state was encountered.
-    Internal(String),
+    /// At least one input has no complete timestamps yet
+    IncompleteTimestamp(Vec<expr::GlobalId>),
     /// Specified index is disabled, but received non-enabling update request
     InvalidAlterOnDisabledIndex(String),
-    /// Attempted to build a materialization on a source that does not allow multiple materializations
-    InvalidRematerialization {
-        base_source: String,
-        existing_indexes: Vec<String>,
-        source_type: RematerializedSourceType,
-    },
     /// The value for the specified parameter does not have the right type.
     InvalidParameterType(&'static (dyn Var + Send + Sync)),
     /// The value of the specified parameter is incorrect
@@ -78,12 +60,8 @@ pub enum CoordError {
     OperationProhibitsTransaction(String),
     /// The named operation requires an active transaction.
     OperationRequiresTransaction(String),
-    /// A persistence-related error.
-    Persistence(mz_persist::error::Error),
     /// The named prepared statement already exists.
     PreparedStatementExists(String),
-    /// An error occurred in the QGM stage of the optimizer.
-    QGM(QGMError),
     /// The transaction is in read-only mode.
     ReadOnlyTransaction,
     /// The specified session parameter is read-only.
@@ -99,10 +77,10 @@ pub enum CoordError {
     /// The specified feature is not permitted in safe mode.
     SafeModeViolation(String),
     /// An error occurred in a SQL catalog operation.
-    SqlCatalog(mz_sql::catalog::CatalogError),
+    SqlCatalog(sql::catalog::CatalogError),
     /// The transaction is in single-tail mode.
     TailOnlyTransaction,
-    /// An error occurred in the MIR stage of the optimizer.
+    /// An error occurred in the optimizer.
     Transform(TransformError),
     /// The named cursor does not exist.
     UnknownCursor(String),
@@ -117,8 +95,6 @@ pub enum CoordError {
     Unstructured(anyhow::Error),
     /// The named feature is not supported and will (probably) not be.
     Unsupported(&'static str),
-    /// The specified function cannot be materialized.
-    UnmaterializableFunction(UnmaterializableFunc),
     /// The transaction is in write-only mode.
     WriteOnlyTransaction,
 }
@@ -188,20 +164,6 @@ impl CoordError {
                  safe mode, which limits the features that are available."
                     .into(),
             ),
-            CoordError::InvalidRematerialization {
-                existing_indexes, source_type, ..
-            } => {
-                let source_name = match source_type {
-                    RematerializedSourceType::Postgres => "Postgres",
-                    RematerializedSourceType::S3 => "S3 with SQS notification ",
-                    RematerializedSourceType::PersistedSource => "Persisted",
-                };
-                Some(format!(
-                    "{} sources can be materialized by only one set of indexes at a time. \
-                     The following indexes have already materialized this source:\n    {}",
-                    source_name,
-                    existing_indexes.join("\n    ")))
-            }
             _ => None,
         }
     }
@@ -237,10 +199,6 @@ impl CoordError {
                 ))
             }
             CoordError::Catalog(c) => c.hint(),
-            CoordError::ConstrainedParameter {
-                valid_values: Some(valid_values),
-                ..
-            } => Some(format!("Available values: {}.", valid_values.join(", "))),
             CoordError::Eval(e) => e.hint(),
             CoordError::InvalidAlterOnDisabledIndex(idx) => Some(format!(
                 "To perform this ALTER, first enable the index using ALTER \
@@ -257,23 +215,6 @@ impl CoordError {
                 // because that leaks information to unauthenticated clients.)
                 Some("Try connecting as the \"materialize\" user.".into())
             }
-            CoordError::InvalidRematerialization { source_type, .. } => {
-                let doc_page = match source_type {
-                    RematerializedSourceType::Postgres => "postgres",
-                    RematerializedSourceType::S3 => "text-s3",
-                    RematerializedSourceType::PersistedSource => {
-                        // TODO: Make this more helpful once we have documentation for persisted
-                        // sources.
-                        return Some(
-                            "Either create one materialization and base more views on that, or create another source to base this materialization upon.".to_string(),
-                        );
-                    }
-                };
-                Some(format!(
-                    "See the documentation at https://materialize.com/docs/sql/create-source/{}",
-                    doc_page
-                ))
-            }
             _ => None,
         }
     }
@@ -287,35 +228,24 @@ impl fmt::Display for CoordError {
             }
             CoordError::ChangedPlan => f.write_str("cached plan must not change result type"),
             CoordError::Catalog(e) => e.fmt(f),
-            CoordError::ConstrainedParameter {
-                parameter, value, ..
-            } => write!(
-                f,
-                "invalid value for parameter {}: {}",
-                parameter.name().quoted(),
-                value.quoted()
-            ),
-            CoordError::DuplicateCursor(name) => {
-                write!(f, "cursor {} already exists", name.quoted())
-            }
-            CoordError::Eval(e) => e.fmt(f),
-            CoordError::FixedValueParameter(p) => write!(
+            CoordError::ConstrainedParameter(p) => write!(
                 f,
                 "parameter {} can only be set to {}",
                 p.name().quoted(),
                 p.value().quoted()
             ),
+            CoordError::DuplicateCursor(name) => {
+                write!(f, "cursor {} already exists", name.quoted())
+            }
+            CoordError::Eval(e) => e.fmt(f),
             CoordError::IdExhaustionError => f.write_str("ID allocator exhausted all valid IDs"),
-            CoordError::Internal(e) => write!(f, "internal error: {}", e),
+            CoordError::IncompleteTimestamp(unstarted) => write!(
+                f,
+                "At least one input has no complete timestamps yet: {:?}",
+                unstarted
+            ),
             CoordError::InvalidAlterOnDisabledIndex(name) => {
                 write!(f, "invalid ALTER on disabled index {}", name.quoted())
-            }
-            CoordError::InvalidRematerialization {
-                base_source,
-                existing_indexes: _,
-                source_type: _,
-            } => {
-                write!(f, "Cannot re-materialize source {}", base_source)
             }
             CoordError::InvalidParameterType(p) => write!(
                 f,
@@ -346,11 +276,9 @@ impl fmt::Display for CoordError {
             CoordError::OperationRequiresTransaction(op) => {
                 write!(f, "{} can only be used in transaction blocks", op)
             }
-            CoordError::Persistence(error) => error.fmt(f),
             CoordError::PreparedStatementExists(name) => {
                 write!(f, "prepared statement {} already exists", name.quoted())
             }
-            CoordError::QGM(e) => e.fmt(f),
             CoordError::ReadOnlyTransaction => f.write_str("transaction in read-only mode"),
             CoordError::ReadOnlyParameter(p) => {
                 write!(f, "parameter {} cannot be changed", p.name().quoted())
@@ -380,9 +308,6 @@ impl fmt::Display for CoordError {
             CoordError::UnknownParameter(name) => {
                 write!(f, "unrecognized configuration parameter {}", name.quoted())
             }
-            CoordError::UnmaterializableFunction(func) => {
-                write!(f, "cannot materialize call to {}", func)
-            }
             CoordError::Unsupported(features) => write!(f, "{} are not supported", features),
             CoordError::Unstructured(e) => write!(f, "{:#}", e),
             CoordError::WriteOnlyTransaction => f.write_str("transaction in write-only mode"),
@@ -399,18 +324,6 @@ impl From<anyhow::Error> for CoordError {
     }
 }
 
-impl From<TryFromIntError> for CoordError {
-    fn from(e: TryFromIntError) -> CoordError {
-        CoordError::Unstructured(e.into())
-    }
-}
-
-impl From<TryFromDecimalError> for CoordError {
-    fn from(e: TryFromDecimalError) -> CoordError {
-        CoordError::Unstructured(e.into())
-    }
-}
-
 impl From<catalog::Error> for CoordError {
     fn from(e: catalog::Error) -> CoordError {
         CoordError::Catalog(e)
@@ -423,15 +336,9 @@ impl From<EvalError> for CoordError {
     }
 }
 
-impl From<mz_sql::catalog::CatalogError> for CoordError {
-    fn from(e: mz_sql::catalog::CatalogError) -> CoordError {
+impl From<sql::catalog::CatalogError> for CoordError {
+    fn from(e: sql::catalog::CatalogError) -> CoordError {
         CoordError::SqlCatalog(e)
-    }
-}
-
-impl From<QGMError> for CoordError {
-    fn from(e: QGMError) -> CoordError {
-        CoordError::QGM(e)
     }
 }
 
@@ -454,33 +361,3 @@ impl From<RecursionLimitError> for CoordError {
 }
 
 impl Error for CoordError {}
-
-/// Represent a source that is not allowed to be rematerialized
-#[derive(Debug)]
-pub enum RematerializedSourceType {
-    Postgres,
-    S3,
-    PersistedSource,
-}
-
-impl RematerializedSourceType {
-    /// Create a RematerializedSourceType error helper
-    ///
-    /// # Panics
-    ///
-    /// If the source is of a type that is allowed to be rematerialized
-    pub fn for_source(source: &catalog::Source) -> RematerializedSourceType {
-        if source.persist_details.is_some() {
-            return RematerializedSourceType::PersistedSource;
-        }
-
-        match &source.connector {
-            SourceConnector::External { connector, .. } => match connector {
-                ExternalSourceConnector::S3(_) => RematerializedSourceType::S3,
-                ExternalSourceConnector::Postgres(_) => RematerializedSourceType::Postgres,
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
-        }
-    }
-}

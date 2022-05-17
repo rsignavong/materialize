@@ -17,6 +17,7 @@ documentation][user-docs].
 
 import argparse
 import base64
+import enum
 import hashlib
 import json
 import os
@@ -25,11 +26,12 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryFile
-from typing import IO, Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set
+from typing import IO, Any, Dict, Iterable, Iterator, List, Sequence, Set
 
 import yaml
 
@@ -47,6 +49,16 @@ class Fingerprint(bytes):
 
     def __str__(self) -> str:
         return base64.b32encode(self).decode()
+
+
+class AcquiredFrom(enum.Enum):
+    """Where an `Image` was acquired from."""
+
+    REGISTRY = "registry"
+    """The image was downloaded from Docker Hub."""
+
+    LOCAL_BUILD = "local-build"
+    """The image was built from source locally."""
 
 
 class RepositoryDetails:
@@ -70,13 +82,9 @@ class RepositoryDetails:
         self.coverage = coverage
         self.cargo_workspace = cargo.Workspace(root)
 
-    def cargo(
-        self, subcommand: str, rustflags: List[str], channel: Optional[str] = None
-    ) -> List[str]:
+    def cargo(self, subcommand: str, rustflags: List[str]) -> List[str]:
         """Start a cargo invocation for the configured architecture."""
-        return xcompile.cargo(
-            arch=self.arch, channel=channel, subcommand=subcommand, rustflags=rustflags
-        )
+        return xcompile.cargo(self.arch, subcommand, rustflags)
 
     def tool(self, name: str) -> List[str]:
         """Start a binutils tool invocation for the configured architecture."""
@@ -84,13 +92,15 @@ class RepositoryDetails:
 
     def cargo_target_dir(self) -> Path:
         """Determine the path to the target directory for Cargo."""
-        return self.root / "target-xcompile" / xcompile.target(self.arch)
+        return self.root / "target" / xcompile.target(self.arch)
 
 
 def docker_images() -> Set[str]:
     """List the Docker images available on the local machine."""
     return set(
-        spawn.capture(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"])
+        spawn.capture(
+            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], unicode=True
+        )
         .strip()
         .split("\n")
     )
@@ -212,26 +222,21 @@ class CargoBuild(CargoPreImage):
         self.strip = config.pop("strip", True)
         self.extract = config.pop("extract", {})
         self.rustflags = config.pop("rustflags", [])
-        self.channel = None
         if rd.coverage:
             self.rustflags += [
                 "-Zinstrument-coverage",
+                "-Clink-dead-code",
                 # Nix generates some unresolved symbols that -Zinstrument-coverage
                 # somehow causes the linker to complain about, so just disable
                 # warnings about unresolved symbols and hope it all works out.
                 # See: https://github.com/nix-rust/nix/issues/1116
                 "-Clink-arg=-Wl,--warn-unresolved-symbols",
             ]
-            self.channel = "nightly"
         if self.bin is None:
             raise ValueError("mzbuild config is missing pre-build target")
 
     def build(self) -> None:
-        cargo_build = [
-            *self.rd.cargo("build", channel=self.channel, rustflags=self.rustflags),
-            "--bin",
-            self.bin,
-        ]
+        cargo_build = [*self.rd.cargo("build", self.rustflags), "--bin", self.bin]
         if self.rd.release_mode:
             cargo_build.append("--release")
         spawn.runv(cargo_build, cwd=self.rd.root)
@@ -269,26 +274,18 @@ class CargoBuild(CargoPreImage):
         if self.extract:
             output = spawn.capture(
                 cargo_build + ["--message-format=json"],
+                unicode=True,
                 cwd=self.rd.root,
             )
-            target_dir = str(self.rd.cargo_target_dir().absolute())
-            ci_builder_target_dir = "/mnt/build/" + xcompile.target(self.rd.arch)
             for line in output.split("\n"):
                 if line.strip() == "" or not line.startswith("{"):
                     continue
                 message = json.loads(line)
                 if message["reason"] != "build-script-executed":
                     continue
-                out_dir = message["out_dir"]
-                if out_dir.startswith(ci_builder_target_dir):
-                    out_dir = target_dir + out_dir[len(ci_builder_target_dir) :]
-                if not out_dir.startswith(target_dir):
-                    # Some crates are built for both the host and the target.
-                    # Ignore the built-for-host out dir.
-                    continue
                 package = message["package_id"].split()[0]
-                for src, dst in self.extract.get(package, {}).items():
-                    spawn.runv(["cp", "-R", Path(out_dir) / src, self.path / dst])
+                for d in self.extract.get(package, []):
+                    shutil.copy(Path(message["out_dir"]) / d, self.path / Path(d).name)
 
     def run(self) -> None:
         super().run()
@@ -315,15 +312,7 @@ class CargoTest(CargoPreImage):
 
     def run(self) -> None:
         super().run()
-        CargoBuild(
-            self.rd,
-            self.path,
-            {
-                "bin": "testdrive",
-                "strip": True,
-                "extract": {"protobuf-src": {"install": "protobuf-install"}},
-            },
-        ).build()
+        CargoBuild(self.rd, self.path, {"bin": "testdrive", "strip": True}).build()
         CargoBuild(self.rd, self.path, {"bin": "materialized", "strip": True}).build()
 
         # NOTE(benesch): The two invocations of `cargo test --no-run` here
@@ -334,8 +323,8 @@ class CargoTest(CargoPreImage):
         # error messages would also be sent to the output file in JSON, and the
         # user would only see a vague "could not compile <package>" error.
         args = [*self.rd.cargo("test", rustflags=[]), "--locked", "--no-run"]
-        spawn.runv(args, cwd=self.rd.root)
-        output = spawn.capture(args + ["--message-format=json"], cwd=self.rd.root)
+        spawn.runv(args)
+        output = spawn.capture(args + ["--message-format=json"], unicode=True)
 
         tests = []
         for line in output.split("\n"):
@@ -345,6 +334,8 @@ class CargoTest(CargoPreImage):
             if message.get("profile", {}).get("test", False):
                 crate_name = message["package_id"].split()[0]
                 target_kind = "".join(message["target"]["kind"])
+                # TODO - ask Nikhil if this is long-term correct,
+                # but it unblocks us for now.
                 if target_kind == "proc-macro":
                     continue
                 slug = crate_name + "." + target_kind
@@ -364,12 +355,8 @@ class CargoTest(CargoPreImage):
         with open(self.path / "tests" / "manifest", "w") as manifest:
             for (executable, slug, crate_path) in tests:
                 shutil.copy(executable, self.path / "tests" / slug)
-                spawn.runv(
-                    [*self.rd.tool("strip"), self.path / "tests" / slug],
-                    cwd=self.rd.root,
-                )
-                package = slug.replace(".", "::")
-                manifest.write(f"{slug} {package} {crate_path}\n")
+                spawn.runv([*self.rd.tool("strip"), self.path / "tests" / slug])
+                manifest.write(f"{slug} {crate_path}\n")
         shutil.move(str(self.path / "materialized"), self.path / "tests")
         shutil.move(str(self.path / "testdrive"), self.path / "tests")
         shutil.copytree(self.rd.root / "misc" / "shlib", self.path / "shlib")
@@ -432,6 +419,13 @@ class Image:
                 if match:
                     self.depends_on.append(match.group(1).decode())
 
+    def env_var_name(self) -> str:
+        """Return the image name formatted for use in an environment variable.
+
+        The name is capitalized and all hyphens are replaced with underscores.
+        """
+        return self.name.upper().replace("-", "_")
+
     def docker_name(self, tag: str) -> str:
         """Return the name of the image on Docker Hub at the given tag."""
         return f"materialize/{self.name}:{tag}"
@@ -442,14 +436,12 @@ class ResolvedImage:
 
     Attributes:
         image: The underlying `Image`.
-        acquired: Whether the image is available locally.
         dependencies: A mapping from dependency name to `ResolvedImage` for
             each of the images that `image` depends upon.
     """
 
     def __init__(self, image: Image, dependencies: Iterable["ResolvedImage"]):
         self.image = image
-        self.acquired = False
         self.dependencies = {}
         for d in dependencies:
             self.dependencies[d.name] = d
@@ -496,9 +488,7 @@ class ResolvedImage:
 
     def build(self) -> None:
         """Build the image from source."""
-        for dep in self.dependencies.values():
-            dep.acquire()
-        spawn.runv(["git", "clean", "-ffdX", self.image.path])
+        spawn.runv(["git", "clean", "-ffdX", self.image.path], print_to=sys.stderr)
         for pre_image in self.image.pre_images:
             pre_image.run()
         build_args = {
@@ -517,33 +507,30 @@ class ResolvedImage:
             self.spec(),
             str(self.image.path),
         ]
-        spawn.runv(cmd, stdin=f, stdout=sys.stderr.buffer)
+        spawn.runv(cmd, stdin=f, stdout=sys.stderr, print_to=sys.stderr)
 
-    def acquire(self) -> None:
-        """Download or build the image if it does not exist locally."""
-        if self.acquired:
-            return
+    def acquire(self) -> AcquiredFrom:
+        """Download or build the image.
 
-        ui.header(f"Acquiring {self.spec()}")
-        try:
-            spawn.runv(
-                ["docker", "pull", self.spec()],
-                stdout=sys.stderr.buffer,
-            )
-        except subprocess.CalledProcessError:
-            self.build()
-        self.acquired = True
-
-    def ensure(self) -> None:
-        """Ensure the image exists on Docker Hub if it is publishable.
-
-        The image is pushed using its spec as its tag.
+        Returns:
+            acquired_from: How the image was acquired.
         """
-        if self.publish and is_docker_image_pushed(self.spec()):
-            ui.say(f"{self.spec()} already exists")
-            return
+        if self.image.publish:
+            while True:
+                try:
+                    spawn.runv(
+                        ["docker", "pull", self.spec()],
+                        print_to=sys.stderr,
+                        stdout=sys.stderr,
+                    )
+                    return AcquiredFrom.REGISTRY
+                except subprocess.CalledProcessError:
+                    if not ui.env_is_truthy("MZBUILD_WAIT_FOR_IMAGE"):
+                        break
+                    print(f"waiting for mzimage to become available", file=sys.stderr)
+                    time.sleep(10)
         self.build()
-        spawn.runv(["docker", "push", self.spec()])
+        return AcquiredFrom.LOCAL_BUILD
 
     def run(self, args: List[str] = [], docker_args: List[str] = []) -> None:
         """Run a command in the image.
@@ -636,7 +623,6 @@ class ResolvedImage:
             self_hash.update(b"\0")
 
         self_hash.update(f"arch={self.image.rd.arch}".encode())
-        self_hash.update(f"coverage={self.image.rd.coverage}".encode())
 
         full_hash = hashlib.sha1()
         full_hash.update(self_hash.digest())
@@ -649,48 +635,66 @@ class ResolvedImage:
 
 
 class DependencySet:
-    """A set of `ResolvedImage`s.
+    """A topologically-sorted, transitively-closed list of `Image`s.
 
-    Iterating over a dependency set yields the contained images in an arbitrary
-    order. Indexing a dependency set yields the image with the specified name.
+    .. warning:: These guarantees are not enforced.
+        Dependency sets constructed by `Repository.resolve_dependencies` will
+        uphold the topological sort and transitive closure guarantees, but
+        it is your responsibility to provide these guarantees for any dependency
+        sets you create yourself.
+
+    Iterating over a dependency set yields the contained images in the stored
+    order, with the caveat noted above. Indexing a dependency set yields the
+    _i_ th item in the stored order.
     """
 
     def __init__(self, dependencies: Iterable[Image]):
-        """Construct a new `DependencySet`.
-
-        The provided `dependencies` must be topologically sorted.
-        """
-        self._dependencies: Dict[str, ResolvedImage] = {}
-        known_images = docker_images()
+        self.dependencies: OrderedDict[str, ResolvedImage] = OrderedDict()
         for d in dependencies:
-            image = ResolvedImage(
-                image=d,
-                dependencies=(self._dependencies[d0] for d0 in d.depends_on),
+            self.dependencies[d.name] = ResolvedImage(
+                d, (self.dependencies[d0] for d0 in d.depends_on)
             )
-            image.acquired = image.spec() in known_images
-            self._dependencies[d.name] = image
 
-    def acquire(self) -> None:
-        """Download or build all of the images in the dependency set that do not
-        already exist locally.
+    def acquire(self, force_build: bool = False) -> None:
+        """Download or build all of the images in the dependency set.
+
+        Args:
+            force_build: Whether to force all images that are not already
+                available locally to be built from source, regardless of whether
+                the image is available for download. Note that this argument has
+                no effect if the image is already available locally.
+            push: Whether to push any images that will built locally to Docker
+                Hub.
+        """
+        known_images = docker_images()
+        for d in self:
+            spec = d.spec()
+            if spec not in known_images:
+                if force_build:
+                    ui.header(f"Force-building {spec}")
+                    d.build()
+                else:
+                    ui.header(f"Acquiring {spec}")
+                    d.acquire()
+            else:
+                ui.header(f"Already built {spec}")
+
+    def push(self) -> None:
+        """Push all publishable images in this dependency set to Docker Hub.
+
+        Images are pushed using their spec as their tag. All images must have
+        been acquired (e.g., by `DependencySet.acquire`) before calling this
+        method.
         """
         for dep in self:
-            dep.acquire()
-
-    def ensure(self) -> None:
-        """Ensure all publishable images in this dependency set exist on Docker
-        Hub.
-
-        Images are pushed using their spec as their tag.
-        """
-        for dep in self:
-            dep.ensure()
+            if dep.publish and not is_docker_image_pushed(dep.spec()):
+                spawn.runv(["docker", "push", dep.spec()])
 
     def __iter__(self) -> Iterator[ResolvedImage]:
-        return iter(self._dependencies.values())
+        return iter(self.dependencies.values())
 
     def __getitem__(self, key: str) -> ResolvedImage:
-        return self._dependencies[key]
+        return self.dependencies[key]
 
 
 class Repository:
@@ -710,7 +714,7 @@ class Repository:
 
     Attributes:
         images: A mapping from image name to `Image` for all contained images.
-        compose_dirs: The set of directories containing an `mzcompose.yml` or `mzcompose.py` file.
+        compose_dirs: The set of directories containing an `mzcompose.yml` or `mzworkflows.py` file.
     """
 
     def __init__(
@@ -724,19 +728,9 @@ class Repository:
         self.images: Dict[str, Image] = {}
         self.compositions: Dict[str, Path] = {}
         for (path, dirs, files) in os.walk(self.root, topdown=True):
-            if path == str(root / "misc"):
-                dirs.remove("python")
             # Filter out some particularly massive ignored directories to keep
             # things snappy. Not required for correctness.
-            dirs[:] = set(dirs) - {
-                ".git",
-                "target",
-                "target-ra",
-                "target-xcompile",
-                "mzdata",
-                "node_modules",
-                "venv",
-            }
+            dirs[:] = set(dirs) - {".git", "target", "mzdata", "node_modules"}
             if "mzbuild.yml" in files:
                 image = Image(self.rd, Path(path))
                 if not image.name:
@@ -744,7 +738,7 @@ class Repository:
                 if image.name in self.images:
                     raise ValueError(f"image {image.name} exists twice")
                 self.images[image.name] = image
-            if "mzcompose.yml" in files or "mzcompose.py" in files:
+            if "mzcompose.yml" in files or "mzworkflows.py" in files:
                 name = Path(path).name
                 if name in self.compositions:
                     raise ValueError(f"composition {name} exists twice")

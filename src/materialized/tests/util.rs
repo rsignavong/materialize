@@ -14,13 +14,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use coord::PersistConfig;
 use lazy_static::lazy_static;
-use mz_coord::PersistConfig;
-use mz_dataflow_types::sources::AwsExternalId;
-use mz_frontegg_auth::FronteggAuthentication;
-use mz_ore::metrics::MetricsRegistry;
-use mz_ore::now::{NowFn, SYSTEM_TIME};
-use mz_ore::task;
+use ore::metrics::MetricsRegistry;
 use postgres::error::DbError;
 use postgres::tls::{MakeTlsConnect, TlsConnect};
 use postgres::types::{FromSql, Type};
@@ -28,10 +24,10 @@ use postgres::Socket;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
-use materialized::{StorageConfig, TlsMode};
+use materialized::TlsMode;
 
 lazy_static! {
-    pub static ref KAFKA_ADDRS: mz_kafka_util::KafkaAddrs = match env::var("KAFKA_ADDRS") {
+    pub static ref KAFKA_ADDRS: kafka_util::KafkaAddrs = match env::var("KAFKA_ADDRS") {
         Ok(addr) => addr.parse().expect("unable to parse KAFKA_ADDRS"),
         _ => "localhost:9092".parse().unwrap(),
     };
@@ -40,30 +36,24 @@ lazy_static! {
 #[derive(Clone)]
 pub struct Config {
     data_directory: Option<PathBuf>,
-    aws_external_id: AwsExternalId,
     logging_granularity: Option<Duration>,
     tls: Option<materialized::TlsConfig>,
-    frontegg: Option<FronteggAuthentication>,
     experimental_mode: bool,
     safe_mode: bool,
     workers: usize,
     logical_compaction_window: Option<Duration>,
-    now: NowFn,
 }
 
 impl Default for Config {
     fn default() -> Config {
         Config {
             data_directory: None,
-            aws_external_id: AwsExternalId::NotProvided,
             logging_granularity: Some(Duration::from_secs(1)),
             tls: None,
-            frontegg: None,
             experimental_mode: false,
             safe_mode: false,
             workers: 1,
             logical_compaction_window: None,
-            now: SYSTEM_TIME.clone(),
         }
     }
 }
@@ -112,16 +102,6 @@ impl Config {
         self.logical_compaction_window = Some(logical_compaction_window);
         self
     }
-
-    pub fn with_frontegg(mut self, frontegg: &FronteggAuthentication) -> Self {
-        self.frontegg = Some(frontegg.clone());
-        self
-    }
-
-    pub fn with_now(mut self, now: NowFn) -> Self {
-        self.now = now;
-        self
-    }
 }
 
 pub fn start_server(config: Config) -> Result<Server, anyhow::Error> {
@@ -141,7 +121,7 @@ pub fn start_server(config: Config) -> Result<Server, anyhow::Error> {
     let inner = runtime.block_on(materialized::serve(materialized::Config {
         logging: config
             .logging_granularity
-            .map(|granularity| mz_coord::LoggingConfig {
+            .map(|granularity| coord::LoggingConfig {
                 granularity,
                 log_logging: false,
                 retain_readings_for: granularity,
@@ -152,12 +132,8 @@ pub fn start_server(config: Config) -> Result<Server, anyhow::Error> {
         workers: config.workers,
         timely_worker: timely::WorkerConfig::default(),
         data_directory,
-        orchestrator: None,
-        storage: StorageConfig::Local,
-        aws_external_id: config.aws_external_id,
         listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         tls: config.tls,
-        frontegg: config.frontegg,
         experimental_mode: config.experimental_mode,
         safe_mode: config.safe_mode,
         disable_user_indexes: false,
@@ -166,8 +142,6 @@ pub fn start_server(config: Config) -> Result<Server, anyhow::Error> {
         metrics_registry: metrics_registry.clone(),
         persist: PersistConfig::disabled(),
         third_party_metrics_listen_addr: None,
-        now: config.now,
-        cors_allowed_origins: vec![],
     }))?;
     let server = Server {
         inner,
@@ -227,7 +201,7 @@ impl Server {
         <T::TlsConnect as TlsConnect<Socket>>::Future: Send,
     {
         let (client, conn) = self.pg_config_async().connect(tls).await?;
-        let handle = task::spawn(|| "connect_async", async move {
+        let handle = tokio::spawn(async move {
             if let Err(err) = conn.await {
                 panic!("connection error: {}", err);
             }
@@ -241,12 +215,12 @@ pub struct MzTimestamp(pub u64);
 
 impl<'a> FromSql<'a> for MzTimestamp {
     fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<MzTimestamp, Box<dyn Error + Sync + Send>> {
-        let n = mz_pgrepr::Numeric::from_sql(ty, raw)?;
+        let n = pgrepr::Numeric::from_sql(ty, raw)?;
         Ok(MzTimestamp(u64::try_from(n.0 .0)?))
     }
 
     fn accepts(ty: &Type) -> bool {
-        mz_pgrepr::Numeric::accepts(ty)
+        pgrepr::Numeric::accepts(ty)
     }
 }
 

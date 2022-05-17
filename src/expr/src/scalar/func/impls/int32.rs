@@ -11,10 +11,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use mz_lowertest::MzReflect;
-use mz_repr::adt::numeric::{self, Numeric, NumericMaxScale};
-use mz_repr::adt::system::{Oid, PgLegacyChar};
-use mz_repr::{strconv, ColumnType, ScalarType};
+use lowertest::MzStructReflect;
+use repr::adt::numeric::{self, Numeric};
+use repr::adt::system::{Oid, RegClass, RegProc, RegType};
+use repr::{strconv, ColumnType, ScalarType};
 
 use crate::scalar::func::EagerUnaryFunc;
 use crate::EvalError;
@@ -88,8 +88,10 @@ sqlfunc!(
     }
 );
 
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
-pub struct CastInt32ToNumeric(pub Option<NumericMaxScale>);
+#[derive(
+    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect,
+)]
+pub struct CastInt32ToNumeric(pub Option<u8>);
 
 impl<'a> EagerUnaryFunc<'a> for CastInt32ToNumeric {
     type Input = i32;
@@ -98,7 +100,7 @@ impl<'a> EagerUnaryFunc<'a> for CastInt32ToNumeric {
     fn call(&self, a: i32) -> Result<Numeric, EvalError> {
         let mut a = Numeric::from(a);
         if let Some(scale) = self.0 {
-            if numeric::rescale(&mut a, scale.into_u8()).is_err() {
+            if numeric::rescale(&mut a, scale).is_err() {
                 return Err(EvalError::NumericFieldOverflow);
             }
         }
@@ -107,7 +109,7 @@ impl<'a> EagerUnaryFunc<'a> for CastInt32ToNumeric {
     }
 
     fn output_type(&self, input: ColumnType) -> ColumnType {
-        ScalarType::Numeric { max_scale: self.0 }.nullable(input.nullable)
+        ScalarType::Numeric { scale: self.0 }.nullable(input.nullable)
     }
 }
 
@@ -121,43 +123,30 @@ sqlfunc!(
     #[sqlname = "i32tooid"]
     #[preserves_uniqueness = true]
     fn cast_int32_to_oid(a: i32) -> Oid {
-        // For historical reasons in PostgreSQL, the bytes of the `i32` are
-        // reinterpreted as a `u32` without bounds checks, so negative `i32`s
-        // become very large positive OIDs.
-        //
-        // Do not use this as a model for behavior in other contexts. OIDs
-        // should not in general be thought of as freely convertible from
-        // `i32`s.
-        Oid(u32::from_ne_bytes(a.to_ne_bytes()))
+        Oid(a)
     }
 );
 
 sqlfunc!(
-    #[sqlname = "i32topglegacychar"]
+    #[sqlname = "i32toregclass"]
     #[preserves_uniqueness = true]
-    fn cast_int32_to_pg_legacy_char(a: i32) -> Result<PgLegacyChar, EvalError> {
-        // Per PostgreSQL, casts to `PgLegacyChar` are performed as if
-        // `PgLegacyChar` is signed.
-        // See: https://github.com/postgres/postgres/blob/791b1b71da35d9d4264f72a87e4078b85a2fcfb4/src/backend/utils/adt/char.c#L91-L96
-        let a = i8::try_from(a).map_err(|_| EvalError::CharOutOfRange)?;
-        Ok(PgLegacyChar(u8::from_ne_bytes(a.to_ne_bytes())))
+    fn cast_int32_to_reg_class(a: i32) -> RegClass {
+        RegClass(a)
     }
 );
 
 sqlfunc!(
-    fn chr(a: i32) -> Result<String, EvalError> {
-        // This error matches the behavior of Postgres 13/14 (and potentially earlier versions)
-        // Postgres 15 will have a different error message for negative values
-        let codepoint = u32::try_from(a).map_err(|_| EvalError::CharacterTooLargeForEncoding(a))?;
-        if codepoint == 0 {
-            Err(EvalError::NullCharacterNotPermitted)
-        } else if 0xd800 <= codepoint && codepoint < 0xe000 {
-            // Postgres returns a different error message for inputs in this range
-            Err(EvalError::CharacterNotValidForEncoding(a))
-        } else {
-            char::from_u32(codepoint)
-                .map(|u| u.to_string())
-                .ok_or(EvalError::CharacterTooLargeForEncoding(a))
-        }
+    #[sqlname = "i32toregproc"]
+    #[preserves_uniqueness = true]
+    fn cast_int32_to_reg_proc(a: i32) -> RegProc {
+        RegProc(a)
+    }
+);
+
+sqlfunc!(
+    #[sqlname = "i32toregtype"]
+    #[preserves_uniqueness = true]
+    fn cast_int32_to_reg_type(a: i32) -> RegType {
+        RegType(a)
     }
 );

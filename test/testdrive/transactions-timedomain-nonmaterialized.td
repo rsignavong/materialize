@@ -31,15 +31,10 @@ $ file-append path=static.csv
 4
 
 ! SELECT * FROM unindexed
-contains:unable to automatically determine a query timestamp
+unable to automatically determine a query timestamp
 
 ! SELECT * FROM v_unindexed
-contains:unable to automatically determine a query timestamp
-
-# Since sources aren't linearizable (see #11048), we need to wait out a
-# timestamp frequency interval to ensure the read timestamp for the timestamp
-# is not picked to a timestamp when the source is empty.
-$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=1s
+unable to automatically determine a query timestamp
 
 > BEGIN
 
@@ -50,10 +45,10 @@ $ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=1s
 2
 4
 
-! SELECT c FROM unindexed
-contains:unable to automatically determine a query timestamp
+! SELECT c FROM unindexed ORDER BY c
+Transactions can only reference objects in the same timedomain
 
-> COMMIT
+> ROLLBACK
 
 # The unindexed view should be the same.
 > BEGIN
@@ -64,9 +59,9 @@ contains:unable to automatically determine a query timestamp
 4
 
 ! SELECT * FROM v_unindexed
-contains:unable to automatically determine a query timestamp
+Transactions can only reference objects in the same timedomain
 
-> COMMIT
+> ROLLBACK
 
 # Ensure that other optionally indexed things (views) are correctly
 # included in the timedomain.
@@ -123,10 +118,6 @@ contains:unable to automatically determine a query timestamp
 # it returns a 0 timestamp error.
 > SELECT * FROM v_materialized
 3
-# Since sources aren't linearizable (see #11048), we need to wait out a
-# timestamp frequency interval to ensure the read timestamp for the timestamp
-# is not picked to a timestamp when the source is empty.
-$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=1s
 > BEGIN
 > SELECT * FROM v_materialized
 3

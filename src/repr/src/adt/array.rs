@@ -18,8 +18,6 @@ use serde::{Deserialize, Serialize};
 use crate::row::DatumList;
 use std::cmp::Ordering;
 
-use mz_lowertest::MzReflect;
-
 /// The maximum number of dimensions permitted in an array.
 pub const MAX_ARRAY_DIMENSIONS: u8 = 6;
 
@@ -131,9 +129,7 @@ pub struct ArrayDimension {
 }
 
 /// An error that can occur when constructing an array.
-#[derive(
-    Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize, MzReflect,
-)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum InvalidArrayError {
     /// The number of dimensions in the array exceedes [`MAX_ARRAY_DIMENSIONS]`.
     TooManyDimensions(usize),

@@ -38,7 +38,6 @@ pub mod fmt;
 #[cfg_attr(nightly_doc_features, doc(cfg(feature = "network")))]
 #[cfg(feature = "network")]
 pub mod future;
-pub mod graph;
 pub mod hash;
 pub mod hint;
 pub mod id_gen;
@@ -53,7 +52,6 @@ pub mod netio;
 pub mod now;
 pub mod option;
 pub mod panic;
-pub mod path;
 pub mod result;
 #[cfg_attr(nightly_doc_features, doc(cfg(feature = "network")))]
 #[cfg(feature = "network")]
@@ -63,9 +61,6 @@ pub mod retry;
 pub mod stack;
 pub mod stats;
 pub mod str;
-#[cfg_attr(nightly_doc_features, doc(cfg(feature = "task")))]
-#[cfg(feature = "task")]
-pub mod task;
 #[cfg_attr(nightly_doc_features, doc(cfg(feature = "test")))]
 #[cfg(feature = "test")]
 pub mod test;

@@ -8,12 +8,6 @@
   - signature: 'coalesce(x: T...) -> T?'
     description: First non-_NULL_ arg, or _NULL_ if all are _NULL_
 
-  - signature: 'greatest(x: T...) -> T?'
-    description: The maximum argument, or _NULL_ if all are _NULL_
-
-  - signature: 'least(x: T...) -> T?'
-    description: The minimum argument, or _NULL_ if all are _NULL_
-
   - signature: 'nullif(x: T, y: T) -> T?'
     description: _NULL_ if `x == y`, else `x`
 
@@ -103,7 +97,7 @@
     - signature: 'list_cat(l1: listany, l2: listany) -> L'
       description: Concatenates `l1` and `l2`.
 
-    - signature: 'list_n_layers(l: listany) -> int'
+    - signature: 'list_ndims(l: listany) -> int'
       description: '[Experimental](/cli/#experimental-mode)––Returns the number of dimensions on `l`.'
 
     - signature: 'list_length(l: listany) -> int'
@@ -114,12 +108,6 @@
 
     - signature: 'list_prepend(e: listelementany, l: listany) -> listany'
       description: Prepends `e` to `l`.
-
-    - signature: 'list_remove(l: listany, e: listelementany) -> listany'
-      description: >-
-        [Experimental](/cli/#experimental-mode)––Returns the list `l` without
-        any elements equal to the given value `e`. Comparisons are done using
-        IS NOT DISTINCT FROM semantics, so it is possible to remove NULLs.
 
 - type: Numbers
   description: Number functions take number-like arguments, e.g. [`int`](../types/int),
@@ -198,14 +186,8 @@
   - signature: 'cos(x: double precision) -> double precision'
     description: The cosine of `x`, with `x` in radians.
 
-  - signature: 'acos(x: double precision) -> double precision'
-    description: The inverse cosine of `x`, result in radians.
-
   - signature: 'cosh(x: double precision) -> double precision'
     description: The hyperbolic cosine of `x`, with `x` as a hyperbolic angle.
-
-  - signature: 'acosh(x: double precision) -> double precision'
-    description: The inverse hyperbolic cosine of `x`.
 
   - signature: 'cot(x: double precision) -> double precision'
     description: The cotangent of `x`, with `x` in radians.
@@ -213,32 +195,14 @@
   - signature: 'sin(x: double precision) -> double precision'
     description: The sine of `x`, with `x` in radians.
 
-  - signature: 'asin(x: double precision) -> double precision'
-    description: The inverse sine of `x`, result in radians.
-
   - signature: 'sinh(x: double precision) -> double precision'
     description: The hyperbolic sine of `x`, with `x` as a hyperbolic angle.
-
-  - signature: 'asinh(x: double precision) -> double precision'
-    description: The inverse hyperbolic sine of `x`.
 
   - signature: 'tan(x: double precision) -> double precision'
     description: The tangent of `x`, with `x` in radians.
 
-  - signature: 'asin(x: double precision) -> double precision'
-    description: The inverse tangent of `x`, result in radians.
-
   - signature: 'tanh(x: double precision) -> double precision'
     description: The hyperbolic tangent of `x`, with `x` as a hyperbolic angle.
-
-  - signature: 'atanh(x: double precision) -> double precision'
-    description: The inverse hyperbolic tangent of `x`.
-
-  - signature: 'radians(x: double precision) -> double precision'
-    description: Converts degrees to radians.
-
-  - signature: 'degrees(x: double precision) -> double precision'
-    description: Converts radians to degrees.
 
 - type: String
   functions:
@@ -259,12 +223,6 @@
 
   - signature: 'char_length(s: str) -> int'
     description: Number of code points in `s`
-
-  - signature: 'chr(i: int) -> str'
-    description: >-
-      Character with the given Unicode codepoint.
-      Only supports codepoints that can be encoded in UTF-8.
-      The NULL (0) character is not allowed.
 
   - signature: 'convert_from(b: bytea, src_encoding: text) -> text'
     description: Convert data `b` from original encoding specified by `src_encoding` into `text`.
@@ -424,8 +382,8 @@
     [`timestamp`](../types/timestamp), [`timestamp with time zone`](../types/timestamptz).
   functions:
   - signature: current_timestamp() -> timestamptz
-    description: 'The `timestamp with time zone` representing when the query was executed.'
-    unmaterializable: true
+    description: 'The `timestamp with time zone` representing when the query was executed.<br/><br/>**NOTE**:
+      Users cannot define views with queries containing `current_timestamp()`.'
 
   - signature: 'date_bin(stride: interval, source: timestamp, origin: timestamp) -> timestamp'
     description: Align `source` with `origin` along `stride`.
@@ -439,27 +397,18 @@
     description: Largest `time_component` <= `val`
     url: date-trunc
 
-  - signature: EXTRACT(extract_expr) -> numeric
+  - signature: EXTRACT(extract_expr) -> float
     description: Specified time component from value
     url: extract
 
-  - signature: 'date_part(time_component: str, val: timestamp) -> float'
-    description: Specified time component from value
-    url: date-part
-
   - signature: mz_logical_timestamp() -> numeric
-    description: |
-      The logical time at which a query executes. Used for temporal filters and internal debugging.
-      <br><br>
-      **Note**: This function generally behaves like a [non-pure] function, but
-      can be used in limited contexts in materialized views as a [temporal filter](/guides/temporal-filters).
+    description: 'The logical time at which a query executes. Used for temporal filters and internal debugging.'
     url: now_and_mz_logical_timestamp
-    unmaterializable: true
 
   - signature: now() -> timestamptz
-    description: 'The `timestamp with time zone` representing when the query was executed.'
+    description: 'The `timestamp with time zone` representing when the query was executed.<br/><br/>**NOTE**:
+      Users cannot define views with queries containing `now()`.'
     url: now_and_mz_logical_timestamp
-    unmaterializable: true
 
   - signature: timestamp AT TIME ZONE zone -> timestamptz
     description: 'Converts `timestamp` to the specified time zone, expressed as an offset from UTC. <br/><br/>**Known limitation:** You must explicitly cast the type for the time zone.'
@@ -485,23 +434,10 @@
     description: Converts a timestamp into a string using the specified format.
     url: to_char
 
-  - signature: 'justify_days(val: interval) -> interval'
-    description: Adjust interval so 30-day time periods are represented as months.
-    url: justify-days
-
-  - signature: 'justify_hours(val: interval) -> interval'
-    description: Adjust interval so 24-hour time periods are represented as days.
-    url: justify-hours
-
-  - signature: 'justify_interval(val: interval) -> interval'
-    description: Adjust interval using justify_days and justify_hours, with additional sign adjustments.
-    url: justify-interval
-
 - type: UUID
   functions:
   - signature: mz_cluster_id() -> uuid
     description: The `uuid` uniquely identifying this Materialize cluster.
-    unmaterializable: true
 
 - type: JSON
   functions:
@@ -579,18 +515,11 @@
 
 - type: Array
   functions:
-  - signature: 'array_cat(a1: arrayany, a2: arrayany) -> arrayany'
-    description: 'Concatenates `a1` and `a2`.'
   - signature: 'array_to_string(a: anyarray, sep: text [, ifnull: text]) -> text'
     description: >-
       Concatenates the elements of `array` together separated by `sep`.
       Null elements are omitted unless `ifnull` is non-null, in which case
       null elements are replaced with the value of `ifnull`.
-  - signature: 'array_remove(a: anyarray, e: anyelement) -> anyarray'
-    description: >-
-      Returns the array `a` without any elements equal to the given value `e`.
-      The array must be one-dimensional. Comparisons are done using IS NOT
-      DISTINCT FROM semantics, so it is possible to remove NULLs.
 
 - type: Cryptography
   functions:
@@ -610,22 +539,6 @@
       description: >-
         Computes a hashed MAC of the given bytea `data` using the specified `key` and
         `type` algorithm. The supported hash algorithms are the same as for `digest`.
-    - signature: 'md5(data: bytea) -> text'
-      description: >-
-        Computes the MD5 hash of the given bytea `data`.
-        For PostgreSQL compatibility, returns a hex-encoded value of type `text` rather than `bytea`.
-    - signature: 'sha224(data: bytea) -> bytea'
-      description: >-
-        Computes the SHA-224 hash of the given bytea `data`.
-    - signature: 'sha256(data: bytea) -> bytea'
-      description: >-
-        Computes the SHA-256 hash of the given bytea `data`.
-    - signature: 'sha384(data: bytea) -> bytea'
-      description: >-
-        Computes the SHA-384 hash of the given bytea `data`.
-    - signature: 'sha512(data: bytea) -> bytea'
-      description: >-
-        Computes the SHA-512 hash of the given bytea `data`.
 
 - type: Window
   description: Window functions compute values across sets of rows related to the current query.
@@ -638,69 +551,45 @@
   functions:
   - signature: 'mz_uptime() -> interval'
     description: Returns the length of time that the materialized process has been running.
-    unmaterializable: true
   - signature: 'mz_version() -> text'
     description: Returns the server's version information as a human-readable string.
-    unmaterializable: true
+  - signature: 'format_type(oid: int, typemod: int) -> text'
+    description: Returns the canonical SQL name for the type specified by `oid` with `typemod` applied.
   - signature: 'current_database() -> text'
     description: >-
       Returns the name of the current database.
-    unmaterializable: true
   - signature: 'current_role() -> text'
     description: >-
       Alias for `current_user`.
-    unmaterializable: true
   - signature: 'current_user() -> text'
     description: >-
       Returns the name of the user who executed the containing query.
-    unmaterializable: true
-  - signature: 'session_user() -> text'
+  - signature: 'session_user -> text'
     description: >-
       Returns the name of the user who executed the containing query.
-    unmaterializable: true
   - signature: 'mz_row_size(expr: Record) -> int'
     description: Returns the number of bytes used to store a row.
 
 - type: PostgreSQL compatibility
-  description: |
-    Functions whose primary purpose is to facilitate compatibility with PostgreSQL tools.
-    These functions may have suboptimal performance characteristics.
+  description: Functions whose primary purpose is to facilitate compatibility with PostgreSQL tools
   functions:
-  - signature: 'format_type(oid: int, typemod: int) -> text'
-    description: Returns the canonical SQL name for the type specified by `oid` with `typemod` applied.
   - signature: 'current_schema() -> text'
     description: >-
       Returns the name of the first non-implicit schema on the search path, or
       `NULL` if the search path is empty.
-    unmaterializable: true
   - signature: 'current_schemas(include_implicit: bool) -> text[]'
     description: >-
       Returns the names of the schemas on the search path.
       The `include_implicit` parameter controls whether implicit schemas like
       `mz_catalog` and `pg_catalog` are included in the output.
-    unmaterializable: true
   - signature: 'obj_description(oid: oid, catalog: text) -> text'
     description: PostgreSQL compatibility shim. Currently always returns `NULL`.
   - signature: 'pg_backend_pid() -> int'
-    description: Returns the internal connection ID.
-    unmaterializable: true
+    description: Returns -1. Not intended for direct use.
   - signature: 'pg_column_size(expr: any) -> int'
     description: Returns the number of bytes used to store any individual data value.
-  - signature: 'pg_get_constraintdef(oid: oid[, pretty: bool]) -> text'
-    description: >-
-      Returns the constraint definition for the given `oid`. Currently always
-      returns NULL since constraints aren't supported.
-  - signature: 'pg_get_indexdef(index: oid[, column: integer, pretty: bool]) -> text'
-    description: >-
-      Reconstructs the creating command for an index. (This is a decompiled
-      reconstruction, not the original text of the command.) If column is
-      supplied and is not zero, only the definition of that column is reconstructed.
-  - signature: 'pg_get_viewdef(view_name: text[, pretty: bool]) -> text'
-    description: Returns the underlying SELECT command for the given view.
-  - signature: 'pg_get_viewdef(view_oid: oid[, pretty: bool]) -> text'
-    description: Returns the underlying SELECT command for the given view.
-  - signature: 'pg_get_viewdef(view_oid: oid[, wrap_column: integer]) -> text'
-    description: Returns the underlying SELECT command for the given view.
+  - signature: 'pg_get_constraintdef(oid: oid [, pretty: bool]) -> text'
+    description: Returns the constraint definition for the given `oid`. Currently always returns an error.
   - signature: 'pg_table_is_visible(relation: oid) -> boolean'
     description: Reports whether the relation with the specified OID is visible in the search path.
   - signature: 'pg_type_is_visible(relation: oid) -> boolean'
@@ -711,7 +600,5 @@
     description: PostgreSQL compatibility shim. Not intended for direct use.
   - signature: 'pg_postmaster_start_time() -> timestamptz'
     description: Returns the time when the server started.
-    unmaterializable: true
   - signature: 'version() -> text'
     description: Returns a PostgreSQL-compatible version string.
-    unmaterializable: true

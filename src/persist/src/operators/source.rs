@@ -11,17 +11,16 @@
 
 use std::time::Duration;
 
-use mz_persist_types::Codec;
+use persist_types::Codec;
 use timely::dataflow::operators::generic::operator;
 use timely::dataflow::operators::Concat;
 use timely::dataflow::{Scope, Stream};
 use timely::progress::Antichain;
 use timely::Data as TimelyData;
 
-use crate::client::StreamReadHandle;
+use crate::indexed::runtime::StreamReadHandle;
 use crate::indexed::ListenEvent;
 use crate::operators::replay::Replay;
-use crate::operators::DEFAULT_OUTPUTS_PER_YIELD;
 
 /// A Timely Dataflow operator that mirrors a persisted stream.
 pub trait PersistedSource<G: Scope<Timestamp = u64>, K: TimelyData, V: TimelyData> {
@@ -30,23 +29,7 @@ pub trait PersistedSource<G: Scope<Timestamp = u64>, K: TimelyData, V: TimelyDat
     fn persisted_source(
         &mut self,
         read: StreamReadHandle<K, V>,
-        as_of_frontier: &Antichain<u64>,
-    ) -> Stream<G, (Result<(K, V), String>, u64, i64)> {
-        self.persisted_source_yield(read, as_of_frontier, DEFAULT_OUTPUTS_PER_YIELD)
-    }
-
-    /// Emits a snapshot of the persisted stream taken as of this call and
-    /// listens for any new data added to the persisted stream after that,
-    /// yielding periodically.
-    ///
-    /// This yields after `outputs_per_yield` outputs to allow downstream
-    /// operators to reduce down the data and limit max memory usage.
-    fn persisted_source_yield(
-        &mut self,
-        read: StreamReadHandle<K, V>,
-        as_of_frontier: &Antichain<u64>,
-        outputs_per_yield: usize,
-    ) -> Stream<G, (Result<(K, V), String>, u64, i64)>;
+    ) -> Stream<G, (Result<(K, V), String>, u64, isize)>;
 }
 
 impl<G, K, V> PersistedSource<G, K, V> for G
@@ -55,12 +38,10 @@ where
     K: TimelyData + Codec + Send,
     V: TimelyData + Codec + Send,
 {
-    fn persisted_source_yield(
+    fn persisted_source(
         &mut self,
         read: StreamReadHandle<K, V>,
-        as_of_frontier: &Antichain<u64>,
-        outputs_per_yield: usize,
-    ) -> Stream<G, (Result<(K, V), String>, u64, i64)> {
+    ) -> Stream<G, (Result<(K, V), String>, u64, isize)> {
         let (listen_tx, listen_rx) = crossbeam_channel::unbounded();
         let snapshot = read.listen(listen_tx);
 
@@ -72,10 +53,10 @@ where
         // it for the operator.
 
         // listen to new data
-        let new = listen_source(self, snapshot_seal, listen_rx, outputs_per_yield);
+        let new = listen_source(self, snapshot_seal, listen_rx);
 
         // Replay the previously persisted data, if any.
-        let previous = self.replay_yield(snapshot, as_of_frontier, outputs_per_yield);
+        let previous = self.replay(snapshot);
 
         previous.concat(&new)
     }
@@ -89,8 +70,7 @@ fn listen_source<G, K, V>(
     // meaning that there will be no more events in the future.
     initial_frontier: Option<Antichain<u64>>,
     listen_rx: crossbeam_channel::Receiver<ListenEvent>,
-    _outputs_per_yield: usize,
-) -> Stream<G, (Result<(K, V), String>, u64, i64)>
+) -> Stream<G, (Result<(K, V), String>, u64, isize)>
 where
     G: Scope<Timestamp = u64>,
     K: TimelyData + Codec + Send,
@@ -139,10 +119,6 @@ where
                                 session.give(result);
                             }
                             activator.activate();
-                            // TODO: Instead of yielding after every message
-                            // from the channel, only yield after we've given at
-                            // least `outputs_per_yield` records (or if we get
-                            // an Empty or Disconnected from try_recv).
                         }
                         ListenEvent::Sealed(ts) => {
                             cap.downgrade(&ts);
@@ -177,7 +153,6 @@ mod tests {
     use crate::error::Error;
     use crate::mem::MemRegistry;
     use crate::operators::split_ok_err;
-    use crate::unreliable::UnreliableHandle;
 
     use super::*;
 
@@ -189,9 +164,7 @@ mod tests {
         let (oks, errs) = timely::execute_directly(move |worker| {
             let (oks, errs) = worker.dataflow(|scope| {
                 let (_write, read) = p.create_or_load::<String, ()>("1");
-                let (ok_stream, err_stream) = scope
-                    .persisted_source(read, &Antichain::from_elem(0))
-                    .ok_err(split_ok_err);
+                let (ok_stream, err_stream) = scope.persisted_source(read).ok_err(split_ok_err);
                 (ok_stream.capture(), err_stream.capture())
             });
 
@@ -260,9 +233,7 @@ mod tests {
 
             worker.dataflow(|scope| {
                 let (_write, read) = p.create_or_load::<String, ()>("1");
-                let (oks, _rrs) = scope
-                    .persisted_source(read, &Antichain::from_elem(0))
-                    .ok_err(split_ok_err);
+                let (oks, _rrs) = scope.persisted_source(read).ok_err(split_ok_err);
 
                 oks.probe_with(&mut probe);
             });
@@ -306,9 +277,7 @@ mod tests {
         timely::execute(Config::process(2), move |worker| {
             worker.dataflow(|scope| {
                 let (write, read) = p.create_or_load("1");
-                let (ok_stream, _) = scope
-                    .persisted_source(read, &Antichain::from_elem(0))
-                    .ok_err(split_ok_err);
+                let (ok_stream, _) = scope.persisted_source(read).ok_err(split_ok_err);
 
                 // Write one thing from each worker again. This time at timestamp 2.
                 write
@@ -359,9 +328,7 @@ mod tests {
 
         let recv = timely::execute_directly(move |worker| {
             let recv = worker.dataflow(|scope| {
-                let (_, err_stream) = scope
-                    .persisted_source(read, &Antichain::from_elem(0))
-                    .ok_err(split_ok_err);
+                let (_, err_stream) = scope.persisted_source(read).ok_err(split_ok_err);
                 err_stream.capture()
             });
             recv
@@ -385,14 +352,13 @@ mod tests {
 
     #[test]
     fn initial_error_handling() -> Result<(), Error> {
-        let mut unreliable = UnreliableHandle::default();
-        let p = MemRegistry::new().runtime_unreliable(unreliable.clone())?;
-        unreliable.make_unavailable();
-        let (_, read) = p.create_or_load::<(), ()>("test_name");
+        let p = MemRegistry::new().runtime_no_reentrance()?;
+        let err = Err(Error::String("ciao".to_owned()));
+        let read: StreamReadHandle<(), ()> = StreamReadHandle::new("test_name".to_string(), err, p);
 
         let recv = timely::execute_directly(move |worker| {
             let recv = worker.dataflow(|scope| {
-                let stream = scope.persisted_source(read, &Antichain::from_elem(0));
+                let stream = scope.persisted_source(read);
                 stream.capture()
             });
 
@@ -405,11 +371,7 @@ mod tests {
             .flat_map(|(_, xs)| xs.into_iter())
             .collect::<Vec<_>>();
 
-        let expected = vec![(
-            Err("replaying persisted data: unavailable: blob set".to_string()),
-            0,
-            1,
-        )];
+        let expected = vec![(Err("replaying persisted data: ciao".to_string()), 0, 1)];
         assert_eq!(actual, expected);
 
         Ok(())
@@ -450,7 +412,7 @@ mod tests {
                 }
                 worker.dataflow(|scope| {
                     let (_write, read) = p.create_or_load::<String, ()>("1");
-                    let data = scope.persisted_source(read, &Antichain::from_elem(0));
+                    let data = scope.persisted_source(read);
                     data.probe_with(&mut probe);
                 });
 

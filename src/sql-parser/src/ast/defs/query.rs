@@ -23,71 +23,53 @@ use std::hash::Hash;
 use std::mem;
 
 use crate::ast::display::{self, AstDisplay, AstFormatter};
-use crate::ast::{
-    Expr, FunctionArgs, Ident, SqlOption, UnresolvedDataType, UnresolvedDatabaseName,
-    UnresolvedObjectName, UnresolvedSchemaName,
-};
+use crate::ast::{Expr, FunctionArgs, Ident, SqlOption, UnresolvedObjectName};
 
-/// This represents the metadata that lives next to an AST, as we take it through
-/// various stages in the planning process.
-///
-/// Conceptually, when we first receive an AST from the parsing process, it only
-/// represents the syntax that the user input, and has no semantic information
-/// embedded in it. Later in this process, we want to be able to walk the tree
-/// and add additional information to it piecemeal, perhaps without going down
-/// the full planning pipeline. AstInfo represents various bits of information
-/// that get stored in the tree: for instance, at first, table names are only
-/// represented by the names the user input (in the `Raw` implementor of this
-/// trait), but later on, we replace them with both the name along with the ID
-/// that it gets resolved to.
-///
-/// Currently this process brings an Ast<Raw> to Ast<Aug>, and lives in
-/// sql/src/names.rs:resolve_names.
+// This represents the metadata that lives next to an AST, as we take it through
+// various stages in the planning process.
+//
+// Conceptually, when we first receive an AST from the parsing process, it only
+// represents the syntax that the user input, and has no semantic information
+// embedded in it. Later in this process, we want to be able to walk the tree
+// and add additional information to it piecemeal, perhaps without going down
+// the full planning pipeline. AstInfo represents various bits of information
+// that get stored in the tree: for instance, at first, table names are only
+// represented by the names the user input (in the `Raw` implementor of this
+// trait), but later on, we replace them with both the name along with the ID
+// that it gets resolved to.
+//
+// Currently this process brings an Ast<Raw> to Ast<Aug>, and lives in
+// sql/src/plan/query.rs:resolve_names.
 pub trait AstInfo: Clone {
-    /// The type used for table references.
+    // The type used for table references.
     type ObjectName: AstDisplay + Clone + Hash + Debug + Eq;
-    /// The type used for schema names.
-    type SchemaName: AstDisplay + Clone + Hash + Debug + Eq;
-    /// The type used for database names.
-    type DatabaseName: AstDisplay + Clone + Hash + Debug + Eq;
-    /// The type used for cluster names.
-    type ClusterName: AstDisplay + Clone + Hash + Debug + Eq;
-    /// The type used for data types.
-    type DataType: AstDisplay + Clone + Hash + Debug + Eq;
-    /// The type stored next to CTEs for their assigned ID.
-    type CteId: Clone + Hash + Debug + Eq;
+    // The type stored next to CTEs for their assigned ID.
+    type Id: Clone + Hash + Debug + Eq;
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone, Default)]
 pub struct Raw;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum RawObjectName {
+pub enum RawName {
     Name(UnresolvedObjectName),
     Id(String, UnresolvedObjectName),
 }
 
-impl RawObjectName {
+impl RawName {
     pub fn name(&self) -> &UnresolvedObjectName {
         match self {
-            RawObjectName::Name(name) => name,
-            RawObjectName::Id(_, name) => name,
-        }
-    }
-
-    pub fn name_mut(&mut self) -> &mut UnresolvedObjectName {
-        match self {
-            RawObjectName::Name(name) => name,
-            RawObjectName::Id(_, name) => name,
+            RawName::Name(name) => name,
+            RawName::Id(_, name) => name,
         }
     }
 }
 
-impl AstDisplay for RawObjectName {
+impl AstDisplay for RawName {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            RawObjectName::Name(o) => f.write_node(o),
-            RawObjectName::Id(id, o) => {
+            RawName::Name(o) => f.write_node(o),
+            RawName::Id(id, o) => {
                 f.write_str(format!("[{} AS ", id));
                 f.write_node(o);
                 f.write_str("]");
@@ -95,33 +77,11 @@ impl AstDisplay for RawObjectName {
         }
     }
 }
-impl_display!(RawObjectName);
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum RawIdent {
-    Unresolved(Ident),
-    Resolved(String),
-}
-
-impl AstDisplay for RawIdent {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        match self {
-            RawIdent::Unresolved(id) => f.write_node(id),
-            RawIdent::Resolved(id) => {
-                f.write_str(format!("[{}]", id));
-            }
-        }
-    }
-}
-impl_display!(RawIdent);
+impl_display!(RawName);
 
 impl AstInfo for Raw {
-    type ObjectName = RawObjectName;
-    type SchemaName = UnresolvedSchemaName;
-    type DatabaseName = UnresolvedDatabaseName;
-    type ClusterName = RawIdent;
-    type DataType = UnresolvedDataType;
-    type CteId = ();
+    type ObjectName = RawName;
+    type Id = ();
 }
 
 /// The most complete variant of a `SELECT` query expression, optionally
@@ -184,16 +144,6 @@ impl<T: AstInfo> Query<T> {
         Query {
             ctes: vec![],
             body: SetExpr::Select(Box::new(select)),
-            order_by: vec![],
-            limit: None,
-            offset: None,
-        }
-    }
-
-    pub fn query(query: Query<T>) -> Query<T> {
-        Query {
-            ctes: vec![],
-            body: SetExpr::Query(Box::new(query)),
             order_by: vec![],
             limit: None,
             offset: None,
@@ -382,7 +332,7 @@ impl<T: AstInfo> AstDisplay for Distinct<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Cte<T: AstInfo> {
     pub alias: TableAlias,
-    pub id: T::CteId,
+    pub id: T::Id,
     pub query: Query<T>,
 }
 
@@ -511,13 +461,13 @@ impl<T: AstInfo> AstDisplay for TableFactor<T> {
                 alias,
                 with_ordinality,
             } => {
-                f.write_str("ROWS FROM (");
+                f.write_str("ROWS FROM(");
                 f.write_node(&display::comma_separated(functions));
-                f.write_str(")");
                 if let Some(alias) = alias {
                     f.write_str(" AS ");
                     f.write_node(alias);
                 }
+                f.write_str(")");
                 if *with_ordinality {
                     f.write_str(" WITH ORDINALITY");
                 }

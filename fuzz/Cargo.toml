@@ -1,8 +1,7 @@
 [package]
-name = "mz-fuzz"
+name = "fuzz"
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.59.0"
 publish = false
 
 [[bin]]
@@ -15,5 +14,5 @@ path = "fuzz_targets/fuzz_parse_time.rs"
 
 [dependencies]
 honggfuzz = "0.5.54"
-mz-repr = { path = "../src/repr" }
-mz-sql-parser = { path = "../src/sql-parser" }
+repr = { path = "../src/repr" }
+sql-parser = { path = "../src/sql-parser" }

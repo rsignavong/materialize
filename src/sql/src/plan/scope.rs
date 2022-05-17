@@ -46,24 +46,25 @@ use std::iter;
 
 use anyhow::bail;
 
-use mz_ore::iter::IteratorExt;
-use mz_repr::ColumnName;
+use ore::iter::IteratorExt;
+use repr::ColumnName;
 
 use crate::ast::Expr;
-use crate::names::{Aug, PartialObjectName};
+use crate::names::PartialName;
 use crate::plan::error::PlanError;
 use crate::plan::expr::ColumnRef;
 use crate::plan::plan_utils::JoinSide;
+use crate::plan::query::Aug;
 
 #[derive(Debug, Clone)]
 pub struct ScopeItem {
     /// The name of the table that produced this scope item, if any.
-    pub table_name: Option<PartialObjectName>,
+    pub table_name: Option<PartialName>,
     /// The name of the column.
     pub column_name: ColumnName,
-    /// The expressions from which this scope item is derived. Used by `GROUP
+    /// The expression from which this scope item is derived. Used by `GROUP
     /// BY`.
-    pub exprs: HashSet<Expr<Aug>>,
+    pub expr: Option<Expr<Aug>>,
     /// Whether the column is the return value of a function that produces only
     /// a single column. This accounts for a strange PostgreSQL special case
     /// around whole-row expansion.
@@ -87,13 +88,6 @@ pub struct ScopeItem {
     /// variables in outer scopes that would otherwise be valid to reference,
     /// but accessing them needs to produce an error.
     pub lateral_error_if_referenced: bool,
-    /// For table functions in scalar positions, this flag is true for the
-    /// ordinality column. If true, then this column represents an "exists" flag
-    /// for the entire row of the table function. In that case, this column must
-    /// be excluded from `*` expansion. If the corresponding datum is `NULL`, then
-    /// `*` expansion should yield a single `NULL` instead of a record with various
-    /// datums.
-    pub is_exists_column_for_a_table_function_that_was_in_the_target_list: bool,
     // Force use of the constructor methods.
     _private: (),
 }
@@ -125,15 +119,14 @@ pub struct Scope {
 }
 
 impl ScopeItem {
-    pub fn empty() -> ScopeItem {
+    fn empty() -> ScopeItem {
         ScopeItem {
             table_name: None,
             column_name: "?column?".into(),
-            exprs: HashSet::new(),
+            expr: None,
             from_single_column_function: false,
             allow_unqualified_references: true,
             lateral_error_if_referenced: false,
-            is_exists_column_for_a_table_function_that_was_in_the_target_list: false,
             _private: (),
         }
     }
@@ -147,7 +140,7 @@ impl ScopeItem {
     }
 
     /// Constructs a new scope item from a name.
-    pub fn from_name<N>(table_name: Option<PartialObjectName>, column_name: N) -> ScopeItem
+    pub fn from_name<N>(table_name: Option<PartialName>, column_name: N) -> ScopeItem
     where
         N: Into<ColumnName>,
     {
@@ -160,13 +153,11 @@ impl ScopeItem {
     /// Constructs a new scope item with no name from an expression.
     pub fn from_expr(expr: impl Into<Option<Expr<Aug>>>) -> ScopeItem {
         let mut item = ScopeItem::empty();
-        if let Some(expr) = expr.into() {
-            item.exprs.insert(expr);
-        }
+        item.expr = expr.into();
         item
     }
 
-    pub fn is_from_table(&self, table_name: &PartialObjectName) -> bool {
+    pub fn is_from_table(&self, table_name: &PartialName) -> bool {
         match &self.table_name {
             None => false,
             Some(n) => n.matches(table_name),
@@ -182,7 +173,7 @@ impl Scope {
         }
     }
 
-    pub fn from_source<I, N>(table_name: Option<PartialObjectName>, column_names: I) -> Self
+    pub fn from_source<I, N>(table_name: Option<PartialName>, column_names: I) -> Self
     where
         I: IntoIterator<Item = N>,
         N: Into<ColumnName>,
@@ -255,7 +246,7 @@ impl Scope {
     pub fn items_from_table<'a>(
         &'a self,
         outer_scopes: &'a [Scope],
-        table: &PartialObjectName,
+        table: &PartialName,
     ) -> Result<Vec<(ColumnRef, &'a ScopeItem)>, PlanError> {
         let mut seen_level = None;
         let items: Vec<_> = self
@@ -275,7 +266,7 @@ impl Scope {
         &'a self,
         outer_scopes: &[Scope],
         mut matches: M,
-        table_name: Option<&PartialObjectName>,
+        table_name: Option<&PartialName>,
         column_name: &ColumnName,
     ) -> Result<ColumnRef, PlanError>
     where
@@ -353,7 +344,7 @@ impl Scope {
     pub fn resolve_table_column<'a>(
         &'a self,
         outer_scopes: &[Scope],
-        table_name: &PartialObjectName,
+        table_name: &PartialName,
         column_name: &ColumnName,
     ) -> Result<ColumnRef, PlanError> {
         let mut seen_at_level = None;
@@ -383,7 +374,7 @@ impl Scope {
     pub fn resolve<'a>(
         &'a self,
         outer_scopes: &[Scope],
-        table_name: Option<&PartialObjectName>,
+        table_name: Option<&PartialName>,
         column_name: &ColumnName,
     ) -> Result<ColumnRef, PlanError> {
         match table_name {
@@ -394,11 +385,11 @@ impl Scope {
 
     /// Look to see if there is an already-calculated instance of this expr.
     /// Failing to find one is not an error, so this just returns Option
-    pub fn resolve_expr<'a>(&'a self, expr: &mz_sql_parser::ast::Expr<Aug>) -> Option<ColumnRef> {
+    pub fn resolve_expr<'a>(&'a self, expr: &sql_parser::ast::Expr<Aug>) -> Option<ColumnRef> {
         self.items
             .iter()
             .enumerate()
-            .find(|(_, item)| item.exprs.contains(expr))
+            .find(|(_, item)| item.expr.as_ref() == Some(expr))
             .map(|(i, _)| ColumnRef {
                 level: 0,
                 column: i,
@@ -434,10 +425,10 @@ impl Scope {
         }
     }
 
-    fn table_names(&self) -> HashSet<&PartialObjectName> {
+    fn table_names(&self) -> HashSet<&PartialName> {
         self.items
             .iter()
             .filter_map(|name| name.table_name.as_ref())
-            .collect::<HashSet<&PartialObjectName>>()
+            .collect::<HashSet<&PartialName>>()
     }
 }

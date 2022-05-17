@@ -15,13 +15,13 @@ import numpy as np
 
 class Aggregation:
     def __init__(self) -> None:
-        self._data: List[float] = []
+        self._data: List[Any] = []
 
     def append(self, measurement: float) -> None:
         self._data.append(measurement)
 
     def aggregate(self) -> Any:
-        return self.func()([*self._data])
+        return self.func()(*self._data)
 
     def func(self) -> Callable:
         assert False
@@ -43,17 +43,12 @@ class StdDevAggregation(Aggregation):
         self._num_stdevs = num_stdevs
 
     def aggregate(self) -> float:
-        stdev: float = np.std(self._data)
-        mean: float = np.mean(self._data)
+        stdev = np.std(self._data)
+        mean = np.mean(self._data)
         val = mean - (stdev * self._num_stdevs)
-        return val
+        return val  # type: ignore
 
 
 class NormalDistributionAggregation(Aggregation):
     def aggregate(self) -> statistics.NormalDist:
         return statistics.NormalDist(mu=np.mean(self._data), sigma=np.std(self._data))
-
-
-class NoAggregation(Aggregation):
-    def aggregate(self) -> Any:
-        return self._data[0]

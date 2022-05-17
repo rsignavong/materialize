@@ -9,13 +9,12 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context};
 use async_trait::async_trait;
 
-use mz_ccsr::{SchemaReference, SchemaType};
-use mz_ore::retry::Retry;
+use ccsr::{SchemaReference, SchemaType};
+use ore::retry::Retry;
 
-use crate::action::{Action, ControlFlow, State};
+use crate::action::{Action, Context, State};
 use crate::parser::BuiltinCommand;
 
 pub struct PublishAction {
@@ -25,13 +24,13 @@ pub struct PublishAction {
     references: Vec<String>,
 }
 
-pub fn build_publish(mut cmd: BuiltinCommand) -> Result<PublishAction, anyhow::Error> {
+pub fn build_publish(mut cmd: BuiltinCommand) -> Result<PublishAction, String> {
     let subject = cmd.args.string("subject")?;
     let schema_type = match cmd.args.string("schema-type")?.as_str() {
         "avro" => SchemaType::Avro,
         "json" => SchemaType::Json,
         "protobuf" => SchemaType::Protobuf,
-        s => bail!("unknown schema type: {}", s),
+        s => return Err(format!("unknown schema type: {}", s)),
     };
     let references = match cmd.args.opt_string("references") {
         None => vec![],
@@ -47,18 +46,18 @@ pub fn build_publish(mut cmd: BuiltinCommand) -> Result<PublishAction, anyhow::E
 
 #[async_trait]
 impl Action for PublishAction {
-    async fn undo(&self, _: &mut State) -> Result<(), anyhow::Error> {
+    async fn undo(&self, _: &mut State) -> Result<(), String> {
         Ok(())
     }
 
-    async fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+    async fn redo(&self, state: &mut State) -> Result<(), String> {
         let mut references = vec![];
         for reference in &self.references {
             let subject = state
                 .ccsr_client
                 .get_subject(reference)
                 .await
-                .with_context(|| format!("fetching reference {}", reference))?;
+                .map_err(|e| format!("fetching reference {}: {}", reference, e))?;
             references.push(SchemaReference {
                 name: subject.name,
                 subject: reference.clone(),
@@ -69,41 +68,41 @@ impl Action for PublishAction {
             .ccsr_client
             .publish_schema(&self.subject, &self.schema, self.schema_type, &references)
             .await
-            .context("publishing schema")?;
-        Ok(ControlFlow::Continue)
+            .map_err(|e| format!("publishing schema: {}", e))?;
+        Ok(())
     }
 }
 
 pub struct WaitSchemaAction {
     schema: String,
+    context: Context,
 }
 
-pub fn build_wait(mut cmd: BuiltinCommand) -> Result<WaitSchemaAction, anyhow::Error> {
+pub fn build_wait(mut cmd: BuiltinCommand, context: Context) -> Result<WaitSchemaAction, String> {
     let schema = cmd.args.string("schema")?;
     cmd.args.done()?;
-    Ok(WaitSchemaAction { schema })
+    Ok(WaitSchemaAction { schema, context })
 }
 
 #[async_trait]
 impl Action for WaitSchemaAction {
-    async fn undo(&self, _: &mut State) -> Result<(), anyhow::Error> {
+    async fn undo(&self, _: &mut State) -> Result<(), String> {
         Ok(())
     }
 
-    async fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+    async fn redo(&self, state: &mut State) -> Result<(), String> {
         Retry::default()
             .initial_backoff(Duration::from_millis(50))
             .factor(1.5)
-            .max_duration(state.timeout)
-            .retry_async_canceling(|_| async {
+            .max_duration(self.context.timeout)
+            .retry_async(|_| async {
                 state
                     .ccsr_client
                     .get_schema_by_subject(&self.schema)
                     .await
-                    .context("fetching schema")
+                    .map_err(|e| format!("fetching schema: {}", e))
                     .and(Ok(()))
             })
-            .await?;
-        Ok(ControlFlow::Continue)
+            .await
     }
 }

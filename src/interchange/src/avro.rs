@@ -12,6 +12,7 @@ use mz_avro::schema::{SchemaPiece, SchemaPieceOrNamed};
 mod decode;
 mod encode;
 pub mod envelope_cdc_v2;
+mod envelope_debezium;
 mod schema;
 
 pub use envelope_cdc_v2 as cdc_v2;
@@ -21,7 +22,19 @@ pub use self::encode::{
     encode_datums_as_avro, encode_debezium_transaction_unchecked, get_debezium_transaction_schema,
     AvroEncoder, AvroSchemaGenerator,
 };
+pub use self::envelope_debezium::DebeziumDeduplicationStrategy;
 pub use self::schema::{parse_schema, schema_to_relationdesc, ConfluentAvroResolver};
+
+use self::decode::{AvroStringDecoder, OptionalRecordDecoder, RowWrapper};
+use self::envelope_debezium::{AvroDebeziumDecoder, RowCoordinates};
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum EnvelopeType {
+    None,
+    Debezium,
+    Upsert,
+    CdcV2,
+}
 
 fn is_null(schema: &SchemaPieceOrNamed) -> bool {
     matches!(schema, SchemaPieceOrNamed::Piece(SchemaPiece::Null))
@@ -33,8 +46,8 @@ mod tests {
     use ordered_float::OrderedFloat;
 
     use mz_avro::types::{DecimalValue, Value};
-    use mz_repr::adt::numeric::{self, NumericMaxScale};
-    use mz_repr::{Datum, RelationDesc, ScalarType};
+    use repr::adt::numeric;
+    use repr::{Datum, RelationDesc, ScalarType};
 
     use super::*;
 
@@ -116,9 +129,7 @@ mod tests {
                 Value::Timestamp(date_time),
             ),
             (
-                ScalarType::Numeric {
-                    max_scale: Some(NumericMaxScale::try_from(1_i64)?),
-                },
+                ScalarType::Numeric { scale: Some(1) },
                 Datum::from(Numeric::from(1)),
                 Value::Decimal(DecimalValue {
                     unscaled: bytes.clone(),
@@ -127,7 +138,7 @@ mod tests {
                 }),
             ),
             (
-                ScalarType::Numeric { max_scale: None },
+                ScalarType::Numeric { scale: None },
                 Datum::from(Numeric::from(1)),
                 Value::Decimal(DecimalValue {
                     // equivalent to 1E39
@@ -152,7 +163,7 @@ mod tests {
         ];
         for (typ, datum, expected) in valid_pairings {
             let desc = RelationDesc::empty().with_column("column1", typ.nullable(false));
-            let schema_generator = AvroSchemaGenerator::new(None, None, None, desc, false);
+            let schema_generator = AvroSchemaGenerator::new(None, desc, false);
             let avro_value =
                 encode_datums_as_avro(std::iter::once(datum), schema_generator.value_columns());
             assert_eq!(

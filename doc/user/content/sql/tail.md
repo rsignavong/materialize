@@ -31,12 +31,9 @@ Clients can use `TAIL` to:
 Field | Use
 ------|-----
 _object&lowbar;name_ | The name of the source, table, or view that you want to tail.
-_select&lowbar;stmt_ | The [`SELECT` statement](../select) whose output you want to tail.
 _timestamp&lowbar;expression_ | The logical time at which the `TAIL` begins as a [`bigint`] representing milliseconds since the Unix epoch. See [`AS OF`](#as-of) below.
 
-### `WITH` options
-
-The following options are valid within the `WITH` clause.
+Supported `WITH` option values:
 
 Option name | Value type | Default | Describes
 ------------|------------|---------|----------
@@ -111,7 +108,7 @@ the nature of the update:
 </tbody>
 </table>
 
-`TAIL` will continue to run until canceled, or until all updates the tailed
+`TAIL` will continue to run until cancelled, or until all updates the tailed
 item could undergo have been presented. The latter case typically occurs when
 tailing constant views (e.g. `CREATE VIEW v AS SELECT 1`) or
 [file sources](/sql/create-source/text-file) that were created in non-tailing
@@ -231,7 +228,7 @@ Below are the recommended ways to work around this.
 ### Tailing with `FETCH`
 
 The recommended way to use `TAIL` is with [`DECLARE`](/sql/declare) and [`FETCH`](/sql/fetch).
-These must be used within a transaction, with [only one `DECLARE`](/sql/begin/#read-only-transactions) per transaction.
+These must be used within a transaction.
 This allows you to limit the number of rows and the time window of your requests. First, declare a `TAIL` cursor:
 
 ```sql

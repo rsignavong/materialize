@@ -26,12 +26,12 @@ $ kafka-create-topic topic=data
   FORMAT AVRO USING SCHEMA '${schema}'
 
 ! SELECT * FROM data
-contains:unable to automatically determine a query timestamp
+unable to automatically determine a query timestamp
 
 > CREATE VIEW data_view as SELECT * from data
 
 ! SELECT * FROM data_view
-contains:unable to automatically determine a query timestamp
+unable to automatically determine a query timestamp
 
 > CREATE MATERIALIZED VIEW test1 AS
   SELECT b, sum(a) FROM data GROUP BY b
@@ -136,7 +136,7 @@ b  max
 
 # Cannot select from unmaterialized view.
 ! SELECT * from data_view
-contains:unable to automatically determine a query timestamp
+unable to automatically determine a query timestamp
 
 # Can create sink from unmaterialized view.
 > CREATE SINK not_mat_sink2 FROM data_view
@@ -160,7 +160,7 @@ b  c
 > CREATE INDEX idx1 ON test5(c)
 
 ! SELECT * FROM idx1
-contains:catalog item 'materialize.public.idx1' is an index and so cannot be depended upon
+catalog item 'materialize.public.idx1' is an index and so cannot be depended upon
 
 # If there exists a second primary index, dropping one primary index will not
 # unmaterialize the view.
@@ -185,7 +185,7 @@ b  c
 > DROP INDEX idx1
 
 ! SELECT * from test5
-contains:unable to automatically determine a query timestamp
+unable to automatically determine a query timestamp
 
 > SHOW FULL VIEWS LIKE 'test5'
 name        type     materialized  volatility
@@ -205,10 +205,10 @@ d
 # Dependencies have not re-materialized as a result of creating a dependent
 # materialized view.
 ! SELECT * from test5
-contains:unable to automatically determine a query timestamp
+unable to automatically determine a query timestamp
 
 ! SELECT * from data_view
-contains:unable to automatically determine a query timestamp
+unable to automatically determine a query timestamp
 
 # Rematerialize data_view creating an index on it.
 > CREATE INDEX data_view_idx on data_view(a)
@@ -366,7 +366,7 @@ c  d
 > DROP INDEX mat_data_primary_idx1
 
 ! SELECT * from mat_data
-contains:unable to automatically determine a query timestamp
+unable to automatically determine a query timestamp
 
 > SELECT * from test7
 count
@@ -374,7 +374,7 @@ count
 4
 
 ! SELECT * from test8
-contains:unable to automatically determine a query timestamp
+unable to automatically determine a query timestamp
 
 $ kafka-ingest format=avro topic=mat schema=${schema} timestamp=2
 {"a": -3, "b": 0}

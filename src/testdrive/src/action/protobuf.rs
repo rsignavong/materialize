@@ -7,15 +7,14 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::env;
 use std::iter;
-use std::path::{self, PathBuf};
+use std::path;
 
-use anyhow::{bail, Context};
 use async_trait::async_trait;
-use tokio::process::Command;
+use protobuf::Message;
+use tokio::fs;
 
-use crate::action::{Action, ControlFlow, State};
+use crate::action::{Action, State};
 use crate::parser::BuiltinCommand;
 
 pub struct CompileDescriptorsAction {
@@ -25,7 +24,7 @@ pub struct CompileDescriptorsAction {
 
 pub fn build_compile_descriptors(
     mut cmd: BuiltinCommand,
-) -> Result<CompileDescriptorsAction, anyhow::Error> {
+) -> Result<CompileDescriptorsAction, String> {
     let inputs: Vec<String> = cmd
         .args
         .string("inputs")?
@@ -36,7 +35,7 @@ pub fn build_compile_descriptors(
     for path in inputs.iter().chain(iter::once(&output)) {
         if path.contains(path::MAIN_SEPARATOR) {
             // The goal isn't security, but preventing mistakes.
-            bail!("separators in paths are forbidden");
+            return Err("separators in paths are forbidden".into());
         }
     }
     Ok(CompileDescriptorsAction { inputs, output })
@@ -44,30 +43,26 @@ pub fn build_compile_descriptors(
 
 #[async_trait]
 impl Action for CompileDescriptorsAction {
-    async fn undo(&self, _: &mut State) -> Result<(), anyhow::Error> {
+    async fn undo(&self, _: &mut State) -> Result<(), String> {
         // Files are written to a fresh temporary directory, so no need to
         // explicitly remove the file here.
         Ok(())
     }
 
-    async fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
-        let protoc = match env::var_os("PROTOC") {
-            None => protobuf_src::protoc(),
-            Some(protoc) => PathBuf::from(protoc),
-        };
-        let status = Command::new(protoc)
-            .arg("--include_imports")
-            .arg("-I")
-            .arg(&state.temp_path)
-            .arg("--descriptor_set_out")
-            .arg(state.temp_path.join(&self.output))
-            .args(&self.inputs)
-            .status()
-            .await
-            .context("invoking protoc failed")?;
-        if !status.success() {
-            bail!("protoc exited unsuccessfully");
+    async fn redo(&self, state: &mut State) -> Result<(), String> {
+        let mut protoc = mz_protoc::Protoc::new();
+        protoc.include(&state.temp_path);
+        for input in &self.inputs {
+            protoc.input(state.temp_path.join(input));
         }
-        Ok(ControlFlow::Continue)
+        let fds = protoc
+            .parse()
+            .map_err(|e| format!("compiling protobuf descriptors: {}", e))?
+            .write_to_bytes()
+            .map_err(|e| format!("compiling protobuf descriptors: {}", e))?;
+        fs::write(state.temp_path.join(&self.output), fds)
+            .await
+            .map_err(|e| format!("writing protobuf descriptors: {}", e))?;
+        Ok(())
     }
 }

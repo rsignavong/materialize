@@ -7,17 +7,14 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use async_trait::async_trait;
 use std::cmp;
 use std::time::Duration;
-
-use anyhow::{bail, Context};
-use async_trait::async_trait;
 use tokio_postgres::NoTls;
 
-use mz_ore::retry::Retry;
-use mz_ore::task;
+use ore::retry::Retry;
 
-use crate::action::{Action, ControlFlow, State};
+use crate::action::{Action, State};
 use crate::parser::BuiltinCommand;
 
 pub struct VerifySlotAction {
@@ -26,7 +23,7 @@ pub struct VerifySlotAction {
     active: bool,
 }
 
-pub fn build_verify_slot(mut cmd: BuiltinCommand) -> Result<VerifySlotAction, anyhow::Error> {
+pub fn build_verify_slot(mut cmd: BuiltinCommand) -> Result<VerifySlotAction, String> {
     let connection = cmd.args.string("connection")?;
     let slot = cmd.args.string("slot")?;
     let active: bool = cmd.args.parse("active")?;
@@ -40,24 +37,24 @@ pub fn build_verify_slot(mut cmd: BuiltinCommand) -> Result<VerifySlotAction, an
 
 #[async_trait]
 impl Action for VerifySlotAction {
-    async fn undo(&self, _: &mut State) -> Result<(), anyhow::Error> {
+    async fn undo(&self, _: &mut State) -> Result<(), String> {
         Ok(())
     }
 
-    async fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+    async fn redo(&self, state: &mut State) -> Result<(), String> {
         let (client, conn) = tokio_postgres::connect(&self.connection, NoTls)
             .await
-            .context("connecting to postgres")?;
+            .map_err(|e| format!("connecting to postgres: {}", e))?;
         println!(
             "Executing queries against PostgreSQL server at {}...",
             self.connection
         );
-        let conn_handle = task::spawn(|| "verify_slot_action_pgconn", conn);
+        let conn_handle = tokio::spawn(conn);
 
         Retry::default()
             .initial_backoff(Duration::from_millis(50))
             .max_duration(cmp::max(state.default_timeout, Duration::from_secs(3)))
-            .retry_async_canceling(|_| async {
+            .retry_async(|_| async {
                 println!(">> checking for postgres replication slot {}", &self.slot);
                 let rows = client
                     .query(
@@ -65,22 +62,28 @@ impl Action for VerifySlotAction {
                         &[&self.slot],
                     )
                     .await
-                    .context("querying postgres for replication slot")?;
+                    .map_err(|e| format!("querying postgres for replication slot: {}", e))?;
 
                 if self.active {
                     if rows.len() != 1 {
-                        bail!(
+                        return Err(format!(
                             "expected entry for slot {} in pg_replication slots, found {}",
                             &self.slot,
                             rows.len()
-                        );
+                        ));
                     }
                     let active_pid: Option<i32> = rows[0].get(0);
                     if active_pid.is_none() {
-                        bail!("expected slot {} to be active, is inactive", &self.slot);
+                        return Err(format!(
+                            "expected slot {} to be active, is inactive",
+                            &self.slot
+                        ));
                     }
                 } else if rows.len() != 0 {
-                    bail!("expected slot {} to be inactive, is active", &self.slot);
+                    return Err(format!(
+                        "expected slot {} to be inactive, is active",
+                        &self.slot
+                    ));
                 }
                 Ok(())
             })
@@ -90,8 +93,6 @@ impl Action for VerifySlotAction {
         conn_handle
             .await
             .unwrap()
-            .context("postgres connection error")?;
-
-        Ok(ControlFlow::Continue)
+            .map_err(|e| format!("postgres connection error: {}", e))
     }
 }

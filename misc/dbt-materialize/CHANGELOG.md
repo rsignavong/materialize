@@ -1,57 +1,6 @@
 # dbt-materialize Changelog
 
-## Unreleased
-
-* Discontinue support for custom index materialization.
-* Enable defining indexes when creating a materializedview, view, or source.
-
-## 1.0.4 - 2022-03-27
-
-* Upgrade to `dbt-postgres` v1.0.4.
-
-## 1.0.3.post1 - 2022-03-16
-
-* Produce a proper error message when attempting to use an incremental
-materialization.
-
-## 1.0.3 - 2022-02-27
-
-* Upgrade to `dbt-postgres` v1.0.3.
-
-## 1.0.1.post3 - 2022-02-17
-
-* Fix a bug introduced in v1.0.1.post1 that prevented use of the custom
-  materialization types (`sink`, `source`, `index`, and `materializedview`).
-
-## 1.0.1.post2 - 2022-02-14
-
-* Execute hooks that specify `transaction: true` ([#7675]). In particular, this
-  includes hooks that are configured as a simple string.
-
-  Previously, dbt-materialize would only execute hooks that specified
-  `transaction: false`. The new behavior matches the other non-transactional dbt
-  adapters, which simply execute all hooks outside of a transaction regardless
-  of their configured `transaction` behavior.
-
-[#7675]: https://github.com/MaterializeInc/materialize/issues/7675
-
-## 1.0.1.post1 - 2022-02-14
-
-* Disable transactions. This avoids errors of the form "CREATE ... must be
-  executed outside of a transaction block" ([materialize-dbt-utils#11]).
-
-  Materialize's transactions are not powerful enough to support dbt's use cases.
-  Disabling transactions follows the precedent set by the dbt-snowflake and
-  dbt-bigquery adapters.
-
-* Respect type overrides in the views created by seeds.
-
-* Fix the implementation of the `list_relations_without_caching` macro.
-  Previously it always returned an empty list of relations.
-
-[materialize-dbt-utils#11]: https://github.com/MaterializeInc/materialize-dbt-utils/issues/11
-
-## 1.0.1 - 2022-01-03
+## 1.0.0 - 2021-01-03
 
 * Upgrade to `dbt-postgres` v1.0.1.
 

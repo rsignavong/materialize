@@ -11,10 +11,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use mz_lowertest::MzReflect;
-use mz_repr::adt::numeric::{self, Numeric, NumericMaxScale};
-use mz_repr::adt::system::Oid;
-use mz_repr::{strconv, ColumnType, ScalarType};
+use lowertest::MzStructReflect;
+use repr::adt::numeric::{self, Numeric};
+use repr::adt::system::Oid;
+use repr::{strconv, ColumnType, ScalarType};
 
 use crate::scalar::func::EagerUnaryFunc;
 use crate::EvalError;
@@ -69,14 +69,14 @@ sqlfunc!(
     #[sqlname = "i64tooid"]
     #[preserves_uniqueness = true]
     fn cast_int64_to_oid(a: i64) -> Result<Oid, EvalError> {
-        // Unlike casting a 16-bit or 32-bit integers to OID, casting a 64-bit
-        // integers to an OID rejects negative values.
-        u32::try_from(a).map(Oid).or(Err(EvalError::OidOutOfRange))
+        i32::try_from(a).map(Oid).or(Err(EvalError::OidOutOfRange))
     }
 );
 
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzReflect)]
-pub struct CastInt64ToNumeric(pub Option<NumericMaxScale>);
+#[derive(
+    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzStructReflect,
+)]
+pub struct CastInt64ToNumeric(pub Option<u8>);
 
 impl<'a> EagerUnaryFunc<'a> for CastInt64ToNumeric {
     type Input = i64;
@@ -85,7 +85,7 @@ impl<'a> EagerUnaryFunc<'a> for CastInt64ToNumeric {
     fn call(&self, a: i64) -> Result<Numeric, EvalError> {
         let mut a = Numeric::from(a);
         if let Some(scale) = self.0 {
-            if numeric::rescale(&mut a, scale.into_u8()).is_err() {
+            if numeric::rescale(&mut a, scale).is_err() {
                 return Err(EvalError::NumericFieldOverflow);
             }
         }
@@ -94,7 +94,7 @@ impl<'a> EagerUnaryFunc<'a> for CastInt64ToNumeric {
     }
 
     fn output_type(&self, input: ColumnType) -> ColumnType {
-        ScalarType::Numeric { max_scale: self.0 }.nullable(input.nullable)
+        ScalarType::Numeric { scale: self.0 }.nullable(input.nullable)
     }
 }
 

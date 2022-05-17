@@ -29,16 +29,15 @@ import subprocess
 import sys
 import webbrowser
 from pathlib import Path
-from typing import IO, Any, List, Optional, Sequence, Text, Tuple, Union
+from typing import Any, List, Optional, Sequence, Text, Tuple
 
-import junit_xml
 from humanize import naturalsize
 
-from materialize import ROOT, ci_util, mzbuild, mzcompose, spawn, ui
+from materialize import ROOT, mzbuild, mzcompose, spawn, ui
 from materialize.ui import UIError
 
 MIN_COMPOSE_VERSION = (1, 24, 0)
-RECOMMENDED_MIN_MEM = 8 * 1024**3  # 8GiB
+RECOMMENDED_MIN_MEM = 8 * 1024 ** 3  # 8GiB
 RECOMMENDED_MIN_CPUS = 2
 
 
@@ -47,7 +46,7 @@ def main(argv: List[str]) -> None:
         prog="mzcompose",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""
-mzcompose orchestrates services defined in mzcompose.yml or mzcompose.py.
+mzcompose orchestrates services defined in mzcompose.yml or mzworkflows.py.
 It wraps Docker Compose to add some Materialize-specific features.""",
         epilog="""
 These are only the most common options. There are additional Docker Compose
@@ -69,11 +68,6 @@ For additional details on mzcompose, consult doc/developer/mzbuild.md.""",
         "--find",
         metavar="DIR",
         help="use the mzcompose.yml file from DIR, rather than the current directory",
-    )
-    parser.add_argument(
-        "--preserve-ports",
-        action="store_true",
-        help="bind container ports to the same host ports rather than choosing random host ports",
     )
     mzbuild.Repository.install_arguments(parser)
 
@@ -103,6 +97,7 @@ For additional details on mzcompose, consult doc/developer/mzbuild.md.""",
     KillCommand.register(parser, subparsers)
     LintCommand().register(parser, subparsers)
     ListCompositionsCommand().register(parser, subparsers)
+    ListPortsCommand().register(parser, subparsers)
     ListWorkflowsCommand().register(parser, subparsers)
     LogsCommand.register(parser, subparsers)
     PauseCommand.register(parser, subparsers)
@@ -137,9 +132,7 @@ def load_composition(args: argparse.Namespace) -> mzcompose.Composition:
     """Loads the composition specified by the command-line arguments."""
     repo = mzbuild.Repository.from_arguments(ROOT, args)
     try:
-        return mzcompose.Composition(
-            repo, name=args.find or Path.cwd().name, preserve_ports=args.preserve_ports
-        )
+        return mzcompose.Composition(repo, args.find or Path.cwd().name)
     except mzcompose.UnknownCompositionError as e:
         if args.find:
             hint = "available compositions:\n"
@@ -152,7 +145,7 @@ def load_composition(args: argparse.Namespace) -> mzcompose.Composition:
             for path in repo.compositions.values():
                 hint += f"    {path.relative_to(Path.cwd())}\n"
             raise UIError(
-                "directory does not contain an mzcompose.yml or mzcompose.py",
+                "directory does not contain an mzcompose.yml or mzworkflows.py",
                 hint,
             )
 
@@ -238,7 +231,7 @@ class GenShortcutsCommand(Command):
 #
 # mzcompose — runs Docker Compose with Materialize customizations.
 
-exec "$(dirname "$0")"/{}/bin/pyactivate -m materialize.cli.mzcompose "$@"
+exec "$(dirname "$0")/{}/bin/mzcompose" "$@"
 """
         for path in repo.compositions.values():
             mzcompose_path = path / "mzcompose"
@@ -264,19 +257,33 @@ class LintCommand(Command):
 
 class ListCompositionsCommand(Command):
     name = "list-compositions"
-    help = "list the directories that contain compositions and their summaries"
+    help = "list the directories that contain compositions"
 
     def run(cls, args: argparse.Namespace) -> None:
         repo = mzbuild.Repository.from_arguments(ROOT, args)
-        for name, path in sorted(repo.compositions.items(), key=lambda item: item[1]):
-            print(os.path.relpath(path, repo.root))
-            composition = mzcompose.Composition(repo, name, munge_services=False)
-            if composition.description:
-                # Emit the first paragraph of the description.
-                for line in composition.description.split("\n"):
-                    if line.strip() == "":
-                        break
-                    print(f"  {line}")
+        for name in sorted(repo.compositions):
+            print(name)
+
+
+class ListPortsCommand(Command):
+    name = "list-ports"
+    help = "list ports exposed by a service"
+
+    def configure(self, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "service", metavar="SERVICE", help="the service to list ports for"
+        )
+
+    def run(self, args: argparse.Namespace) -> None:
+        composition = load_composition(args)
+        ports = composition.find_host_ports(args.service)
+        if not ports:
+            raise UIError(
+                f"no ports for service {args.service!r} found",
+                hint="is the service running?",
+            )
+        for port in ports:
+            print(port)
 
 
 class ListWorkflowsCommand(Command):
@@ -285,7 +292,9 @@ class ListWorkflowsCommand(Command):
 
     def run(self, args: argparse.Namespace) -> None:
         composition = load_composition(args)
-        for name in sorted(composition.workflows):
+        for name in sorted(
+            list(composition.yaml_workflows) + list(composition.python_funcs)
+        ):
             print(name)
 
 
@@ -298,20 +307,22 @@ class DescribeCommand(Command):
         composition = load_composition(args)
 
         workflows = []
-        for name, fn in composition.workflows.items():
+        for name in composition.yaml_workflows:
+            workflows.append((name, ""))
+        for name, fn in composition.python_funcs.items():
             workflows.append((name, inspect.getdoc(fn) or ""))
         workflows.sort()
 
         name_width = min(max(len(name) for name, _ in workflows), 16)
 
         print("Services:")
-        for name in sorted(composition.compose["services"]):
+        for name in sorted(composition.services):
             print(f"    {name}")
 
         print()
         print("Workflows:")
         for name, description in workflows:
-            if len(name) <= name_width or not description:
+            if len(name) <= name_width:
                 print(f"    {name: <{name_width}}    {description}")
             else:
                 print(f"    {name}")
@@ -336,7 +347,7 @@ class SqlCommand(Command):
     def run(self, args: argparse.Namespace) -> None:
         composition = load_composition(args)
 
-        service = composition.compose["services"].get(args.service)
+        service = composition.services.get(args.service)
         if not service:
             raise UIError(f"unknown service {args.service!r}")
 
@@ -346,9 +357,8 @@ class SqlCommand(Command):
                 f"cannot connect SQL shell to non-materialized service {args.service!r}"
             )
 
-        # Attempting to load the default port will produce a nice error message
-        # if the service isn't running or isn't exposing a port.
-        composition.default_port(args.service)
+        if not composition.find_host_ports(args.service):
+            raise UIError(f"service {args.service!r} is not running")
 
         deps = composition.repo.resolve_dependencies([composition.repo.images["psql"]])
         deps.acquire()
@@ -375,8 +385,13 @@ class WebCommand(Command):
 
     def run(self, args: argparse.Namespace) -> None:
         composition = load_composition(args)
-        port = composition.default_port(args.service)
-        url = f"http://localhost:{port}"
+        ports = composition.find_host_ports(args.service)
+        if not ports:
+            raise UIError(
+                f"no ports discovered for service {args.service!r}",
+                hint="is the service running?",
+            )
+        url = f"http://localhost:{ports[0]}"
         print(f"Opening {url} in a web browser...")
         webbrowser.open(url)
 
@@ -403,7 +418,7 @@ class DockerComposeCommand(Command):
     def run(self, args: argparse.Namespace) -> None:
         if args.help:
             output = self.capture(
-                ["docker-compose", self.name, "--help"], stderr=subprocess.STDOUT
+                ["docker-compose", self.name, "--help"], stderr_too=True
             )
             output = output.replace("docker-compose", "./mzcompose")
             output += "\nThis command is a wrapper around Docker Compose."
@@ -415,9 +430,7 @@ class DockerComposeCommand(Command):
 
         # Make sure Docker Compose is new enough.
         output = (
-            self.capture(
-                ["docker-compose", "version", "--short"], stderr=subprocess.STDOUT
-            )
+            self.capture(["docker-compose", "version", "--short"], stderr_too=True)
             .strip()
             .strip("v")
         )
@@ -429,8 +442,9 @@ class DockerComposeCommand(Command):
             )
 
         composition = load_composition(args)
-        ui.header("Collecting mzbuild images")
-        for d in composition.dependencies:
+        ui.header("Collecting mzbuild dependencies")
+        deps = composition.repo.resolve_dependencies(composition.images)
+        for d in deps:
             ui.say(d.spec())
 
         if self.runs_containers:
@@ -440,10 +454,7 @@ class DockerComposeCommand(Command):
                 # it as root.
                 (composition.path / "coverage").mkdir(exist_ok=True)
             self.check_docker_resource_limits()
-            composition.dependencies.acquire()
-
-            if "services" in composition.compose:
-                composition.pull_if_variable(composition.compose["services"].keys())
+            deps.acquire()
 
         self.handle_composition(args, composition)
 
@@ -451,7 +462,10 @@ class DockerComposeCommand(Command):
         self, args: argparse.Namespace, composition: mzcompose.Composition
     ) -> None:
         ui.header("Delegating to Docker Compose")
-        composition.invoke(*args.unknown_args, self.name, *args.unknown_subargs)
+        composition.run(
+            [*args.unknown_args, self.name, *args.unknown_subargs],
+            check=False,
+        )
 
     def check_docker_resource_limits(self) -> None:
         output = self.capture(
@@ -471,11 +485,9 @@ class DockerComposeCommand(Command):
                 "See https://materialize.com/docs/third-party/docker/."
             )
 
-    def capture(
-        self, args: List[str], stderr: Union[None, int, IO[bytes]] = None
-    ) -> str:
+    def capture(self, args: List[str], stderr_too: bool = False) -> str:
         try:
-            return spawn.capture(args, stderr=stderr)
+            return spawn.capture(args, stderr_too=stderr_too, unicode=True)
         except subprocess.CalledProcessError as e:
             # Print any captured output, since it probably hints at the problem.
             print(e.output, file=sys.stderr, end="")
@@ -554,19 +566,17 @@ To see the available workflows, run:
     def handle_composition(
         self, args: argparse.Namespace, composition: mzcompose.Composition
     ) -> None:
-        if args.workflow not in composition.workflows:
+        try:
+            workflow = composition.get_workflow(args.workflow, dict(os.environ))
+        except KeyError:
             # Restart any dependencies whose definitions have changed. This is
             # Docker Compose's default behavior for `up`, but not for `run`,
             # which is a constant irritation that we paper over here. The trick,
             # taken from Buildkite's Docker Compose plugin, is to run an `up`
             # command that requests zero instances of the requested service.
             if args.workflow:
-                composition.invoke(
-                    "up",
-                    "-d",
-                    "--scale",
-                    f"{args.workflow}=0",
-                    args.workflow,
+                composition.run(
+                    ["up", "-d", "--scale", f"{args.workflow}=0", args.workflow]
                 )
             super().handle_composition(args, composition)
         else:
@@ -585,27 +595,7 @@ To see the available workflows, run:
                     f"it can't be used when running {args.workflow!r}, because {args.workflow!r} "
                     "is a custom mzcompose workflow, not a Docker Compose service",
                 )
-
-            # Run the workflow inside of a test case so that we get some basic
-            # test analytics, even if the workflow doesn't define more granular
-            # test cases.
-            with composition.test_case(f"workflow-{args.workflow}"):
-                composition.workflow(args.workflow, *args.unknown_subargs[1:])
-
-            # Upload test report to Buildkite Test Analytics.
-            junit_suite = junit_xml.TestSuite(composition.name)
-            for (name, result) in composition.test_results.items():
-                test_case = junit_xml.TestCase(name, composition.name, result.duration)
-                if result.error:
-                    test_case.add_error_info(message=result.error)
-                junit_suite.test_cases.append(test_case)
-            junit_report = ci_util.junit_report_filename("mzcompose")
-            with junit_report.open("w") as f:
-                junit_xml.to_xml_report_file(f, [junit_suite])
-            ci_util.upload_junit_report("mzcompose", junit_report)
-
-            if any(result.error for result in composition.test_results.values()):
-                raise UIError("at least one test case failed")
+            workflow.run(args.unknown_subargs[1:])
 
 
 BuildCommand = DockerComposeCommand("build", "build or rebuild services")

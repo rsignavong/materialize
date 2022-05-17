@@ -91,7 +91,7 @@ macro_rules! soft_assert_or_log {
         if $crate::assert::SOFT_ASSERTIONS.load(::std::sync::atomic::Ordering::Relaxed) {
             assert!($cond, $($arg)+);
         } else if !$cond {
-            ::tracing::error!($($arg)+)
+            ::log::error!($($arg)+)
         }
     }}
 }
@@ -104,7 +104,7 @@ macro_rules! soft_panic_or_log {
         if $crate::assert::SOFT_ASSERTIONS.load(::std::sync::atomic::Ordering::Relaxed) {
             panic!($($arg)+);
         } else {
-            ::tracing::error!($($arg)+)
+            ::log::error!($($arg)+)
         }
     }}
 }
@@ -135,21 +135,21 @@ macro_rules! soft_panic_or_log {
 /// Check whether a string contains a substring:
 ///
 /// ```
-/// use mz_ore::assert_contains;
+/// use ore::assert_contains;
 /// assert_contains!("hello", "ello");
 /// ```
 ///
 /// Check whether a slice contains an element:
 ///
 /// ```
-/// use mz_ore::assert_contains;
+/// use ore::assert_contains;
 /// assert_contains!(&[1, 2, 3], 2);
 /// ```
 ///
 /// Failed assertions panic:
 ///
 /// ```should_panic
-/// use mz_ore::assert_contains;
+/// use ore::assert_contains;
 /// assert_contains!("hello", "yellow");
 /// ```
 #[macro_export]

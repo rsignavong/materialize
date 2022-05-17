@@ -7,114 +7,38 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Traits and types for controller of the dataflow subsystem.
+//! Traits and types for fat clients of the dataflow subsystem.
 
 // This appears to be defective at the moment, with false positiives
 // for each variant of the `Command` enum, each of which are documented.
 // #![warn(missing_docs)]
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::pin::Pin;
-
-use async_trait::async_trait;
-use futures::Stream;
-use serde::de::DeserializeOwned;
+use enum_iterator::IntoEnumIterator;
+use enum_kinds::EnumKind;
+use num_enum::IntoPrimitive;
 use serde::{Deserialize, Serialize};
 use timely::progress::frontier::Antichain;
 use timely::progress::ChangeBatch;
-use tracing::trace;
-use uuid::Uuid;
 
 use crate::logging::LoggingConfig;
 use crate::{
-    sources::{MzOffset, SourceDesc},
-    DataflowDescription, PeekResponse, SourceInstanceDesc, TailResponse, Update,
+    DataflowDescription, MzOffset, PeekResponse, SourceConnector, TailResponse,
+    TimestampSourceUpdate, Update,
 };
-use mz_expr::{GlobalId, PartitionId, RowSetFinishing};
-use mz_repr::Row;
-
-pub mod controller;
-pub use controller::Controller;
-
-pub mod partitioned;
-pub mod replicated;
+use expr::{GlobalId, PartitionId, RowSetFinishing};
+use persist::indexed::runtime::RuntimeClient;
+use repr::{Row, Timestamp};
 
 /// Explicit instructions for timely dataflow workers.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum Command<T = mz_repr::Timestamp> {
-    /// A compute command.
-    Compute(ComputeCommand<T>),
-    /// A storage command.
-    Storage(StorageCommand<T>),
-}
-
-/// An abstraction allowing us to name difference compute instances.
-// TODO(benesch): this is an `i64` rather than a `u64` because SQLite does not
-// support natively storing `u64`. Revisit this before shipping Platform, as we
-// might not like to bake in this decision based on a SQLite limitation.
-// See #11123.
-pub type ComputeInstanceId = i64;
-/// A default value whose use we can track down and remove later.
-pub const DEFAULT_COMPUTE_INSTANCE_ID: ComputeInstanceId = 1;
-
-/// Instance configuration
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum InstanceConfig {
-    /// In-process instance.
-    Local,
-    /// Out-of-process named instance
-    Remote {
-        /// A map from replica name to hostnames.
-        replicas: BTreeMap<String, BTreeSet<String>>,
-    },
-    /// A remote but managed instance.
-    Managed {
-        /// The size of the cluster.
-        size: String,
-    },
-}
-
-/// Peek at an arrangement.
-///
-/// This request elicits data from the worker, by naming an
-/// arrangement and some actions to apply to the results before
-/// returning them.
-///
-/// The `timestamp` member must be valid for the arrangement that
-/// is referenced by `id`. This means that `AllowCompaction` for
-/// this arrangement should not pass `timestamp` before this command.
-/// Subsequent commands may arbitrarily compact the arrangements;
-/// the dataflow runners are responsible for ensuring that they can
-/// correctly answer the `Peek`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Peek<T = mz_repr::Timestamp> {
-    /// The identifier of the arrangement.
-    pub id: GlobalId,
-    /// An optional key that should be used for the arrangement.
-    pub key: Option<Row>,
-    /// The identifier of this peek request.
-    ///
-    /// Used in responses and cancellation requests.
-    pub uuid: Uuid,
-    /// The logical timestamp at which the arrangement is queried.
-    pub timestamp: T,
-    /// Actions to apply to the result set before returning them.
-    pub finishing: RowSetFinishing,
-    /// Linear operation to apply in-line on each result.
-    pub map_filter_project: mz_expr::SafeMfpPlan,
-}
-
-/// Commands related to the computation and maintenance of views.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ComputeCommand<T = mz_repr::Timestamp> {
-    /// Indicates the creation of an instance, and is the first command for its compute instance.
-    ///
-    /// Optionally, request that the logging sources in the contained configuration are installed.
-    CreateInstance(Option<LoggingConfig>),
-    /// Indicates the termination of an instance, and is the last command for its compute instance.
-    DropInstance,
-
+#[derive(Clone, Debug, Serialize, Deserialize, EnumKind)]
+#[enum_kind(
+    CommandKind,
+    derive(Serialize, IntoPrimitive, IntoEnumIterator),
+    repr(usize),
+    serde(rename_all = "snake_case"),
+    doc = "The kind of command that was received"
+)]
+pub enum Command {
     /// Create a sequence of dataflows.
     ///
     /// Each of the dataflows must contain `as_of` members that are valid
@@ -123,107 +47,203 @@ pub enum ComputeCommand<T = mz_repr::Timestamp> {
     /// Subsequent commands may arbitrarily compact the arrangements;
     /// the dataflow runners are responsible for ensuring that they can
     /// correctly maintain the dataflows.
-    CreateDataflows(Vec<DataflowDescription<crate::plan::Plan<T>, T>>),
-    /// Enable compaction in compute-managed collections.
-    ///
-    /// Each entry in the vector names a collection and provides a frontier after which
-    /// accumulations must be correct. The workers gain the liberty of compacting
-    /// the corresponding maintained traces up through that frontier.
-    AllowCompaction(Vec<(GlobalId, Antichain<T>)>),
-
+    CreateDataflows(Vec<DataflowDescription<crate::plan::Plan>>),
+    /// Drop the sources bound to these names.
+    DropSources(Vec<GlobalId>),
+    /// Drop the sinks bound to these names.
+    DropSinks(Vec<GlobalId>),
+    /// Drop the indexes bound to these namees.
+    DropIndexes(Vec<GlobalId>),
     /// Peek at an arrangement.
-    Peek(Peek<T>),
-    /// Cancel the peeks associated with the given `uuids`.
-    CancelPeeks {
-        /// The identifiers of the peek requests to cancel.
-        uuids: BTreeSet<Uuid>,
+    ///
+    /// This request elicits data from the worker, by naming an
+    /// arrangement and some actions to apply to the results before
+    /// returning them.
+    ///
+    /// The `timestamp` member must be valid for the arrangement that
+    /// is referenced by `id`. This means that `AllowCompaction` for
+    /// this arrangement should not pass `timestamp` before this command.
+    /// Subsequent commands may arbitrarily compact the arrangements;
+    /// the dataflow runners are responsible for ensuring that they can
+    /// correctly answer the `Peek`.
+    Peek {
+        /// The identifier of the arrangement.
+        id: GlobalId,
+        /// An optional key that should be used for the arrangement.
+        key: Option<Row>,
+        /// The identifier of this peek request.
+        ///
+        /// Used in responses and cancelation requests.
+        conn_id: u32,
+        /// The logical timestamp at which the arrangement is queried.
+        timestamp: Timestamp,
+        /// Actions to apply to the result set before returning them.
+        finishing: RowSetFinishing,
+        /// Linear operation to apply in-line on each result.
+        map_filter_project: expr::SafeMfpPlan,
     },
-}
-
-/// A command creating a single source
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateSourceCommand<T> {
-    /// The source identifier
-    pub id: GlobalId,
-    /// The source description
-    pub desc: SourceDesc,
-    /// The initial `since` frontier
-    pub since: Antichain<T>,
-    /// Any previously stored timestamp bindings
-    pub ts_bindings: Vec<(PartitionId, T, crate::sources::MzOffset)>,
-}
-
-/// Commands related to the ingress and egress of collections.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum StorageCommand<T = mz_repr::Timestamp> {
-    /// Create the enumerated sources, each associated with its identifier.
-    CreateSources(Vec<CreateSourceCommand<T>>),
-    /// Render the enumerated sources.
-    ///
-    /// Each source has a name for debugging purposes, an optional "as of" frontier and collection
-    /// of sources to import.
-    RenderSources(
-        Vec<(
-            /* debug_name */ String,
-            /* dataflow_id */ uuid::Uuid,
-            /* as_of */ Option<Antichain<T>>,
-            /* source_imports*/ BTreeMap<GlobalId, SourceInstanceDesc<T>>,
-        )>,
-    ),
-    /// Enable compaction in storage-managed collections.
-    ///
-    /// Each entry in the vector names a collection and provides a frontier after which
-    /// accumulations must be correct.
-    AllowCompaction(Vec<(GlobalId, Antichain<T>)>),
-
+    /// Cancel the peek associated with the given `conn_id`.
+    CancelPeek {
+        /// The identifier of the peek request to cancel.
+        conn_id: u32,
+    },
     /// Insert `updates` into the local input named `id`.
     Insert {
         /// Identifier of the local input.
         id: GlobalId,
         /// A list of updates to be introduced to the input.
-        updates: Vec<Update<T>>,
+        updates: Vec<Update>,
     },
+    /// Enable compaction in views.
+    ///
+    /// Each entry in the vector names a view and provides a frontier after which
+    /// accumulations must be correct. The workers gain the liberty of compacting
+    /// the corresponding maintained traces up through that frontier.
+    AllowCompaction(Vec<(GlobalId, Antichain<Timestamp>)>),
     /// Update durability information for sources.
     ///
     /// Each entry names a source and provides a frontier before which the source can
     /// be exactly replayed across restarts (i.e. we can assign the same timestamps to
     /// all the same data)
-    DurabilityFrontierUpdates(Vec<(GlobalId, Antichain<T>)>),
+    DurabilityFrontierUpdates(Vec<(GlobalId, Antichain<Timestamp>)>),
+    /// Add a new source to be aware of for timestamping.
+    AddSourceTimestamping {
+        /// The ID of the timestamped source
+        id: GlobalId,
+        /// The connector for the timestamped source.
+        connector: SourceConnector,
+        /// Previously stored timestamp bindings.
+        bindings: Vec<(PartitionId, Timestamp, MzOffset)>,
+    },
+    /// Advance worker timestamp
+    AdvanceSourceTimestamp {
+        /// The ID of the timestamped source
+        id: GlobalId,
+        /// The associated update (RT or BYO)
+        update: TimestampSourceUpdate,
+    },
+    /// Drop all timestamping info for a source
+    DropSourceTimestamping {
+        /// The ID id of the formerly timestamped source.
+        id: GlobalId,
+    },
     /// Advance all local inputs to the given timestamp.
     AdvanceAllLocalInputs {
         /// The timestamp to advance to.
-        advance_to: T,
+        advance_to: Timestamp,
     },
+    /// Request that the logging sources in the contained configuration are
+    /// installed.
+    EnableLogging(LoggingConfig),
+    /// Enable persistence.
+    // TODO: to enable persistence in clustered mode, we'll need to figure out
+    // an alternative design that doesn't require serializing a persistence
+    // client.
+    #[serde(skip)]
+    EnablePersistence(RuntimeClient),
 }
 
-impl<T> ComputeCommand<T> {
+impl Command {
+    /// Partitions the command into `parts` many disjoint pieces.
+    ///
+    /// This is used to subdivide commands that can be sharded across workers,
+    /// for example the `plan::Constant` stages of dataflow plans, and the
+    /// `Command::Insert` commands that may contain multiple updates.
+    pub fn partition_among(self, parts: usize) -> Vec<Self> {
+        if parts == 0 {
+            Vec::new()
+        } else if parts == 1 {
+            vec![self]
+        } else {
+            match self {
+                Command::CreateDataflows(dataflows) => {
+                    let mut dataflows_parts = vec![Vec::new(); parts];
+
+                    for dataflow in dataflows {
+                        // A list of descriptions of objects for each part to build.
+                        let mut builds_parts = vec![Vec::new(); parts];
+                        // Partition each build description among `parts`.
+                        for build_desc in dataflow.objects_to_build {
+                            let build_part = build_desc.view.partition_among(parts);
+                            for (view, objects_to_build) in
+                                build_part.into_iter().zip(builds_parts.iter_mut())
+                            {
+                                objects_to_build.push(crate::BuildDesc {
+                                    id: build_desc.id,
+                                    view,
+                                });
+                            }
+                        }
+                        // Each list of build descriptions results in a dataflow description.
+                        for (dataflows_part, objects_to_build) in
+                            dataflows_parts.iter_mut().zip(builds_parts)
+                        {
+                            dataflows_part.push(DataflowDescription {
+                                source_imports: dataflow.source_imports.clone(),
+                                index_imports: dataflow.index_imports.clone(),
+                                objects_to_build,
+                                index_exports: dataflow.index_exports.clone(),
+                                sink_exports: dataflow.sink_exports.clone(),
+                                dependent_objects: dataflow.dependent_objects.clone(),
+                                as_of: dataflow.as_of.clone(),
+                                debug_name: dataflow.debug_name.clone(),
+                            });
+                        }
+                    }
+                    dataflows_parts
+                        .into_iter()
+                        .map(Command::CreateDataflows)
+                        .collect()
+                }
+                Command::Insert { id, updates } => {
+                    let mut updates_parts = vec![Vec::new(); parts];
+                    for (index, update) in updates.into_iter().enumerate() {
+                        updates_parts[index % parts].push(update);
+                    }
+                    updates_parts
+                        .into_iter()
+                        .map(|updates| Command::Insert { id, updates })
+                        .collect()
+                }
+                command => vec![command; parts],
+            }
+        }
+    }
+
     /// Indicates which global ids should start and cease frontier tracking.
     ///
     /// Identifiers added to `start` will install frontier tracking, and indentifiers
     /// added to `cease` will uninstall frontier tracking.
     pub fn frontier_tracking(&self, start: &mut Vec<GlobalId>, cease: &mut Vec<GlobalId>) {
         match self {
-            ComputeCommand::CreateDataflows(dataflows) => {
+            Command::CreateDataflows(dataflows) => {
                 for dataflow in dataflows.iter() {
                     for (sink_id, _) in dataflow.sink_exports.iter() {
                         start.push(*sink_id)
                     }
-                    for (index_id, _) in dataflow.index_exports.iter() {
+                    for (index_id, _, _) in dataflow.index_exports.iter() {
                         start.push(*index_id);
                     }
                 }
             }
-            ComputeCommand::AllowCompaction(frontiers) => {
-                for (id, frontier) in frontiers.iter() {
-                    if frontier.is_empty() {
-                        cease.push(*id);
-                    }
+            Command::DropIndexes(index_ids) => {
+                for id in index_ids.iter() {
+                    cease.push(*id);
                 }
             }
-            ComputeCommand::CreateInstance(logging) => {
-                if let Some(logging_config) = logging {
-                    start.extend(logging_config.log_identifiers());
+            Command::DropSinks(sink_ids) => {
+                for id in sink_ids.iter() {
+                    cease.push(*id);
                 }
+            }
+            Command::AddSourceTimestamping { id, .. } => {
+                start.push(*id);
+            }
+            Command::DropSourceTimestamping { id } => {
+                cease.push(*id);
+            }
+            Command::EnableLogging(logging_config) => {
+                start.extend(logging_config.log_identifiers());
             }
             _ => {
                 // Other commands have no known impact on frontier tracking.
@@ -232,339 +252,143 @@ impl<T> ComputeCommand<T> {
     }
 }
 
-#[derive(Debug)]
-struct ComputeCommandHistory<T> {
-    commands: Vec<ComputeCommand<T>>,
-}
-
-impl<T: timely::progress::Timestamp> ComputeCommandHistory<T> {
-    pub fn push(&mut self, command: ComputeCommand<T>) {
-        self.commands.push(command);
-    }
-    /// Reduces `self.history` to a minimal form.
-    ///
-    /// This action not only simplifies the issued history, but importantly reduces the instructions
-    /// to only reference inputs from times that are still certain to be valid. Commands that allow
-    /// compaction of a collection also remove certainty that the inputs will be available for times
-    /// not greater or equal to that compaction frontier.
-    ///
-    /// The `peeks` argument should contain those peeks that have yet to be resolved, either through
-    /// response or cancelation.
-    ///
-    /// Returns the number of distinct commands that remain.
-    pub fn reduce(&mut self, peeks: &std::collections::HashSet<uuid::Uuid>) -> usize {
-        // First determine what the final compacted frontiers will be for each collection.
-        // These will determine for each collection whether the command that creates it is required,
-        // and if required what `as_of` frontier should be used for its updated command.
-        let mut final_frontiers = std::collections::BTreeMap::new();
-        let mut live_dataflows = Vec::new();
-        let mut live_peeks = Vec::new();
-        let mut live_cancels = std::collections::BTreeSet::new();
-
-        let mut create_command = None;
-        let mut drop_command = None;
-
-        for command in self.commands.drain(..) {
-            match command {
-                create @ ComputeCommand::CreateInstance(_) => {
-                    // We should be able to handle this, should this client need to be restartable.
-                    assert!(create_command.is_none());
-                    create_command = Some(create);
-                }
-                cmd @ ComputeCommand::DropInstance => {
-                    assert!(drop_command.is_none());
-                    drop_command = Some(cmd);
-                }
-                ComputeCommand::CreateDataflows(dataflows) => {
-                    live_dataflows.extend(dataflows);
-                }
-                ComputeCommand::AllowCompaction(frontiers) => {
-                    for (id, frontier) in frontiers {
-                        final_frontiers.insert(id, frontier.clone());
-                    }
-                }
-                ComputeCommand::Peek(peek) => {
-                    // We could pre-filter here, but seems hard to access `uuid`
-                    // and take ownership of `peek` at the same time.
-                    live_peeks.push(peek);
-                }
-                ComputeCommand::CancelPeeks { mut uuids } => {
-                    uuids.retain(|uuid| peeks.contains(uuid));
-                    live_cancels.extend(uuids);
-                }
-            }
-        }
-
-        // Update dataflow `as_of` frontiers to the least of the final frontiers of their outputs.
-        // One possible frontier is the empty frontier, indicating that the dataflow can be removed.
-        for dataflow in live_dataflows.iter_mut() {
-            let mut as_of = Antichain::new();
-            for id in dataflow.export_ids() {
-                if let Some(frontier) = final_frontiers.get(&id) {
-                    as_of.extend(frontier.clone());
-                } else {
-                    as_of.extend(dataflow.as_of.clone().unwrap());
-                }
-            }
-
-            // Remove compaction for any collection that brought us to `as_of`.
-            for id in dataflow.export_ids() {
-                if let Some(frontier) = final_frontiers.get(&id) {
-                    if frontier == &as_of {
-                        final_frontiers.remove(&id);
-                    }
-                }
-            }
-
-            dataflow.as_of = Some(as_of);
-        }
-
-        // Discard dataflows whose outputs have all been allowed to compact away.
-        live_dataflows.retain(|dataflow| dataflow.as_of != Some(Antichain::new()));
-
-        // Retain only those peeks that have not yet been processed.
-        live_peeks.retain(|peek| peeks.contains(&peek.uuid));
-
-        // Record the volume of post-compaction commands.
-        let mut command_count = 1;
-        command_count += live_dataflows.len();
-        command_count += final_frontiers.len();
-        command_count += live_peeks.len();
-        command_count += live_cancels.len();
-        if drop_command.is_some() {
-            command_count += 1;
-        }
-
-        // Reconstitute the commands as a compact history.
-        if let Some(create_command) = create_command {
-            self.commands.push(create_command);
-        }
-        if !live_dataflows.is_empty() {
-            self.commands
-                .push(ComputeCommand::CreateDataflows(live_dataflows));
-        }
-        if !final_frontiers.is_empty() {
-            self.commands.push(ComputeCommand::AllowCompaction(
-                final_frontiers.into_iter().collect(),
-            ));
-        }
-        self.commands
-            .extend(live_peeks.into_iter().map(ComputeCommand::Peek));
-        if !live_cancels.is_empty() {
-            self.commands.push(ComputeCommand::CancelPeeks {
-                uuids: live_cancels,
-            });
-        }
-        if let Some(drop_command) = drop_command {
-            self.commands.push(drop_command);
-        }
-
-        command_count
-    }
-    /// Iterate through the contained commands.
-    pub fn iter(&self) -> impl Iterator<Item = &ComputeCommand<T>> {
-        self.commands.iter()
-    }
-
-    /// Report the number of commands.
-    ///
-    /// Importantly, each command can be arbitrarily complicated, so this number could be small
-    /// even while we have few commands that cause many actions to be taken.
-    pub fn len(&self) -> usize {
-        self.commands.len()
-    }
-}
-
-impl<T> Default for ComputeCommandHistory<T> {
-    fn default() -> Self {
-        Self {
-            commands: Vec::new(),
+impl CommandKind {
+    /// Returns the name of the command kind.
+    pub fn name(self) -> &'static str {
+        match self {
+            CommandKind::AddSourceTimestamping => "add_source_timestamping",
+            CommandKind::AdvanceAllLocalInputs => "advance_all_local_inputs",
+            CommandKind::AdvanceSourceTimestamp => "advance_source_timestamp",
+            CommandKind::AllowCompaction => "allow_compaction",
+            CommandKind::CancelPeek => "cancel_peek",
+            CommandKind::CreateDataflows => "create_dataflows",
+            CommandKind::DropIndexes => "drop_indexes",
+            CommandKind::DropSinks => "drop_sinks",
+            CommandKind::DropSourceTimestamping => "drop_source_timestamping",
+            CommandKind::DropSources => "drop_sources",
+            CommandKind::DurabilityFrontierUpdates => "durability_frontier_updates",
+            CommandKind::EnableLogging => "enable_logging",
+            CommandKind::EnablePersistence => "enable_persistence",
+            CommandKind::Insert => "insert",
+            CommandKind::Peek => "peek",
         }
     }
-}
-
-/// Data about timestamp bindings, sent to the coordinator, in service
-/// of a specific "linearized" read request
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LinearizedTimestampBindingFeedback<T = mz_repr::Timestamp> {
-    /// The _minimum_ viable timestamp that will produce a "linearized" read...
-    pub timestamp: T,
-    /// ... for this peek
-    pub peek_id: Uuid,
 }
 
 /// Data about timestamp bindings that dataflow workers send to the coordinator
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TimestampBindingFeedback<T = mz_repr::Timestamp> {
+pub struct TimestampBindingFeedback {
     /// Durability frontier changes
-    pub changes: Vec<(GlobalId, ChangeBatch<T>)>,
+    pub changes: Vec<(GlobalId, ChangeBatch<Timestamp>)>,
     /// Timestamp bindings for all of those frontier changes
-    pub bindings: Vec<(GlobalId, Vec<(PartitionId, T, MzOffset)>)>,
+    pub bindings: Vec<(GlobalId, PartitionId, Timestamp, MzOffset)>,
 }
 
-/// Responses that the worker/dataflow can provide back to the coordinator.
+/// Responses the worker can provide back to the coordinator.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum Response<T = mz_repr::Timestamp> {
-    /// A compute response.
-    Compute(ComputeResponse<T>),
-    /// A storage response.
-    Storage(StorageResponse<T>),
-}
-
-/// Responses that the compute nature of a worker/dataflow can provide back to the coordinator.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ComputeResponse<T = mz_repr::Timestamp> {
+pub enum Response {
     /// A list of identifiers of traces, with prior and new upper frontiers.
-    FrontierUppers(Vec<(GlobalId, ChangeBatch<T>)>),
-    /// The worker's response to a specified (by connection id) peek.
-    PeekResponse(Uuid, PeekResponse),
-    /// The worker's next response to a specified tail.
-    TailResponse(GlobalId, TailResponse<T>),
-}
-
-/// Responses that the storage nature of a worker/dataflow can provide back to the coordinator.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum StorageResponse<T = mz_repr::Timestamp> {
+    FrontierUppers(Vec<(GlobalId, ChangeBatch<Timestamp>)>),
     /// Timestamp bindings and prior and new frontiers for those bindings for all
     /// sources
-    TimestampBindings(TimestampBindingFeedback<T>),
-
-    /// Data about timestamp bindings, sent to the coordinator, in service
-    /// of a specific "linearized" read request
-    LinearizedTimestamps(LinearizedTimestampBindingFeedback<T>),
+    TimestampBindings(TimestampBindingFeedback),
+    /// The worker's response to a specified (by connection id) peek.
+    PeekResponse(u32, PeekResponse),
+    /// The worker's next response to a specified tail.
+    TailResponse(GlobalId, TailResponse),
 }
 
 /// A client to a running dataflow server.
-#[async_trait]
-pub trait GenericClient<C, R>: fmt::Debug + Send {
+#[async_trait::async_trait]
+pub trait Client: Send {
     /// Sends a command to the dataflow server.
-    ///
-    /// The command can error for various reasons.
-    async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error>;
+    async fn send(&mut self, cmd: Command);
 
     /// Receives the next response from the dataflow server.
     ///
     /// This method blocks until the next response is available, or, if the
     /// dataflow server has been shut down, returns `None`.
-    async fn recv(&mut self) -> Result<Option<R>, anyhow::Error>;
+    async fn recv(&mut self) -> Option<Response>;
+}
 
-    /// Returns an adapter that treats the client as a stream.
-    ///
-    /// The stream produces the responses that would be produced by repeated
-    /// calls to `recv`.
-    fn as_stream<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Stream<Item = Result<R, anyhow::Error>> + Send + 'a>>
-    where
-        R: Send + 'a,
-    {
-        Box::pin(async_stream::stream! {
-            loop {
-                match self.recv().await {
-                    Ok(Some(response)) => yield Ok(response),
-                    Err(error) => yield Err(error),
-                    Ok(None) => { return; }
+#[async_trait::async_trait]
+impl Client for Box<dyn Client> {
+    async fn send(&mut self, cmd: Command) {
+        self.send(cmd).await
+    }
+    async fn recv(&mut self) -> Option<Response> {
+        self.recv().await
+    }
+}
+
+/// A helper struct which allows us to interpret a `Client` as a `Stream` of `Response`.
+pub struct ClientAsStream<'a, C: Client + 'a> {
+    client: &'a mut C,
+}
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+impl<'a, C: Client + 'a> futures::stream::Stream for ClientAsStream<'a, C> {
+    type Item = Response;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use futures::Future;
+        Pin::new(&mut self.client.recv()).poll(cx)
+    }
+}
+
+/// A wrapper for enumerating any available result from a client.
+///
+/// Maintains an internal counter, and round robins through clients for fairness.
+pub struct SelectStream<'a, C: Client + 'a> {
+    clients: &'a mut [C],
+    cursor: usize,
+}
+
+impl<'a, C: Client + 'a> SelectStream<'a, C> {
+    /// Create a new [SelectStream], starting from the client at position `cursor`.
+    pub fn new(clients: &'a mut [C], cursor: usize) -> Self {
+        Self { clients, cursor }
+    }
+}
+
+impl<'a, C: Client + 'a> futures::stream::Stream for SelectStream<'a, C> {
+    type Item = (usize, Response);
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut done = true;
+        for _ in 0..self.clients.len() {
+            let cursor = self.cursor;
+            let result = {
+                use futures::Future;
+                Pin::new(&mut self.clients[cursor].recv()).poll(cx)
+            };
+            self.cursor = (self.cursor + 1) % self.clients.len();
+            match result {
+                Poll::Pending => {
+                    done = false;
+                }
+                Poll::Ready(None) => {}
+                Poll::Ready(Some(response)) => {
+                    return Poll::Ready(Some((self.cursor, response)));
                 }
             }
-        })
-    }
-}
-
-/// A client to a storage server.
-pub trait StorageClient<T = mz_repr::Timestamp>:
-    GenericClient<StorageCommand<T>, StorageResponse<T>>
-{
-}
-
-impl<C, T> StorageClient<T> for C where C: GenericClient<StorageCommand<T>, StorageResponse<T>> {}
-
-/// A client to a compute server.
-pub trait ComputeClient<T = mz_repr::Timestamp>:
-    GenericClient<ComputeCommand<T>, ComputeResponse<T>>
-{
-}
-
-impl<C, T> ComputeClient<T> for C where C: GenericClient<ComputeCommand<T>, ComputeResponse<T>> {}
-
-#[async_trait]
-impl<C, R> GenericClient<C, R> for Box<dyn GenericClient<C, R>>
-where
-    C: Send,
-{
-    async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
-        (**self).send(cmd).await
-    }
-    async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
-        (**self).recv().await
-    }
-}
-
-#[async_trait]
-impl<T: Send> GenericClient<ComputeCommand<T>, ComputeResponse<T>> for Box<dyn ComputeClient<T>> {
-    async fn send(&mut self, cmd: ComputeCommand<T>) -> Result<(), anyhow::Error> {
-        (**self).send(cmd).await
-    }
-    async fn recv(&mut self) -> Result<Option<ComputeResponse<T>>, anyhow::Error> {
-        (**self).recv().await
-    }
-}
-
-#[async_trait]
-impl<T: Send> GenericClient<StorageCommand<T>, StorageResponse<T>> for Box<dyn StorageClient<T>> {
-    async fn send(&mut self, cmd: StorageCommand<T>) -> Result<(), anyhow::Error> {
-        (**self).send(cmd).await
-    }
-    async fn recv(&mut self) -> Result<Option<StorageResponse<T>>, anyhow::Error> {
-        (**self).recv().await
-    }
-}
-
-/// An generic command sender.
-pub struct Sender<C> {
-    inner: Box<dyn FnMut(C) + Send>,
-}
-
-impl<C> Sender<C> {
-    /// Construct a new command sender from a function.
-    pub fn new<F>(f: F) -> Sender<C>
-    where
-        F: FnMut(C) + Send + 'static,
-    {
-        Sender { inner: Box::new(f) }
-    }
-
-    /// Sends a command to the destination.
-    pub fn send(&mut self, command: C) {
-        (self.inner)(command)
-    }
-}
-
-impl<C> fmt::Debug for Sender<C> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Sender").finish()
+        }
+        if done {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
     }
 }
 
 /// A convenience type for compatibility.
-#[derive(Debug)]
-pub struct LocalClient<C, R>
-where
-    (C, R): partitioned::Partitionable<C, R>,
-    C: fmt::Debug,
-    R: fmt::Debug,
-{
-    client: partitioned::Partitioned<process_local::ProcessLocal<C, R>, C, R>,
+pub struct LocalClient {
+    client: partitioned::Partitioned<process_local::ProcessLocal>,
 }
 
-impl<C, R> LocalClient<C, R>
-where
-    (C, R): partitioned::Partitionable<C, R>,
-    C: fmt::Debug,
-    R: fmt::Debug,
-{
+impl LocalClient {
     pub fn new(
-        feedback_rxs: Vec<tokio::sync::mpsc::UnboundedReceiver<R>>,
-        worker_txs: Vec<Sender<C>>,
+        feedback_rxs: Vec<tokio::sync::mpsc::UnboundedReceiver<Response>>,
+        worker_txs: Vec<crossbeam_channel::Sender<Command>>,
         worker_threads: Vec<std::thread::Thread>,
     ) -> Self {
         assert_eq!(feedback_rxs.len(), worker_threads.len());
@@ -580,123 +404,224 @@ where
     }
 }
 
-#[async_trait]
-impl<C, R> GenericClient<C, R> for LocalClient<C, R>
-where
-    (C, R): partitioned::Partitionable<C, R>,
-    C: fmt::Debug + Send,
-    R: fmt::Debug + Send,
-{
-    async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
-        trace!("SEND dataflow command: {:?}", cmd);
+#[async_trait::async_trait]
+impl Client for LocalClient {
+    async fn send(&mut self, cmd: Command) {
+        log::trace!("SEND dataflow command: {:?}", cmd);
         self.client.send(cmd).await
     }
-    async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
+    async fn recv(&mut self) -> Option<Response> {
         let response = self.client.recv().await;
-        trace!("RECV dataflow response: {:?}", response);
+        log::trace!("RECV dataflow response: {:?}", response);
         response
     }
 }
 
-/// A [`LocalClient`] for the storage layer.
-pub type LocalStorageClient = LocalClient<StorageCommand, StorageResponse>;
+/// Clients whose implementation is partitioned across a set of subclients (e.g. timely workers).
+pub mod partitioned {
 
-/// A [`LocalClient`] for the compute layer.
-pub type LocalComputeClient = LocalClient<ComputeCommand, ComputeResponse>;
+    use std::collections::HashMap;
 
-/// A convenience type for compatibility.
-#[derive(Debug)]
-pub struct RemoteClient<C, R>
-where
-    (C, R): partitioned::Partitionable<C, R>,
-    C: fmt::Debug + Send,
-    R: fmt::Debug + Send,
-{
-    client: partitioned::Partitioned<tcp::TcpClient<C, R>, C, R>,
-}
+    use expr::GlobalId;
+    use repr::Timestamp;
 
-impl<C, R> RemoteClient<C, R>
-where
-    (C, R): partitioned::Partitionable<C, R>,
-    C: fmt::Debug + Send,
-    R: fmt::Debug + Send,
-{
-    /// Construct a client backed by multiple tcp connections
-    pub fn new(addrs: &[impl tokio::net::ToSocketAddrs + std::fmt::Display]) -> Self {
-        let mut remotes = Vec::with_capacity(addrs.len());
-        for addr in addrs.iter() {
-            remotes.push(tcp::TcpClient::new(addr.to_string()));
-        }
-        Self {
-            client: partitioned::Partitioned::new(remotes),
+    use super::Client;
+    use super::{Command, PeekResponse, Response};
+
+    /// A client whose implementation is sharded across a number of other clients.
+    ///
+    /// Such a client needs to broadcast (partitioned) commands to all of its clients,
+    /// and await responses from each of the client shards before it can respond.
+    pub struct Partitioned<C: Client> {
+        shards: Vec<C>,
+        cursor: usize,
+        state: PartitionedClientState,
+    }
+
+    impl<C: Client> Partitioned<C> {
+        /// Create a client partitioned across multiple client shards.
+        pub fn new(shards: Vec<C>) -> Self {
+            Self {
+                state: PartitionedClientState::new(shards.len()),
+                cursor: 0,
+                shards,
+            }
         }
     }
 
-    /// Construct a client backed by multiple tcp connections
-    pub async fn connect(&mut self) {
-        // TODO: initiate connections concurrently.
-        for remote in self.client.parts.iter_mut() {
-            remote.connect().await;
+    #[async_trait::async_trait]
+    impl<C: Client> Client for Partitioned<C> {
+        async fn send(&mut self, cmd: Command) {
+            self.state.observe_command(&cmd);
+            let cmd_parts = cmd.partition_among(self.shards.len());
+            for (shard, cmd_part) in self.shards.iter_mut().zip(cmd_parts) {
+                shard.send(cmd_part).await;
+            }
+        }
+
+        async fn recv(&mut self) -> Option<Response> {
+            use futures::StreamExt;
+            self.cursor = (self.cursor + 1) % self.shards.len();
+            let mut stream = super::SelectStream::new(&mut self.shards[..], self.cursor);
+            while let Some((index, response)) = stream.next().await {
+                let message = self.state.absorb_response(index, response);
+                if let Some(message) = message {
+                    return Some(message);
+                }
+            }
+            // Indicate completion of the communication.
+            None
         }
     }
-}
 
-#[async_trait]
-impl<C, R> GenericClient<C, R> for RemoteClient<C, R>
-where
-    (C, R): partitioned::Partitionable<C, R>,
-    C: Serialize + fmt::Debug + Unpin + Send,
-    R: DeserializeOwned + fmt::Debug + Unpin + Send,
-{
-    async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
-        trace!("Sending dataflow command: {:?}", cmd);
-        self.client.send(cmd).await
+    use timely::progress::{frontier::MutableAntichain, ChangeBatch};
+
+    /// Maintained state for sharded dataflow clients.
+    ///
+    /// This helper type unifies the responses of multiple partitioned
+    /// workers in order to present as a single worker.
+    pub struct PartitionedClientState {
+        /// Upper frontiers for sources and indexes.
+        uppers: HashMap<GlobalId, MutableAntichain<Timestamp>>,
+        /// Pending responses for a peek; returnable once all are available.
+        peek_responses: HashMap<u32, HashMap<usize, PeekResponse>>,
+        /// Number of parts the state machine represents.
+        parts: usize,
     }
-    async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
-        let response = self.client.recv().await;
-        trace!("Receiving dataflow response: {:?}", response);
-        response
+
+    impl PartitionedClientState {
+        /// Instantiates a new client state machine wrapping a number of parts.
+        pub fn new(parts: usize) -> Self {
+            Self {
+                uppers: Default::default(),
+                peek_responses: Default::default(),
+                parts,
+            }
+        }
+
+        /// Observes commands that move past, and prepares state for responses.
+        ///
+        /// In particular, this method installs and removes upper frontier maintenance.
+        pub fn observe_command(&mut self, command: &Command) {
+            // Temporary storage for identifiers to add to and remove from frontier tracking.
+            let mut start = Vec::new();
+            let mut cease = Vec::new();
+            command.frontier_tracking(&mut start, &mut cease);
+            // Apply the determined effects of the command to `self.uppers`.
+            for id in start.into_iter() {
+                let mut frontier = timely::progress::frontier::MutableAntichain::new();
+                frontier.update_iter(Some((
+                    <Timestamp as timely::progress::Timestamp>::minimum(),
+                    self.parts as i64,
+                )));
+                let previous = self.uppers.insert(id, frontier);
+                assert!(previous.is_none(), "Protocol error: starting frontier tracking for already present identifier {:?} due to command {:?}", id, command);
+            }
+            for id in cease.into_iter() {
+                let previous = self.uppers.remove(&id);
+                if previous.is_none() {
+                    log::debug!("Protocol error: ceasing frontier tracking for absent identifier {:?} due to command {:?}", id, command);
+                }
+            }
+        }
+
+        /// Absorbs a response, and produces response that should be emitted.
+        pub fn absorb_response(&mut self, shard_id: usize, message: Response) -> Option<Response> {
+            match message {
+                Response::FrontierUppers(mut list) => {
+                    // Fold updates into the maintained antichain, and report
+                    // any net changes to the minimal antichain itself.
+                    let mut reactions = ChangeBatch::new();
+                    for (id, changes) in list.iter_mut() {
+                        // We may receive changes to identifiers that are no longer tracked;
+                        // do not worry about them in that case (a benign race condition).
+                        if let Some(frontier) = self.uppers.get_mut(id) {
+                            for (time, diff) in frontier.update_iter(changes.drain()) {
+                                reactions.update(time, diff);
+                            }
+                            std::mem::swap(changes, &mut reactions);
+                        } else {
+                            changes.clear();
+                        }
+                    }
+                    // TODO: The following line would be great, but is not permitted by `list.retain()`.
+                    // list.retain_mut(|(_, changes)| !changes.is_empty());
+                    if !list.is_empty() {
+                        Some(Response::FrontierUppers(list))
+                    } else {
+                        None
+                    }
+                }
+                Response::PeekResponse(connection, response) => {
+                    // Incorporate new peek responses; awaiting all responses.
+                    let entry = self
+                        .peek_responses
+                        .entry(connection)
+                        .or_insert_with(Default::default);
+                    let novel = entry.insert(shard_id, response);
+                    assert!(novel.is_none(), "Duplicate peek response");
+                    // We may be ready to respond.
+                    if entry.len() == self.parts {
+                        let mut response = PeekResponse::Rows(Vec::new());
+                        for (_part, r) in std::mem::take(entry).into_iter() {
+                            response = match (response, r) {
+                                (_, PeekResponse::Canceled) => PeekResponse::Canceled,
+                                (PeekResponse::Canceled, _) => PeekResponse::Canceled,
+                                (_, PeekResponse::Error(e)) => PeekResponse::Error(e),
+                                (PeekResponse::Error(e), _) => PeekResponse::Error(e),
+                                (PeekResponse::Rows(mut rows), PeekResponse::Rows(r)) => {
+                                    rows.extend(r.into_iter());
+                                    PeekResponse::Rows(rows)
+                                }
+                            };
+                        }
+                        self.peek_responses.remove(&connection);
+                        Some(Response::PeekResponse(connection, response))
+                    } else {
+                        None
+                    }
+                }
+                message => {
+                    // TimestampBindings and TailResponses are mirrored out,
+                    // as they do not seem to contain worker-specific information.
+                    Some(message)
+                }
+            }
+        }
     }
 }
 
 /// A client backed by a process-local timely worker thread.
 pub mod process_local {
-    use std::fmt;
 
-    use async_trait::async_trait;
-
-    use super::{GenericClient, Sender};
+    use super::{Client, Command, Response};
 
     /// A client to a dataflow server running in the current process.
-    #[derive(Debug)]
-    pub struct ProcessLocal<C, R> {
-        feedback_rx: tokio::sync::mpsc::UnboundedReceiver<R>,
-        worker_tx: Sender<C>,
+    pub struct ProcessLocal {
+        feedback_rx: tokio::sync::mpsc::UnboundedReceiver<Response>,
+        worker_tx: crossbeam_channel::Sender<Command>,
         worker_thread: std::thread::Thread,
     }
 
-    #[async_trait]
-    impl<C, R> GenericClient<C, R> for ProcessLocal<C, R>
-    where
-        C: fmt::Debug + Send,
-        R: fmt::Debug + Send,
-    {
-        async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
-            self.worker_tx.send(cmd);
+    #[async_trait::async_trait]
+    impl Client for ProcessLocal {
+        async fn send(&mut self, cmd: Command) {
+            self.worker_tx
+                .send(cmd)
+                .expect("worker command receiver should not drop first");
             self.worker_thread.unpark();
-            Ok(())
         }
 
-        async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
-            Ok(self.feedback_rx.recv().await)
+        async fn recv(&mut self) -> Option<Response> {
+            self.feedback_rx.recv().await
         }
     }
 
-    impl<C, R> ProcessLocal<C, R> {
+    impl ProcessLocal {
         /// Create a new instance of [ProcessLocal] from its parts.
         pub fn new(
-            feedback_rx: tokio::sync::mpsc::UnboundedReceiver<R>,
-            worker_tx: Sender<C>,
+            feedback_rx: tokio::sync::mpsc::UnboundedReceiver<Response>,
+            worker_tx: crossbeam_channel::Sender<Command>,
             worker_thread: std::thread::Thread,
         ) -> Self {
             Self {
@@ -708,189 +633,13 @@ pub mod process_local {
     }
 
     // We implement `Drop` so that we can wake each of the workers and have them notice the drop.
-    impl<C, R> Drop for ProcessLocal<C, R> {
+    impl Drop for ProcessLocal {
         fn drop(&mut self) {
             // Drop the worker handle.
-            self.worker_tx = Sender::new(|_| ());
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            self.worker_tx = tx;
             // Unpark the thread once the handle is dropped, so that it can observe the emptiness.
             self.worker_thread.unpark();
         }
-    }
-}
-
-/// A client to a remote dataflow server.
-pub mod tcp {
-    use std::fmt;
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::time::Duration;
-
-    use async_trait::async_trait;
-    use futures::sink::SinkExt;
-    use futures::stream::StreamExt;
-    use serde::de::DeserializeOwned;
-    use serde::ser::Serialize;
-    use tokio::io::{self, AsyncRead, AsyncWrite};
-    use tokio::net::TcpStream;
-    use tokio::time::{self, Instant};
-    use tokio_serde::formats::Bincode;
-    use tokio_util::codec::LengthDelimitedCodec;
-
-    use crate::client::GenericClient;
-
-    enum TcpConn<C, R> {
-        Disconnected,
-        Connecting(Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>),
-        Backoff(Instant),
-        Connected(FramedClient<TcpStream, C, R>),
-    }
-
-    impl<C, R> fmt::Debug for TcpConn<C, R> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("TcpConn")
-        }
-    }
-
-    /// A client to a remote dataflow server.
-    ///
-    /// If the client experiences errors, it will attempt a reconnection in the `recv` method and
-    /// produce an error for the call in which that reconnection happens, allowing a bearer to
-    /// re-issue commands. As the reconnection happens in `recv()`, the bearer is advised to use
-    /// a `select` style construct to avoid suspending their task by a call to `recv()`.
-    #[derive(Debug)]
-    pub struct TcpClient<C, R> {
-        connection: TcpConn<C, R>,
-        addr: String,
-    }
-
-    impl<C, R> TcpClient<C, R> {
-        /// Creates a new `TcpClient` initially in a disconnected state.
-        ///
-        /// Use the `connect()` method to put the client into a connected state.
-        pub fn new(addr: String) -> TcpClient<C, R> {
-            Self {
-                connection: TcpConn::Disconnected,
-                addr,
-            }
-        }
-
-        /// Reports whether the client is actively connected.
-        pub fn connected(&self) -> bool {
-            matches!(self.connection, TcpConn::Connected(_))
-        }
-
-        /// Connects the underlying `connection`.
-        pub async fn connect(&mut self) {
-            // This is written in state-machine style to be cancellation safe.
-            loop {
-                match &mut self.connection {
-                    TcpConn::Disconnected => {
-                        let connecting = Box::pin(TcpStream::connect(self.addr.clone()));
-                        self.connection = TcpConn::Connecting(connecting);
-                    }
-                    TcpConn::Connecting(connecting) => match connecting.await {
-                        Ok(connection) => {
-                            tracing::info!("Reconnected to {}", self.addr);
-                            self.connection = TcpConn::Connected(framed_client(connection));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Error connecting to {}: {e}; reconnecting in 1s",
-                                self.addr
-                            );
-                            let deadline = Instant::now() + Duration::from_secs(1);
-                            self.connection = TcpConn::Backoff(deadline);
-                        }
-                    },
-                    TcpConn::Backoff(deadline) => {
-                        time::sleep_until(*deadline).await;
-                        self.connection = TcpConn::Disconnected;
-                    }
-                    TcpConn::Connected(_) => break,
-                }
-            }
-        }
-    }
-
-    #[async_trait]
-    impl<C, R> GenericClient<C, R> for TcpClient<C, R>
-    where
-        C: Serialize + fmt::Debug + Send + Unpin,
-        R: DeserializeOwned + fmt::Debug + Send + Unpin,
-    {
-        async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
-            if let TcpConn::Connected(connection) = &mut self.connection {
-                let result = connection.send(cmd).await;
-                if result.is_err() {
-                    self.connection = TcpConn::Disconnected;
-                }
-                Ok(result?)
-            } else {
-                Err(anyhow::anyhow!("Sent into disconnected channel"))
-            }
-        }
-
-        async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
-            if let TcpConn::Connected(connection) = &mut self.connection {
-                match connection.next().await {
-                    Some(Ok(response)) => Ok(Some(response)),
-                    _ => {
-                        self.connection = TcpConn::Disconnected;
-                        self.connect().await;
-                        Err(anyhow::anyhow!("Connection severed; reconnected"))
-                    }
-                }
-            } else {
-                self.connect().await;
-                Err(anyhow::anyhow!("Connection severed; reconnected"))
-            }
-        }
-    }
-
-    /// A framed connection to a dataflowd server.
-    pub type Framed<C, T, U> = tokio_serde::Framed<
-        tokio_util::codec::Framed<C, LengthDelimitedCodec>,
-        T,
-        U,
-        Bincode<T, U>,
-    >;
-
-    /// A framed connection from the server's perspective.
-    pub type FramedServer<A, C, R> = Framed<A, C, R>;
-
-    /// A framed connection from the client's perspective.
-    pub type FramedClient<A, C, R> = Framed<A, R, C>;
-
-    fn length_delimited_codec() -> LengthDelimitedCodec {
-        // NOTE(benesch): using an unlimited maximum frame length is problematic
-        // because Tokio never shrinks its buffer. Sending or receiving one large
-        // message of size N means the client will hold on to a buffer of size
-        // N forever. We should investigate alternative transport protocols that
-        // do not have this limitation.
-        let mut codec = LengthDelimitedCodec::new();
-        codec.set_max_frame_length(usize::MAX);
-        codec
-    }
-
-    /// Constructs a framed connection for the server.
-    pub fn framed_server<A, C, R>(conn: A) -> FramedServer<A, C, R>
-    where
-        A: AsyncRead + AsyncWrite,
-    {
-        tokio_serde::Framed::new(
-            tokio_util::codec::Framed::new(conn, length_delimited_codec()),
-            Bincode::default(),
-        )
-    }
-
-    /// Constructs a framed connection for the client.
-    pub fn framed_client<A, C, R>(conn: A) -> FramedClient<A, C, R>
-    where
-        A: AsyncRead + AsyncWrite,
-    {
-        tokio_serde::Framed::new(
-            tokio_util::codec::Framed::new(conn, length_delimited_codec()),
-            Bincode::default(),
-        )
     }
 }

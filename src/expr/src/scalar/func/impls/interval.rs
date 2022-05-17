@@ -8,11 +8,9 @@
 // by the Apache License, Version 2.0.
 
 use chrono::NaiveTime;
-use num::traits::CheckedNeg;
 
-use crate::EvalError;
-use mz_repr::adt::interval::Interval;
-use mz_repr::strconv;
+use repr::adt::interval::Interval;
+use repr::strconv;
 
 sqlfunc!(
     #[sqlname = "ivtostr"]
@@ -28,17 +26,20 @@ sqlfunc!(
     #[sqlname = "ivtotime"]
     fn cast_interval_to_time(mut i: Interval) -> NaiveTime {
         // Negative durations have their HH::MM::SS.NS values subtracted from 1 day.
-        if i.is_negative() {
-            i = Interval::new(0, 0, 86_400_000_000)
+        if i.duration < 0 {
+            i = Interval::new(0, 86400, 0)
                 .unwrap()
-                .checked_add(&i.as_time_interval())
+                .checked_add(
+                    &Interval::new(0, i.dur_as_secs() % (24 * 60 * 60), i.nanoseconds() as i64)
+                        .unwrap(),
+                )
                 .unwrap();
         }
 
         NaiveTime::from_hms_nano(
             i.hours() as u32,
             i.minutes() as u32,
-            i.seconds::<f64>() as u32,
+            i.seconds() as u32,
             i.nanoseconds() as u32,
         )
     }
@@ -47,29 +48,7 @@ sqlfunc!(
 sqlfunc!(
     #[sqlname = "-"]
     #[preserves_uniqueness = true]
-    fn neg_interval(i: Interval) -> Result<Interval, EvalError> {
-        i.checked_neg().ok_or(EvalError::IntervalOutOfRange)
-    }
-);
-
-sqlfunc!(
-    #[sqlname = "justify_days"]
-    fn justify_days(i: Interval) -> Result<Interval, EvalError> {
-        i.justify_days().map_err(|_| EvalError::IntervalOutOfRange)
-    }
-);
-
-sqlfunc!(
-    #[sqlname = "justify_hours"]
-    fn justify_hours(i: Interval) -> Result<Interval, EvalError> {
-        i.justify_hours().map_err(|_| EvalError::IntervalOutOfRange)
-    }
-);
-
-sqlfunc!(
-    #[sqlname = "justify_interval"]
-    fn justify_interval(i: Interval) -> Result<Interval, EvalError> {
-        i.justify_interval()
-            .map_err(|_| EvalError::IntervalOutOfRange)
+    fn neg_interval(i: Interval) -> Interval {
+        -i
     }
 );

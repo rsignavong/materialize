@@ -42,18 +42,35 @@ That way agents in the builder stack have a warm Cargo and Docker cache, and
 will typically build much faster because they don't need to recompile all
 dependencies.
 
+## Build caching
+
+We once used sccache, a distributed build cache from Mozilla, to share built
+artifacts between agents. Unfortunately, for reasons Nikhil never fully tracked
+down, setting `RUSTC_WRAPPER=sccache` was causing Cargo to always build from
+scratch, a process that was taking 7m+ at the time sccache was removed. Even
+back when things were configured correctly, sccache was unable to cache a
+number of crates, e.g., crates with a build script could not be cached. The
+trouble doesn't seem worth it, unless sccache becomes far more mature.
+
+The current approach is to limit the number of agents that actually build
+Rust to the minimum possible. These agents thus wind up with a warm local Cargo
+cache (i.e., the cache in the `target` directory, which is quite a bit more
+reliable than sccache), and typically only need to rebuild the first-party
+crates that have changed.
+
+These agents build a number of Docker images, each with a name starting with
+`ci-, that are pushed to Docker Hub. Future steps in the build pipeline run
+tests by downloading and orchestrating these Docker images appropriately,
+effectively using Docker Hub for intra-build artifact storage. This system
+isn't ideal, but it's much faster than having each build step compile its own
+binaries.
+
 Note that most of these Docker images don't contain debug symbols, which can
 make debugging CI failures quite challenging, as backtraces won't contain
 function names, only program counters. (The debug symbols are too large to ship
 to Docker Hub; the `ci-test` image would generate several gigabytes of debug
 symbols!) Whenever possible, try to reproduce the CI failure locally to get a
 real backtrace.
-
-## Build caching
-
-We configure [`sccache`](https://github.com/mozilla/sccache) to write
-compilation artifacts to an S3 bucket that is shared amongst the build agents.
-This makes from-scratch compilation on a fresh agent *much* faster.
 
 ## macOS agent
 
@@ -213,8 +230,8 @@ printed by the previous command and run the CI job that is failing.
 
 Every CI job is a combination of an mzcompose "composition" and a "workflow". A
 composition is the name of a directory containing an mzcompose.yml or
-mzcompose.py file. A workflow is the name of a service or Python function to run
-within the composition. You can see the definition of each CI job in
+mzworkflows.py file. A workflow is the name of a service or Python function to
+run within the composition. You can see the definition of each CI job in
 [ci/test/pipeline.template.yml](./test/pipeline.template.yml). To invoke a
 workflow manually, you run `bin/mzcompose --find COMPOSITION run WORKFLOW`.
 
@@ -223,7 +240,7 @@ For example, here's how you'd run the testdrive job on the EC2 instance:
 ```
 bin/scratch ssh INSTANCE-ID
 cd materialize
-bin/mzcompose --find testdrive run default
+bin/mzcompose --find testdrive run testdrive-ci
 ```
 
 If the test fails like it did in CI, you're set! You now have a reliable way to

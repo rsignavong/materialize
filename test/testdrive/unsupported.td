@@ -9,14 +9,12 @@
 
 $ set-sql-timeout duration=125ms
 
-> CREATE TABLE foo (a int)
-
 # DROP MATERIALIZED <anything> is not allowed
 ! DROP MATERIALIZED VIEW foo
-contains:DROP MATERIALIZED VIEW is not allowed, use DROP VIEW
+DROP MATERIALIZED VIEW is not allowed, use DROP VIEW
 
 ! DROP MATERIALIZED SOURCE foo
-contains:DROP MATERIALIZED SOURCE is not allowed, use DROP SOURCE
+DROP MATERIALIZED SOURCE is not allowed, use DROP SOURCE
 
 ! DROP MATERIALIZED TABLE foo
-contains:DROP MATERIALIZED TABLE is not allowed, use DROP TABLE
+DROP MATERIALIZED TABLE is not allowed, use DROP TABLE

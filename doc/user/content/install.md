@@ -1,6 +1,6 @@
 ---
 title: "Install"
-description: "Install the Materialize binary"
+description: "Get started with Materialize"
 menu: "main"
 weight: 2
 ---
@@ -54,29 +54,14 @@ curl -L https://binaries.materialize.com/materialized-{{< version >}}-$(uname -m
 
 ### apt (Ubuntu, Debian, or variants)
 
-{{< note >}}
-These instructions changed between versions 0.8.0 and 0.8.1. If you ran them
+**Note!** These instructions changed between versions 0.8.0 and 0.8.1. If you ran them
 previously, you may need to do so again to continue receiving updates.
-{{</ note >}}
-
 
 ```shell
 # Add the signing key for the Materialize apt repository
 sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 79DEC5E1B7AE7694
 # Add and update the repository
 sudo sh -c 'echo "deb http://apt.materialize.com/ generic main" > /etc/apt/sources.list.d/materialize.list'
-sudo apt update
-# Install materialized
-sudo apt install materialized
-```
-
-### apt DEB822 (Ubuntu jammy/22.04+, Debian bookworm/testing+)
-
-For Debian-based distributions with apt version `2.3.10` or later, we offer a DEB822-compliant sources file to install Materialize:
-
-```shell
-# Add and update the repository
-curl https://dev.materialize.com/apt/materialize.sources | sudo tee /etc/apt/sources.list.d/materialize.sources
 sudo apt update
 # Install materialized
 sudo apt install materialized
@@ -92,13 +77,12 @@ curl -L https://binaries.materialize.com/materialized-{{< version >}}-$(uname -m
 ## Build from source
 
 Materialize is written primarily in Rust, but incorporates several components
-written in C. To build Materialize, you will need the following tools:
+written in C. To build Materialize, you will need to acquire the following
+tools:
 
   * A recent version of Git
 
   * A C compiler that supports C11
-
-  * A C++ compiler that supports C++11
 
   * CMake v3.2+
 
@@ -124,7 +108,7 @@ for the correct release.
 git clone https://github.com/MaterializeInc/materialize.git
 cd materialize
 git checkout {{< version >}}
-cargo build --release --bin materialized
+cargo build --release
 ```
 
 ## Run the binary
@@ -132,10 +116,10 @@ cargo build --release --bin materialized
 You can start the `materialized` process by simply running the binary, e.g.
 
 ```nofmt
-./materialized --workers 1
+./materialized -w 1
 ```
 
-`--workers 1` specifies that the process will use 1 worker. You can also find more detail
+`-w 1` specifies that the process will use 1 worker. You can also find more detail
 about our [command line flags](/cli/#command-line-flags).
 
 By default `materialized` uses:
@@ -145,21 +129,7 @@ Detail | Info
 **Database** | `materialize`
 **Port** | `6875`
 
-### `systemd` service
-
-If you've installed Materialize via [`apt`](#apt-ubuntu-debian-or-variants), you can start it as a service by running:
-
-```shell
-systemctl start materialized.service
-```
-
-To enable the service to start up at boot, run:
-
-```shell
-systemctl enable materialized.service
-```
-
-## CLI Connections
+### CLI Connections
 
 To connect to a running instance, you can use any [Materialize-compatible CLI](/connect/cli/),
 like `psql` or `mzcli`. To install the `psql` client:

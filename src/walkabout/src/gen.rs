@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use fstrings::{f, format_args_f};
 use itertools::Itertools;
 
-use mz_ore::codegen::CodegenBuf;
+use ore::codegen::CodegenBuf;
 
 use crate::ir::{Ir, Item, Type};
 
@@ -316,7 +316,7 @@ fn trait_generics_and_bounds(generics: &BTreeMap<String, BTreeSet<String>>) -> S
         .iter()
         .map(|(ident, bounds)| {
             if bounds.len() == 0 {
-                format!("{}, ", ident)
+                format!("{}, ", ident.to_string())
             } else {
                 format!("{}: {}, ", ident, bounds.iter().join("+"))
             }

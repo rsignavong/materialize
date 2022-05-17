@@ -17,46 +17,39 @@ use std::mem;
 
 use chrono::{DateTime, Utc};
 use derivative::Derivative;
-use mz_dataflow_types::PeekResponseUnary;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::sync::OwnedMutexGuard;
 
-use mz_dataflow_types::client::ComputeInstanceId;
-use mz_expr::GlobalId;
-use mz_pgrepr::Format;
-use mz_repr::{Datum, Diff, Row, ScalarType};
-use mz_sql::ast::{Raw, Statement, TransactionAccessMode};
-use mz_sql::plan::{Params, PlanContext, StatementDesc};
+use expr::GlobalId;
+use pgrepr::Format;
+use repr::{Datum, Diff, Row, ScalarType, Timestamp};
+use sql::ast::{Raw, Statement, TransactionAccessMode};
+use sql::plan::{Params, PlanContext, StatementDesc};
 
-use crate::command::RowsFuture;
-use crate::coord::CoordTimestamp;
 use crate::error::CoordError;
 
 mod vars;
 
-pub use self::vars::{
-    ClientSeverity, Var, Vars, DEFAULT_DATABASE_NAME, SERVER_MAJOR_VERSION, SERVER_MINOR_VERSION,
-    SERVER_PATCH_VERSION,
-};
+pub use self::vars::{Var, Vars};
 
 const DUMMY_CONNECTION_ID: u32 = 0;
 
 /// A session holds per-connection state.
 #[derive(Debug)]
-pub struct Session<T = mz_repr::Timestamp> {
+pub struct Session {
     conn_id: u32,
     prepared_statements: HashMap<String, PreparedStatement>,
     portals: HashMap<String, Portal>,
-    transaction: TransactionStatus<T>,
+    transaction: TransactionStatus,
     pcx: Option<PlanContext>,
     user: String,
     vars: Vars,
-    drop_sinks: Vec<(ComputeInstanceId, GlobalId)>,
+    drop_sinks: Vec<GlobalId>,
 }
 
-impl<T: CoordTimestamp> Session<T> {
+impl Session {
     /// Creates a new session for the specified connection ID.
-    pub fn new(conn_id: u32, user: String) -> Session<T> {
+    pub fn new(conn_id: u32, user: String) -> Session {
         assert_ne!(conn_id, DUMMY_CONNECTION_ID);
         Self::new_internal(conn_id, user)
     }
@@ -65,11 +58,11 @@ impl<T: CoordTimestamp> Session<T> {
     ///
     /// Dummy sessions are intended for use when executing queries on behalf of
     /// the system itself, rather than on behalf of a user.
-    pub fn dummy() -> Session<T> {
+    pub fn dummy() -> Session {
         Self::new_internal(DUMMY_CONNECTION_ID, "mz_system".into())
     }
 
-    fn new_internal(conn_id: u32, user: String) -> Session<T> {
+    fn new_internal(conn_id: u32, user: String) -> Session {
         Session {
             conn_id,
             transaction: TransactionStatus::Default,
@@ -147,9 +140,7 @@ impl<T: CoordTimestamp> Session<T> {
     /// and
     /// > An unnamed portal is destroyed at the end of the transaction
     #[must_use]
-    pub fn clear_transaction(
-        &mut self,
-    ) -> (Vec<(ComputeInstanceId, GlobalId)>, TransactionStatus<T>) {
+    pub fn clear_transaction(&mut self) -> (Vec<GlobalId>, TransactionStatus) {
         self.portals.clear();
         self.pcx = None;
         let drop_sinks = mem::take(&mut self.drop_sinks);
@@ -172,13 +163,13 @@ impl<T: CoordTimestamp> Session<T> {
     }
 
     /// Returns the current transaction status.
-    pub fn transaction(&self) -> &TransactionStatus<T> {
+    pub fn transaction(&self) -> &TransactionStatus {
         &self.transaction
     }
 
     /// Adds operations to the current transaction. An error is produced if they
     /// cannot be merged (i.e., a read cannot be merged to an insert).
-    pub fn add_transaction_ops(&mut self, add_ops: TransactionOps<T>) -> Result<(), CoordError> {
+    pub fn add_transaction_ops(&mut self, add_ops: TransactionOps) -> Result<(), CoordError> {
         match &mut self.transaction {
             TransactionStatus::Started(Transaction { ops, access, .. })
             | TransactionStatus::InTransaction(Transaction { ops, access, .. })
@@ -221,8 +212,8 @@ impl<T: CoordTimestamp> Session<T> {
 
     /// Adds a sink that will need to be dropped when the current transaction is
     /// cleared.
-    pub fn add_drop_sink(&mut self, compute_instance: ComputeInstanceId, name: GlobalId) {
-        self.drop_sinks.push((compute_instance, name));
+    pub fn add_drop_sink(&mut self, name: GlobalId) {
+        self.drop_sinks.push(name);
     }
 
     /// Sets the transaction ops to `TransactionOps::None`. Must only be used after
@@ -233,24 +224,28 @@ impl<T: CoordTimestamp> Session<T> {
         }
     }
 
-    /// Returns the transaction's read timestamp, if set.
-    ///
-    /// Returns `None` if there is no active transaction, or if the active
-    /// transaction is not a read transaction.
-    pub fn get_transaction_timestamp(&self) -> Option<T> {
+    /// Assumes an active transaction. Returns its read timestamp. Errors if not
+    /// a read transaction. Calls get_ts to get a timestamp if the transaction
+    /// doesn't have an operation yet, converting the transaction to a read.
+    pub fn get_transaction_timestamp<F: FnMut() -> Result<Timestamp, CoordError>>(
+        &mut self,
+        mut get_ts: F,
+    ) -> Result<Timestamp, CoordError> {
         // If the transaction already has a peek timestamp, use it. Otherwise generate
         // one. We generate one even though we could check here that the transaction
         // isn't in some other conflicting state because we want all of that logic to
         // reside in add_transaction_ops.
-        match self.transaction.inner() {
+        let ts = match self.transaction.inner() {
             Some(Transaction {
                 pcx: _,
                 ops: TransactionOps::Peeks(ts),
                 write_lock_guard: _,
                 access: _,
-            }) => Some(ts.clone()),
-            _ => None,
-        }
+            }) => *ts,
+            _ => get_ts()?,
+        };
+        self.add_transaction_ops(TransactionOps::Peeks(ts))?;
+        Ok(ts)
     }
 
     /// Registers the prepared statement under `name`.
@@ -309,8 +304,7 @@ impl<T: CoordTimestamp> Session<T> {
         desc: StatementDesc,
         stmt: Option<Statement<Raw>>,
         params: Vec<(Datum, ScalarType)>,
-        result_formats: Vec<mz_pgrepr::Format>,
-        catalog_revision: u64,
+        result_formats: Vec<pgrepr::Format>,
     ) -> Result<(), CoordError> {
         // The empty portal can be silently replaced.
         if !portal_name.is_empty() && self.portals.contains_key(&portal_name) {
@@ -321,7 +315,6 @@ impl<T: CoordTimestamp> Session<T> {
             Portal {
                 stmt,
                 desc,
-                catalog_revision,
                 parameters: Params {
                     datums: Row::pack(params.iter().map(|(d, _t)| d)),
                     types: params.into_iter().map(|(_d, t)| t).collect(),
@@ -343,14 +336,14 @@ impl<T: CoordTimestamp> Session<T> {
     /// Retrieves a reference to the specified portal.
     ///
     /// If there is no such portal, returns `None`.
-    pub fn get_portal_unverified(&self, portal_name: &str) -> Option<&Portal> {
+    pub fn get_portal(&self, portal_name: &str) -> Option<&Portal> {
         self.portals.get(portal_name)
     }
 
     /// Retrieves a mutable reference to the specified portal.
     ///
     /// If there is no such portal, returns `None`.
-    pub fn get_portal_unverified_mut(&mut self, portal_name: &str) -> Option<&mut Portal> {
+    pub fn get_portal_mut(&mut self, portal_name: &str) -> Option<&mut Portal> {
         self.portals.get_mut(portal_name)
     }
 
@@ -361,7 +354,6 @@ impl<T: CoordTimestamp> Session<T> {
         desc: StatementDesc,
         parameters: Params,
         result_formats: Vec<Format>,
-        catalog_revision: u64,
     ) -> Result<String, CoordError> {
         // See: https://github.com/postgres/postgres/blob/84f5c2908dad81e8622b0406beea580e40bb03ac/src/backend/utils/mmgr/portalmem.c#L234
 
@@ -373,7 +365,6 @@ impl<T: CoordTimestamp> Session<T> {
                     entry.insert(Portal {
                         stmt,
                         desc,
-                        catalog_revision,
                         parameters,
                         result_formats,
                         state: PortalState::NotStarted,
@@ -388,7 +379,7 @@ impl<T: CoordTimestamp> Session<T> {
 
     /// Resets the session to its initial state. Returns sinks that need to be
     /// dropped.
-    pub fn reset(&mut self) -> Vec<(ComputeInstanceId, GlobalId)> {
+    pub fn reset(&mut self) -> Vec<GlobalId> {
         let (drop_sinks, _) = self.clear_transaction();
         self.prepared_statements.clear();
         self.vars = Vars::default();
@@ -472,12 +463,10 @@ pub struct Portal {
     pub stmt: Option<Statement<Raw>>,
     /// The statement description.
     pub desc: StatementDesc,
-    /// The most recent catalog revision that has verified this statement.
-    pub catalog_revision: u64,
     /// The bound values for the parameters in the prepared statement, if any.
     pub parameters: Params,
     /// The desired output format for each column in the result set.
-    pub result_formats: Vec<mz_pgrepr::Format>,
+    pub result_formats: Vec<pgrepr::Format>,
     /// The execution state of the portal.
     #[derivative(Debug = "ignore")]
     pub state: PortalState,
@@ -512,41 +501,43 @@ impl InProgressRows {
             remaining,
         }
     }
+
+    /// Creates a new InProgressRows from a single batch of rows.
+    pub fn single_batch(rows: Vec<Row>) -> Self {
+        let (_tx, rx) = unbounded_channel();
+        Self {
+            current: Some(rows),
+            remaining: rx,
+        }
+    }
 }
 
 /// A channel of batched rows.
-pub type RowBatchStream = UnboundedReceiver<PeekResponseUnary>;
-
-/// Converts a RowsFuture to a RowBatchStream.
-pub async fn row_future_to_stream(rows: RowsFuture) -> RowBatchStream {
-    let (tx, rx) = unbounded_channel();
-    tx.send(rows.await).expect("send must succeed");
-    rx
-}
+pub type RowBatchStream = UnboundedReceiver<Vec<Row>>;
 
 /// The transaction status of a session.
 ///
 /// PostgreSQL's transaction states are in backend/access/transam/xact.c.
 #[derive(Debug)]
-pub enum TransactionStatus<T> {
+pub enum TransactionStatus {
     /// Idle. Matches `TBLOCK_DEFAULT`.
     Default,
     /// Running a single-query transaction. Matches `TBLOCK_STARTED`.
-    Started(Transaction<T>),
+    Started(Transaction),
     /// Currently in a transaction issued from a `BEGIN`. Matches `TBLOCK_INPROGRESS`.
-    InTransaction(Transaction<T>),
+    InTransaction(Transaction),
     /// Currently in an implicit transaction started from a multi-statement query
     /// with more than 1 statements. Matches `TBLOCK_IMPLICIT_INPROGRESS`.
-    InTransactionImplicit(Transaction<T>),
+    InTransactionImplicit(Transaction),
     /// In a failed transaction that was started explicitly (i.e., previously
     /// InTransaction). We do not use Failed for implicit transactions because
     /// those cleanup after themselves. Matches `TBLOCK_ABORT`.
-    Failed(Transaction<T>),
+    Failed(Transaction),
 }
 
-impl<T> TransactionStatus<T> {
+impl TransactionStatus {
     /// Extracts the inner transaction ops if not failed.
-    pub fn into_ops(self) -> Option<TransactionOps<T>> {
+    pub fn into_ops(self) -> Option<TransactionOps> {
         match self {
             TransactionStatus::Default | TransactionStatus::Failed(_) => None,
             TransactionStatus::Started(txn)
@@ -556,7 +547,7 @@ impl<T> TransactionStatus<T> {
     }
 
     /// Exposes the inner transaction.
-    pub fn inner(&self) -> Option<&Transaction<T>> {
+    pub fn inner(&self) -> Option<&Transaction> {
         match self {
             TransactionStatus::Default => None,
             TransactionStatus::Started(txn)
@@ -567,7 +558,7 @@ impl<T> TransactionStatus<T> {
     }
 
     /// Exposes the inner transaction.
-    pub fn inner_mut(&mut self) -> Option<&mut Transaction<T>> {
+    pub fn inner_mut(&mut self) -> Option<&mut Transaction> {
         match self {
             TransactionStatus::Default => None,
             TransactionStatus::Started(txn)
@@ -605,7 +596,7 @@ impl<T> TransactionStatus<T> {
     }
 }
 
-impl<T> Default for TransactionStatus<T> {
+impl Default for TransactionStatus {
     fn default() -> Self {
         TransactionStatus::Default
     }
@@ -613,18 +604,18 @@ impl<T> Default for TransactionStatus<T> {
 
 /// State data for transactions.
 #[derive(Debug)]
-pub struct Transaction<T> {
+pub struct Transaction {
     /// Plan context.
     pub pcx: PlanContext,
     /// Transaction operations.
-    pub ops: TransactionOps<T>,
+    pub ops: TransactionOps,
     /// Holds the coordinator's write lock.
     write_lock_guard: Option<OwnedMutexGuard<()>>,
     /// Access mode (read only, read write).
     access: Option<TransactionAccessMode>,
 }
 
-impl<T> Transaction<T> {
+impl Transaction {
     /// Grants the write lock to this transaction for the remainder of its lifetime.
     fn grant_write_lock(&mut self, guard: OwnedMutexGuard<()>) {
         self.write_lock_guard = Some(guard);
@@ -637,12 +628,12 @@ impl<T> Transaction<T> {
 /// a transaction. Use this to record what we have done, and what may need to
 /// happen at commit.
 #[derive(Debug, Clone, PartialEq)]
-pub enum TransactionOps<T> {
+pub enum TransactionOps {
     /// The transaction has been initiated, but no statement has yet been executed
     /// in it.
     None,
     /// This transaction has had a peek (`SELECT`, `TAIL`) and must only do other peeks.
-    Peeks(T),
+    Peeks(Timestamp),
     /// This transaction has done a TAIL and must do nothing else.
     Tail,
     /// This transaction has had a write (`INSERT`, `UPDATE`, `DELETE`) and must only do

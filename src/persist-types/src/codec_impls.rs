@@ -9,19 +9,14 @@
 
 //! Implementations of [Codec] for stdlib types.
 
-use bytes::BufMut;
-
-use crate::{Codec, Codec64};
+use crate::Codec;
 
 impl Codec for () {
     fn codec_name() -> String {
         "()".into()
     }
 
-    fn encode<B>(&self, _buf: &mut B)
-    where
-        B: BufMut,
-    {
+    fn encode<E: for<'a> Extend<&'a u8>>(&self, _buf: &mut E) {
         // No-op.
     }
 
@@ -38,11 +33,8 @@ impl Codec for String {
         "String".into()
     }
 
-    fn encode<B>(&self, buf: &mut B)
-    where
-        B: BufMut,
-    {
-        buf.put(self.as_bytes())
+    fn encode<E: for<'a> Extend<&'a u8>>(&self, buf: &mut E) {
+        buf.extend(self.as_bytes())
     }
 
     fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
@@ -55,11 +47,8 @@ impl Codec for Vec<u8> {
         "Vec<u8>".into()
     }
 
-    fn encode<B>(&self, buf: &mut B)
-    where
-        B: BufMut,
-    {
-        buf.put(self.as_slice())
+    fn encode<E: for<'a> Extend<&'a u8>>(&self, buf: &mut E) {
+        buf.extend(self)
     }
 
     fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
@@ -74,17 +63,14 @@ impl<T: Codec, E: Codec> Codec for Result<T, E> {
         "Result".into()
     }
 
-    fn encode<B>(&self, buf: &mut B)
-    where
-        B: BufMut,
-    {
+    fn encode<B: for<'a> Extend<&'a u8>>(&self, buf: &mut B) {
         match self {
             Ok(r) => {
-                buf.put(&[RESULT_OK][..]);
+                buf.extend(&[RESULT_OK]);
                 r.encode(buf);
             }
             Err(err) => {
-                buf.put(&[RESULT_ERR][..]);
+                buf.extend(&[RESULT_ERR]);
                 err.encode(buf);
             }
         }
@@ -104,34 +90,6 @@ impl<T: Codec, E: Codec> Codec for Result<T, E> {
             typ => return Err(format!("Unexpected Result variant: {}.", typ)),
         };
         Ok(result)
-    }
-}
-
-impl Codec64 for i64 {
-    fn codec_name() -> String {
-        "i64".to_owned()
-    }
-
-    fn encode(&self) -> [u8; 8] {
-        self.to_le_bytes()
-    }
-
-    fn decode(buf: [u8; 8]) -> Self {
-        i64::from_le_bytes(buf)
-    }
-}
-
-impl Codec64 for u64 {
-    fn codec_name() -> String {
-        "u64".to_owned()
-    }
-
-    fn encode(&self) -> [u8; 8] {
-        self.to_le_bytes()
-    }
-
-    fn decode(buf: [u8; 8]) -> Self {
-        u64::from_le_bytes(buf)
     }
 }
 

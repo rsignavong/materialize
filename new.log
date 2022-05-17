@@ -1,0 +1,34 @@
+    Finished release [optimized + debuginfo] target(s) in 0.35s
+     Running `target/release/materialized --experimental`
+<jemalloc>: option background_thread currently supports pthread only
+=======================================================================
+Thank you for trying Materialize!
+
+We are interested in any and all feedback you have, which may be able
+to improve both our software and your queries! Please reach out at:
+
+    Web: https://materialize.com
+    GitHub issues: https://github.com/MaterializeInc/materialize/issues
+    Email: support@materialize.com
+    Twitter: @MaterializeInc
+=======================================================================
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                                WARNING!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Starting Materialize in experimental mode means:
+
+- This node's catalog of views and sources are unstable.
+
+If you use any version of Materialize besides this one, you might
+not be able to start the Materialize node. To fix this, you'll have
+to remove all of Materialize's data (e.g. rm -rf mzdata) and start
+the node anew.
+
+- You must always start this node in experimental mode; it can no
+longer be started in non-experimental/regular mode.
+
+For more details, see https://materialize.com/docs/cli#experimental-mode
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+materialized v0.9.11-dev (1dae8d8b5) listening on 0.0.0.0:6875...

@@ -25,9 +25,8 @@ better availability and durability story.
 
 ### C components
 
-Materialize depends on several components that are written in C and C++, so
-you'll need a working C and C++ toolchain. You'll also need to install the
-[CMake] build system.
+Materialize depends on several components that are written in C, so you'll need
+a working C compiler. You'll also need to install the [CMake] build system.
 
 On macOS, if you install [Homebrew], you'll be guided through the process of
 installing Apple's developer tools, which includes a C compiler. Then it's a
@@ -54,62 +53,12 @@ Install Rust via [rustup]:
 curl https://sh.rustup.rs -sSf | sh
 ```
 
+Rustup will automatically select the correct toolchain version specified in
+[rust-toolchain.toml](/rust-toolchain.toml).
+
 We recommend that you do _not_ install Rust via your system's package manager.
 We closely track the most recent version of Rust. The version of Rust in your
 package manager is likely too old to build Materialize.
-
-### Editors and IDEs
-
-In principle, any text editor can be used to edit Rust code. There is nothing special about Materialize's codebase: any general Rust development setup should work fine.
-
-By default, we recomend that developers without a strong preference of editor use
-Visual Studio Code with the Rust-Analyzer plugin. This is the most mainstream
-setup for developing Materialize, and the one for which you are the most likely
-to be able to get help if something goes wrong. It's important to note that you
-**should not** install the "Rust" plugin, as it is known to
-conflict with Rust-Analyzer; the latter has far more advanced code navigation
-features and is the de-facto standard for developing Rust.
-
-Visual Studio Code also works well for editing Python; to work on the Python code
-in the Materialize repository, install the official Python extension from Microsoft
-and add the following to your `settings.json`.
-
-``` json
-{
-  "python.linting.mypyEnabled": true,
-  "python.analysis.extraPaths": [
-      "misc/python"
-  ],
-  "python.defaultInterpreterPath": "misc/python/venv/bin/python"
-}
-```
-
-If you prefer to use another editor, such as Vim or Emacs, we recommend that
-you install an LSP plugin with Rust-Analyzer. How to do so is beyond the scope
-of this document; if you have any issues, ask in one of the engineering channels
-on Slack.
-
-Besides Rust-Analyzer, the only other known tool with good code navigation features
-is CLion along with its Rust plugin. This is a good choice for developers who prefer
-the JetBrains ecosystem, but we no longer recommend it by default, since
-Rust-Analyzer has long since caught up to it in maturity. If you are a
-Materialize employee, ask Nikhil Benesch on Slack for access to our corporate
-JetBrains license. If you're not yet sure you want to use CLion, you can
-use the 30-day free trial.
-
-### Debugging
-
-The standard debuggers for Rust code are `rust-lldb` on macOS, and `rust-gdb` on GNU/Linux.
-(It is also possible to run `rust-lldb` on GNU/Linux if necessary for whatever reason).
-These are wrappers around `lldb` and `gdb`, respectively, that endow them with slightly
-improved capabilities for pretty-printing Rust data structures. Visual Studio Code
-users may want to try the [CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb)
-plugin.
-
-Unfortunately, you will soon find that these programs work less well than the equivalent
-tools for some other mainstream programming languages. In particular, inspecting
-complex data structures is often tedious and difficult. For this reason, most developers routinely use
-`println!` statements for debugging, in addition to (or instead of) these standard debuggers.
 
 ### Confluent Platform
 
@@ -154,13 +103,6 @@ curl http://packages.confluent.io/archive/7.0/confluent-7.0.1.tar.gz | tar -xC $
 echo export CONFLUENT_HOME=(cd $INSTALL_DIR && pwd) >> ~/.bashrc
 source ~/.bashrc
 confluent local services start
-```
-
-If you have multiple JDKs installed and your current JAVA_HOME points to an incompatible version,
-you can explicitly run confluent with JDK 8 or 11:
-
-```
-JAVA_HOME=$(/usr/libexec/java_home -v 1.8) confluent local services start
 ```
 
 #### Linux
@@ -268,22 +210,14 @@ own document. See [Developer guide: testing](guide-testing.md).
 CI performs the lawful evil task of ensuring "good code style" with the
 following tools:
 
-Tool                  | Use                     | Run locally with
-----------------------|-------------------------|-------------------
-[Clippy]              | Rust semantic nits      | `./bin/check`
-[rustfmt]             | Rust code formatter     | `cargo fmt`
-Linter                | General formatting nits | `./bin/lint`
-[Unused dependencies] | Check for unused deps   | `./bin/unused-deps`
+Tool      | Use                     | Run locally with
+----------|-------------------------|-------------------
+[Clippy]  | Rust semantic nits      | `./bin/check`
+[rustfmt] | Rust code formatter     | `cargo fmt`
+Linter    | General formatting nits | `./bin/lint`
 
 See also the [style guide](style.md) for some additional soft
 recommendations.
-
-### Unused dependencies
-
-Use `.bin/unused-deps`. This is also run in ci; use this
-[guide][https://github.com/est31/cargo-udeps#ignoring-some-of-the-dependencies]
-for information about how to ignore false-positives. Common examples are
-dependencies only used on certain platforms.
 
 ## Submitting and reviewing changes
 
@@ -331,11 +265,11 @@ acceptable for:
     entry. Changes to Materialize very rarely require changes in rust-sasl, so
     maintaining the two separately does not introduce much overhead.
 
-## Code organization
+## Our Crates
 
-We break our code into crates for several reasons, but primarily to promote organization of code by team, thereby introducing ownership and autonomy. As such, many crates are owned by a specific team (which does not preclude the existence of shared, cross-team crates).
-
-Although the primary unit of code organization at the inter-team level is the crate, modules within a crate are also useful for code organization, especially because they are the level at which `pub` visibility operates.
+We break up our rust code into crates mostly to improve compilation time, but
+also sometimes because our code is intended to be open sourced or to be re-used
+between different binaries.
 
 You can view a relationship diagram of our crates by running the following
 command:
@@ -350,49 +284,11 @@ It is possible to view transitive dependencies of a select subset of roots by sp
 bin/crate-diagram --roots sql,dataflow
 ```
 
-## Developer tools
-
-The Materialize repo contains many useful scripts that can be included in your environment
-to improve your development experience.
-
-### Automatic style checks
-
-To ensure each code change passes all style nits before pushing to GitHub, symlink `pre-push`
-into your local git hooks:
-
-```sh
-ln -s ./misc/githooks/pre-push .git/hooks/pre-push
-```
-
-### Shell completion
-
-Some Materialize scripts have shell completion, and the latest versions of the completions files
-are checked in to `misc/completions`. The contents of this directory can be sourced into your shell,
-and will stay updated as any changes are made.
-
-To add the completions to bash, add the following to your `~/.bashrc`:
-
-```shell
-source /path/to/materialize/misc/completions/bash/*
-```
-
-For zsh, add the follow to your `~/.zshrc`:
-
-```shell
-source /path/to/materialize/misc/completions/zsh/*
-```
-
-### Editor add-ons
-
-A few editor-specific add-ons and configurations have been authored to improve the editing of
-Materialize-specific code. Check `misc/editor` for add-ons that may be relevant for your editor
-of choice.
 
 [Apache Kafka]: https://kafka.apache.org
 [Apache ZooKeeper]: https://zookeeper.apache.org
 [askama]: https://github.com/djc/askama
 [Clippy]: https://github.com/rust-lang/rust-clippy
-[Unused dependencies]: https://github.com/est31/cargo-udeps
 [CMake]: https://cmake.org
 [Confluent CLI]: https://docs.confluent.io/current/cli/installing.html#scripted-installation
 [Confluent Platform]: https://www.confluent.io/product/confluent-platform/

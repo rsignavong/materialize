@@ -43,7 +43,7 @@
 ! INSERT INTO t SELECT * FROM (
     VALUES ('11', '12', 'f')
   );
-contains:column "i" is of type integer but expression is of type text
+column "i" is of type integer but expression is of type text
 
 > BEGIN
 
@@ -52,7 +52,7 @@ contains:column "i" is of type integer but expression is of type text
 ! INSERT INTO t SELECT * FROM (
     VALUES (13, 14, 'g')
   );
-contains:cannot be run inside a transaction block
+cannot be run inside a transaction block
 
 > COMMIT
 
@@ -68,14 +68,14 @@ contains:cannot be run inside a transaction block
 ! INSERT INTO t SELECT * FROM (
     VALUES (11, 12, 'f')
   );
-contains:cannot be run inside a transaction block
+cannot be run inside a transaction block
 
 > COMMIT
 
 > CREATE MATERIALIZED VIEW v (a, b, c) AS SELECT 11, 12::real, 'f';
 
 ! INSERT INTO t SELECT * FROM v;
-contains:invalid selection
+invalid selection
 
 # Table check descends into select targets
 ! INSERT INTO t (i, f, t) SELECT column1, column2, column3
@@ -84,7 +84,7 @@ contains:invalid selection
         SELECT a, b, c FROM v
     ) AS y
     ON y.a = column1
-contains:invalid selection
+invalid selection
 
 # Multiple connections
 

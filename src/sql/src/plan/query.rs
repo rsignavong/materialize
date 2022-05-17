@@ -15,55 +15,43 @@
 //! plan_* functions which correspond to operations on scalars typically return a `HirScalarExpr` and a `ScalarType`. (The latter is because it's not always possible to infer from a `HirScalarExpr` what the intended type is - notably in the case of decimals where the scale/precision are encoded only in the type).
 
 //! Aggregates are particularly twisty.
-//!
-//! In SQL, a GROUP BY turns any columns not in the group key into vectors of
-//! values. Then anywhere later in the scope, an aggregate function can be
-//! applied to that group. Inside the arguments of an aggregate function, other
-//! normal functions are applied element-wise over the vectors. Thus `SELECT
-//! sum(foo.x + foo.y) FROM foo GROUP BY x` means adding the scalar `x` to the
-//! vector `y` and summing the results.
-//!
-//! In `HirRelationExpr`, aggregates can only be applied immediately at the time
-//! of grouping.
-//!
-//! To deal with this, whenever we see a SQL GROUP BY we look ahead for
-//! aggregates and precompute them in the `HirRelationExpr::Reduce`. When we
-//! reach the same aggregates during normal planning later on, we look them up
-//! in an `ExprContext` to find the precomputed versions.
+//! In SQL, a GROUP BY turns any columns not in the group key into vectors of values. Then anywhere later in the scope, an aggregate function can be applied to that group. Inside the arguments of an aggregate function, other normal functions are applied element-wise over the vectors. Thus `SELECT sum(foo.x + foo.y) FROM foo GROUP BY x` means adding the scalar `x` to the vector `y` and summing the results.
+//! In `HirRelationExpr`, aggregates can only be applied immediately at the time of grouping.
+//! To deal with this, whenever we see a SQL GROUP BY we look ahead for aggregates and precompute them in the `HirRelationExpr::Reduce`. When we reach the same aggregates during normal planning later on, we look them up in an `ExprContext` to find the precomputed versions.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
-
+use std::fmt;
 use std::iter;
 use std::mem;
 
+use expr::{func as expr_func, LocalId};
 use itertools::Itertools;
-use uuid::Uuid;
-
-use mz_expr::{func as expr_func, GlobalId, Id, LocalId, MirScalarExpr, RowSetFinishing};
-use mz_ore::collections::CollectionExt;
-use mz_ore::stack::{CheckedRecursion, RecursionGuard};
-use mz_ore::str::StrExt;
-use mz_repr::adt::char::CharLength;
-use mz_repr::adt::numeric::{NumericMaxScale, NUMERIC_DATUM_MAX_PRECISION};
-use mz_repr::adt::varchar::VarCharMaxLength;
-use mz_repr::{
-    strconv, ColumnName, ColumnType, Datum, RelationDesc, RelationType, Row, RowArena, ScalarType,
-};
-
-use mz_sql_parser::ast::visit_mut::{self, VisitMut};
-use mz_sql_parser::ast::{
-    Assignment, DeleteStatement, Distinct, Expr, Function, FunctionArgs, HomogenizingFunction,
+use ore::stack::{CheckedRecursion, RecursionGuard};
+use ore::str::StrExt;
+use sql_parser::ast::display::{AstDisplay, AstFormatter};
+use sql_parser::ast::fold::Fold;
+use sql_parser::ast::visit::{self, Visit};
+use sql_parser::ast::{
+    Assignment, AstInfo, Cte, DataType, DeleteStatement, Distinct, Expr, Function, FunctionArgs,
     Ident, InsertSource, IsExprConstruct, Join, JoinConstraint, JoinOperator, Limit, OrderByExpr,
-    Query, Select, SelectItem, SetExpr, SetOperator, SubscriptPosition, TableAlias, TableFactor,
-    TableFunction, TableWithJoins, UnresolvedObjectName, UpdateStatement, Value, Values,
+    Query, Raw, RawName, Select, SelectItem, SetExpr, SetOperator, Statement, SubscriptPosition,
+    TableAlias, TableFactor, TableFunction, TableWithJoins, UnresolvedObjectName, UpdateStatement,
+    Value, Values,
 };
 
-use crate::catalog::{CatalogItemType, CatalogType, SessionCatalog};
+use ::expr::{GlobalId, Id, RowSetFinishing};
+use repr::adt::numeric;
+use repr::{
+    strconv, ColumnName, ColumnType, Datum, RelationDesc, RelationType, Row, RowArena, ScalarType,
+    Timestamp,
+};
+
+use crate::catalog::{CatalogItemType, SessionCatalog};
 use crate::func::{self, Func, FuncSpec};
-use crate::names::{Aug, PartialObjectName, ResolvedDataType, ResolvedObjectName};
+use crate::names::PartialName;
 use crate::normalize;
 use crate::plan::error::PlanError;
 use crate::plan::expr::{
@@ -75,13 +63,268 @@ use crate::plan::plan_utils::{self, JoinSide};
 use crate::plan::scope::{Scope, ScopeItem};
 use crate::plan::statement::{StatementContext, StatementDesc};
 use crate::plan::typeconv::{self, CastContext};
+use crate::plan::Params;
 use crate::plan::{transform_ast, PlanContext};
-use crate::plan::{Params, QueryWhen};
+
+// Aug is the type variable assigned to an AST that has already been
+// name-resolved. An AST in this state has global IDs populated next to table
+// names, and local IDs assigned to CTE definitions and references.
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone, Default)]
+pub struct Aug;
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct ResolvedObjectName {
+    pub id: Id,
+    pub raw_name: PartialName,
+    // Whether this object, when printed out, should use [id AS name] syntax. We
+    // want this for things like tables and sources, but not for things like
+    // types.
+    pub print_id: bool,
+}
+
+impl AstDisplay for ResolvedObjectName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        if self.print_id {
+            f.write_str(format!("[{} AS ", self.id));
+        }
+        let n = self.raw_name();
+        if let Some(database) = n.database {
+            f.write_node(&Ident::new(database));
+            f.write_str(".");
+        }
+        if let Some(schema) = n.schema {
+            f.write_node(&Ident::new(schema));
+            f.write_str(".");
+        }
+        f.write_node(&Ident::new(n.item));
+        if self.print_id {
+            f.write_str("]");
+        }
+    }
+}
+
+impl std::fmt::Display for ResolvedObjectName {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.to_ast_string().as_str())
+    }
+}
+
+impl ResolvedObjectName {
+    pub fn raw_name(&self) -> PartialName {
+        self.raw_name.clone()
+    }
+}
+
+impl AstInfo for Aug {
+    type ObjectName = ResolvedObjectName;
+    type Id = Id;
+}
+
+#[derive(Debug)]
+struct NameResolver<'a> {
+    catalog: &'a dyn SessionCatalog,
+    ctes: HashMap<String, LocalId>,
+    status: Result<(), PlanError>,
+    ids: HashSet<GlobalId>,
+}
+
+impl<'a> NameResolver<'a> {
+    pub fn new(catalog: &'a dyn SessionCatalog) -> NameResolver {
+        NameResolver {
+            catalog,
+            ctes: HashMap::new(),
+            status: Ok(()),
+            ids: HashSet::new(),
+        }
+    }
+}
+
+impl<'a> Fold<Raw, Aug> for NameResolver<'a> {
+    fn fold_query(&mut self, q: Query<Raw>) -> Query<Aug> {
+        // Retain the old values of various CTE names so that we can restore them after we're done
+        // planning this SELECT.
+        let mut old_cte_values = Vec::new();
+        // A single WITH block cannot use the same name multiple times.
+        let mut used_names = HashSet::new();
+        let mut ctes = Vec::new();
+        for cte in q.ctes {
+            let cte_name = normalize::ident(cte.alias.name.clone());
+
+            if used_names.contains(&cte_name) {
+                self.status = Err(PlanError::Unstructured(format!(
+                    "WITH query name \"{}\" specified more than once",
+                    cte_name
+                )));
+            }
+            used_names.insert(cte_name.clone());
+
+            let id = LocalId::new(self.ctes.len() as u64);
+            ctes.push(Cte {
+                alias: cte.alias,
+                id: Id::Local(id),
+                query: self.fold_query(cte.query),
+            });
+            let old_val = self.ctes.insert(cte_name.clone(), id);
+            old_cte_values.push((cte_name, old_val));
+        }
+        let result = Query {
+            ctes,
+            body: self.fold_set_expr(q.body),
+            limit: q.limit.map(|l| self.fold_limit(l)),
+            offset: q.offset.map(|l| self.fold_expr(l)),
+            order_by: q
+                .order_by
+                .into_iter()
+                .map(|c| self.fold_order_by_expr(c))
+                .collect(),
+        };
+
+        // Restore the old values of the CTEs.
+        for (name, value) in old_cte_values.iter() {
+            match value {
+                Some(value) => {
+                    self.ctes.insert(name.to_string(), value.clone());
+                }
+                None => {
+                    self.ctes.remove(name);
+                }
+            };
+        }
+
+        result
+    }
+
+    fn fold_id(&mut self, _id: <Raw as AstInfo>::Id) -> <Aug as AstInfo>::Id {
+        panic!("this should have been handled when walking the CTE");
+    }
+
+    fn fold_object_name(
+        &mut self,
+        object_name: <Raw as AstInfo>::ObjectName,
+    ) -> <Aug as AstInfo>::ObjectName {
+        match object_name {
+            RawName::Name(raw_name) => {
+                // Check if unqualified name refers to a CTE.
+                if raw_name.0.len() == 1 {
+                    let norm_name = normalize::ident(raw_name.0[0].clone());
+                    if let Some(id) = self.ctes.get(&norm_name) {
+                        return ResolvedObjectName {
+                            id: Id::Local(*id),
+                            raw_name: normalize::unresolved_object_name(raw_name).unwrap(),
+                            print_id: false,
+                        };
+                    }
+                }
+
+                let name = normalize::unresolved_object_name(raw_name).unwrap();
+                match self.catalog.resolve_item(&name) {
+                    Ok(item) => {
+                        self.ids.insert(item.id());
+                        let print_id = !matches!(
+                            item.item_type(),
+                            CatalogItemType::Func | CatalogItemType::Type
+                        );
+                        ResolvedObjectName {
+                            id: Id::Global(item.id()),
+                            raw_name: item.name().clone().into(),
+                            print_id,
+                        }
+                    }
+                    Err(e) => {
+                        if self.status.is_ok() {
+                            self.status = Err(e.into());
+                        }
+                        ResolvedObjectName {
+                            id: Id::Local(LocalId::new(0)),
+                            raw_name: name,
+                            print_id: false,
+                        }
+                    }
+                }
+            }
+            RawName::Id(id, raw_name) => {
+                let gid: GlobalId = match id.parse() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.status = Err(e.into());
+                        GlobalId::User(0)
+                    }
+                };
+                if self.status.is_ok() && self.catalog.try_get_item_by_id(&gid).is_none() {
+                    self.status = Err(PlanError::Unstructured(format!("invalid id {}", &gid)));
+                }
+                self.ids.insert(gid.clone());
+                ResolvedObjectName {
+                    id: Id::Global(gid),
+                    raw_name: normalize::unresolved_object_name(raw_name).unwrap(),
+                    print_id: true,
+                }
+            }
+        }
+    }
+}
+
+pub fn resolve_names_stmt(
+    catalog: &dyn SessionCatalog,
+    stmt: Statement<Raw>,
+) -> Result<Statement<Aug>, PlanError> {
+    let mut n = NameResolver::new(catalog);
+    let result = n.fold_statement(stmt);
+    n.status?;
+    Ok(result)
+}
+
+// Attaches additional information to a `Raw` AST, resulting in an `Aug` AST, by
+// resolving names and (aspirationally) performing semantic analysis such as
+// type-checking.
+pub fn resolve_names(qcx: &mut QueryContext, query: Query<Raw>) -> Result<Query<Aug>, PlanError> {
+    let mut n = NameResolver::new(qcx.scx.catalog);
+    let result = n.fold_query(query);
+    n.status?;
+    qcx.ids.extend(n.ids.iter());
+    Ok(result)
+}
+
+pub fn resolve_names_expr(qcx: &mut QueryContext, expr: Expr<Raw>) -> Result<Expr<Aug>, PlanError> {
+    let mut n = NameResolver::new(qcx.scx.catalog);
+    let result = n.fold_expr(expr);
+    n.status?;
+    qcx.ids.extend(n.ids.iter());
+    Ok(result)
+}
+
+pub fn resolve_names_data_type(
+    scx: &StatementContext,
+    data_type: DataType<Raw>,
+) -> Result<(DataType<Aug>, HashSet<GlobalId>), PlanError> {
+    let mut n = NameResolver::new(scx.catalog);
+    let result = n.fold_data_type(data_type);
+    n.status?;
+    Ok((result, n.ids))
+}
+
+/// A general implementation for name resolution on AST elements.
+///
+/// This implementation is appropriate Whenever:
+/// - You don't need to export the name resolution outside the `sql` crate and
+///   the extra typing isn't too onerous.
+/// - Discovered dependencies should extend `qcx.ids`.
+fn resolve_names_extend_qcx_ids<F, T>(qcx: &mut QueryContext, f: F) -> Result<T, PlanError>
+where
+    F: FnOnce(&mut NameResolver) -> T,
+{
+    let mut n = NameResolver::new(qcx.scx.catalog);
+    let result = f(&mut n);
+    n.status?;
+    qcx.ids.extend(n.ids.iter());
+    Ok(result)
+}
 
 pub struct PlannedQuery<E> {
     pub expr: E,
     pub desc: RelationDesc,
     pub finishing: RowSetFinishing,
+    pub depends_on: Vec<GlobalId>,
 }
 
 /// Plans a top-level query, returning the `HirRelationExpr` describing the query
@@ -94,12 +337,13 @@ pub struct PlannedQuery<E> {
 /// applying the returned `RowSetFinishing`.
 pub fn plan_root_query(
     scx: &StatementContext,
-    mut query: Query<Aug>,
+    mut query: Query<Raw>,
     lifetime: QueryLifetime,
 ) -> Result<PlannedQuery<HirRelationExpr>, PlanError> {
     transform_ast::transform_query(scx, &mut query)?;
     let mut qcx = QueryContext::root(scx, lifetime);
-    let (mut expr, scope, mut finishing) = plan_query(&mut qcx, &query)?;
+    let resolved_query = resolve_names(&mut qcx, query)?;
+    let (mut expr, scope, mut finishing) = plan_query(&mut qcx, &resolved_query)?;
 
     // Attempt to push the finishing's ordering past its projection. This allows
     // data to be projected down on the workers rather than the coordinator. It
@@ -117,11 +361,13 @@ pub fn plan_root_query(
             .collect(),
     );
     let desc = RelationDesc::new(typ, scope.column_names());
+    let depends_on = qcx.ids.into_iter().collect();
 
     Ok(PlannedQuery {
         expr,
         desc,
         finishing,
+        depends_on,
     })
 }
 
@@ -161,31 +407,28 @@ fn try_push_projection_order_by(
 
 pub fn plan_insert_query(
     scx: &StatementContext,
-    table_name: ResolvedObjectName,
+    table_name: UnresolvedObjectName,
     columns: Vec<Ident>,
-    source: InsertSource<Aug>,
+    source: InsertSource<Raw>,
 ) -> Result<(GlobalId, HirRelationExpr), PlanError> {
     let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
-    let table = scx.get_item_by_resolved_name(&table_name)?;
+    let table = scx.resolve_item(table_name)?;
 
     // Validate the target of the insert.
     if table.item_type() != CatalogItemType::Table {
         sql_bail!(
             "cannot insert into {} '{}'",
             table.item_type(),
-            table_name.full_name_str()
+            table.name()
         );
     }
-    let desc = table.desc(&scx.catalog.resolve_full_name(table.name()))?;
+    let desc = table.desc()?;
     let defaults = table
         .table_details()
         .expect("attempted to insert into non-table");
 
     if table.id().is_system() {
-        sql_bail!(
-            "cannot insert into system table '{}'",
-            table_name.full_name_str()
-        );
+        sql_bail!("cannot insert into system table '{}'", table.name());
     }
 
     let columns: Vec<_> = columns.into_iter().map(normalize::column_name).collect();
@@ -214,7 +457,7 @@ pub fn plan_insert_query(
                 sql_bail!(
                     "column {} of relation {} does not exist",
                     c.as_str().quoted(),
-                    table_name.full_name_str().quoted()
+                    table.name().to_string().quoted()
                 );
             }
         }
@@ -227,18 +470,21 @@ pub fn plan_insert_query(
     let expr = match source {
         InsertSource::Query(mut query) => {
             transform_ast::transform_query(scx, &mut query)?;
+            let query = resolve_names(&mut qcx, query)?;
 
             match query {
-                // Special-case simple VALUES clauses as PostgreSQL does.
+                // Special-case simple VALUES clauses, as PostgreSQL does, so
+                // we can pass in a type hint for literal coercions.
+                // See: https://github.com/postgres/postgres/blob/ad77039fa/src/backend/parser/analyze.c#L504-L518
                 Query {
-                    body: SetExpr::Values(Values(values)),
+                    body: SetExpr::Values(values),
                     ctes,
                     order_by,
                     limit: None,
                     offset: None,
                 } if ctes.is_empty() && order_by.is_empty() => {
-                    let names: Vec<_> = ordering.iter().map(|i| desc.get_name(*i)).collect();
-                    plan_values_insert(&qcx, &names, &source_types, &values)?
+                    let (expr, _scope) = plan_values(&qcx, &values.0, Some(source_types.clone()))?;
+                    expr
                 }
                 _ => {
                     let (expr, _scope) = plan_nested_query(&mut qcx, &query)?;
@@ -277,9 +523,9 @@ pub fn plan_insert_query(
     let expr = cast_relation(&qcx, CastContext::Assignment, expr, source_types).map_err(|e| {
         PlanError::Unstructured(format!(
             "column {} is of type {} but expression is of type {}",
-            desc.get_name(ordering[e.column]).as_str().quoted(),
-            qcx.humanize_scalar_type(&e.target_type),
-            qcx.humanize_scalar_type(&e.source_type),
+            desc.get_name(e.column).as_str().quoted(),
+            pgrepr::Type::from(&e.target_type).name(),
+            pgrepr::Type::from(&e.source_type).name(),
         ))
     })?;
 
@@ -295,7 +541,7 @@ pub fn plan_insert_query(
         if let Some(src_idx) = col_to_source.get(&col_idx) {
             project_key.push(*src_idx);
         } else {
-            let hir = plan_default_expr(scx, default, &col_typ.scalar_type)?;
+            let (hir, _) = plan_default_expr(scx, default, &col_typ.scalar_type)?;
             project_key.push(typ.arity() + map_exprs.len());
             map_exprs.push(hir);
         }
@@ -306,31 +552,26 @@ pub fn plan_insert_query(
 
 pub fn plan_copy_from(
     scx: &StatementContext,
-    table_name: ResolvedObjectName,
+    table_name: UnresolvedObjectName,
     columns: Vec<Ident>,
 ) -> Result<(GlobalId, RelationDesc, Vec<usize>), PlanError> {
-    let table = scx.get_item_by_resolved_name(&table_name)?;
+    let table = scx.resolve_item(table_name)?;
 
     // Validate the target of the insert.
     if table.item_type() != CatalogItemType::Table {
         sql_bail!(
             "cannot insert into {} '{}'",
             table.item_type(),
-            table_name.full_name_str()
+            table.name()
         );
     }
-    let mut desc = table
-        .desc(&scx.catalog.resolve_full_name(table.name()))?
-        .clone();
+    let mut desc = table.desc()?.clone();
     let _ = table
         .table_details()
         .expect("attempted to insert into non-table");
 
     if table.id().is_system() {
-        sql_bail!(
-            "cannot insert into system table '{}'",
-            table_name.full_name_str()
-        );
+        sql_bail!("cannot insert into system table '{}'", table.name());
     }
 
     let mut ordering = Vec::with_capacity(columns.len());
@@ -357,7 +598,7 @@ pub fn plan_copy_from(
                 sql_bail!(
                     "column {} of relation {} does not exist",
                     c.as_str().quoted(),
-                    table_name.full_name_str().quoted()
+                    table.name().to_string().quoted()
                 );
             }
         }
@@ -378,10 +619,10 @@ pub fn plan_copy_from_rows(
     catalog: &dyn SessionCatalog,
     id: GlobalId,
     columns: Vec<usize>,
-    rows: Vec<mz_repr::Row>,
+    rows: Vec<repr::Row>,
 ) -> Result<HirRelationExpr, PlanError> {
-    let table = catalog.get_item(&id);
-    let desc = table.desc(&catalog.resolve_full_name(table.name()))?;
+    let table = catalog.get_item_by_id(&id);
+    let desc = table.desc()?;
 
     let defaults = table
         .table_details()
@@ -427,7 +668,7 @@ pub fn plan_copy_from_rows(
         if let Some(src_idx) = col_to_source.get(&col_idx) {
             project_key.push(*src_idx);
         } else {
-            let hir = plan_default_expr(&scx, default, &col_typ.scalar_type)?;
+            let (hir, _) = plan_default_expr(&scx, default, &col_typ.scalar_type)?;
             project_key.push(typ.arity() + map_exprs.len());
             map_exprs.push(hir);
         }
@@ -448,7 +689,7 @@ pub struct ReadThenWritePlan {
 
 pub fn plan_delete_query(
     scx: &StatementContext,
-    mut delete_stmt: DeleteStatement<Aug>,
+    mut delete_stmt: DeleteStatement<Raw>,
 ) -> Result<ReadThenWritePlan, PlanError> {
     transform_ast::run_transforms(
         scx,
@@ -456,20 +697,22 @@ pub fn plan_delete_query(
         &mut delete_stmt,
     )?;
 
-    let qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
-    plan_mutation_query_inner(
-        qcx,
-        delete_stmt.table_name,
-        delete_stmt.alias,
-        delete_stmt.using,
-        vec![],
-        delete_stmt.selection,
-    )
+    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
+    let DeleteStatement {
+        table_name,
+        alias,
+        using,
+        selection,
+    } = resolve_names_extend_qcx_ids(&mut qcx, move |n: &mut NameResolver| {
+        n.fold_delete_statement(delete_stmt)
+    })?;
+
+    plan_mutation_query_inner(qcx, table_name, alias, using, vec![], selection)
 }
 
 pub fn plan_update_query(
     scx: &StatementContext,
-    mut update_stmt: UpdateStatement<Aug>,
+    mut update_stmt: UpdateStatement<Raw>,
 ) -> Result<ReadThenWritePlan, PlanError> {
     transform_ast::run_transforms(
         scx,
@@ -477,16 +720,16 @@ pub fn plan_update_query(
         &mut update_stmt,
     )?;
 
-    let qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
+    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
+    let UpdateStatement {
+        table_name,
+        assignments,
+        selection,
+    } = resolve_names_extend_qcx_ids(&mut qcx, move |n: &mut NameResolver| {
+        n.fold_update_statement(update_stmt)
+    })?;
 
-    plan_mutation_query_inner(
-        qcx,
-        update_stmt.table_name,
-        None,
-        vec![],
-        update_stmt.assignments,
-        update_stmt.selection,
-    )
+    plan_mutation_query_inner(qcx, table_name, None, vec![], assignments, selection)
 }
 
 pub fn plan_mutation_query_inner(
@@ -498,31 +741,24 @@ pub fn plan_mutation_query_inner(
     selection: Option<Expr<Aug>>,
 ) -> Result<ReadThenWritePlan, PlanError> {
     // Get global ID.
-    let id = match table_name {
-        ResolvedObjectName::Object { id, .. } => id,
+    let id = match table_name.id {
+        Id::Global(id) => id,
         _ => sql_bail!("cannot mutate non-user table"),
     };
 
     // Perform checks on item with given ID.
-    let item = qcx.scx.get_item(&id);
+    let item = qcx.scx.get_item_by_id(&id);
     if item.item_type() != CatalogItemType::Table {
-        sql_bail!(
-            "cannot mutate {} '{}'",
-            item.item_type(),
-            table_name.full_name_str()
-        );
+        sql_bail!("cannot mutate {} '{}'", item.item_type(), item.name());
     }
     if id.is_system() {
-        sql_bail!(
-            "cannot mutate system table '{}'",
-            table_name.full_name_str()
-        );
+        sql_bail!("cannot mutate system table '{}'", item.name());
     }
 
     // Derive structs for operation from validated table
     let (mut get, scope) = qcx.resolve_table_name(table_name)?;
     let scope = plan_table_alias(scope, alias.as_ref())?;
-    let desc = item.desc(&qcx.scx.catalog.resolve_full_name(item.name()))?;
+    let desc = item.desc()?;
     let relation_type = qcx.relation_type(&get);
 
     if using.is_empty() {
@@ -559,6 +795,7 @@ pub fn plan_mutation_query_inner(
                     allow_windows: false,
                 };
                 let expr = plan_expr(&ecx, &value)?.cast_to(
+                    "SET clause",
                     ecx,
                     CastContext::Assignment,
                     &typ.scalar_type,
@@ -720,7 +957,7 @@ where
         // We plan every cast and check the evaluated expressions rather than
         // checking the types directly because of some complex casting rules
         // between types not expressed in `ScalarType` equality.
-        match typeconv::plan_cast(ecx, ccx, expr.clone(), target_typ) {
+        match typeconv::plan_cast("relation cast", ecx, ccx, expr.clone(), target_typ) {
             Ok(cast_expr) => {
                 if expr == cast_expr {
                     // Cast between types was unnecessary
@@ -743,18 +980,18 @@ where
     Ok(expr.map(map_exprs).project(project_key))
 }
 
-/// Plans an expression in the AS OF position of a `SELECT` or `TAIL` statement.
-pub fn plan_as_of(scx: &StatementContext, expr: Option<Expr<Aug>>) -> Result<QueryWhen, PlanError> {
-    let mut expr = match expr {
-        None => return Ok(QueryWhen::Immediately),
-        Some(expr) => expr,
-    };
-
+/// Evaluates an expression in the AS OF position of a TAIL statement.
+pub fn eval_as_of<'a>(
+    scx: &'a StatementContext,
+    mut expr: Expr<Raw>,
+) -> Result<Timestamp, PlanError> {
     let scope = Scope::empty();
     let desc = RelationDesc::empty();
-    let qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
+    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
 
     transform_ast::transform_expr(scx, &mut expr)?;
+
+    let expr = resolve_names_expr(&mut qcx, expr)?;
 
     let ecx = &ExprContext {
         qcx: &qcx,
@@ -765,44 +1002,37 @@ pub fn plan_as_of(scx: &StatementContext, expr: Option<Expr<Aug>>) -> Result<Que
         allow_subqueries: false,
         allow_windows: false,
     };
-    let expr = plan_expr(ecx, &expr)?
+
+    let ex = plan_expr(ecx, &expr)?
         .type_as_any(ecx)?
         .lower_uncorrelated()?;
-    Ok(QueryWhen::AtTimestamp(expr))
-}
+    let temp_storage = &RowArena::new();
+    let evaled = ex.eval(&[], temp_storage)?;
 
-/// Plans an expression in the AS position of a `CREATE SECRET`.
-pub fn plan_secret_as(
-    scx: &StatementContext,
-    mut expr: Expr<Aug>,
-) -> Result<MirScalarExpr, PlanError> {
-    let scope = Scope::empty();
-    let desc = RelationDesc::empty();
-    let qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
-
-    transform_ast::transform_expr(scx, &mut expr)?;
-
-    let ecx = &ExprContext {
-        qcx: &qcx,
-        name: "AS",
-        scope: &scope,
-        relation_type: &desc.typ(),
-        allow_aggregates: false,
-        allow_subqueries: false,
-        allow_windows: false,
-    };
-    let expr = plan_expr(ecx, &expr)?
-        .type_as(ecx, &ScalarType::Bytes)?
-        .lower_uncorrelated()?;
-    Ok(expr)
+    Ok(match ex.typ(desc.typ()).scalar_type {
+        ScalarType::Numeric { .. } => {
+            let n = evaled.unwrap_numeric().0;
+            u64::try_from(n).map_err(|e| PlanError::Unstructured(e.to_string()))?
+        }
+        ScalarType::Int16 => evaled.unwrap_int16().try_into()?,
+        ScalarType::Int32 => evaled.unwrap_int32().try_into()?,
+        ScalarType::Int64 => evaled.unwrap_int64().try_into()?,
+        ScalarType::TimestampTz => evaled.unwrap_timestamptz().timestamp_millis().try_into()?,
+        ScalarType::Timestamp => evaled.unwrap_timestamp().timestamp_millis().try_into()?,
+        _ => sql_bail!(
+            "can't use {} as a timestamp for AS OF",
+            scx.humanize_column_type(&ex.typ(desc.typ()))
+        ),
+    })
 }
 
 pub fn plan_default_expr(
     scx: &StatementContext,
-    expr: &Expr<Aug>,
+    expr: &Expr<Raw>,
     target_ty: &ScalarType,
-) -> Result<HirScalarExpr, PlanError> {
-    let qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
+) -> Result<(HirScalarExpr, Vec<GlobalId>), PlanError> {
+    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
+    let expr = resolve_names_expr(&mut qcx, expr.clone())?;
     let ecx = &ExprContext {
         qcx: &qcx,
         name: "DEFAULT expression",
@@ -812,13 +1042,13 @@ pub fn plan_default_expr(
         allow_subqueries: false,
         allow_windows: false,
     };
-    let hir = plan_expr(ecx, &expr)?.cast_to(ecx, CastContext::Assignment, target_ty)?;
-    Ok(hir)
+    let hir = plan_expr(ecx, &expr)?.cast_to(ecx.name, ecx, CastContext::Assignment, target_ty)?;
+    Ok((hir, qcx.ids.into_iter().collect()))
 }
 
 pub fn plan_params<'a>(
     scx: &'a StatementContext,
-    params: Vec<Expr<Aug>>,
+    params: Vec<Expr<Raw>>,
     desc: &StatementDesc,
 ) -> Result<Params, PlanError> {
     if params.len() != desc.param_types.len() {
@@ -829,16 +1059,16 @@ pub fn plan_params<'a>(
         );
     }
 
-    let qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
+    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
     let scope = Scope::empty();
     let rel_type = RelationType::empty();
 
-    let mut datums = Row::default();
-    let mut packer = datums.packer();
+    let mut datums = Row::with_capacity(desc.param_types.len());
     let mut types = Vec::new();
     let temp_storage = &RowArena::new();
-    for (mut expr, ty) in params.into_iter().zip(&desc.param_types) {
-        transform_ast::transform_expr(scx, &mut expr)?;
+    for (mut param, ty) in params.into_iter().zip(&desc.param_types) {
+        transform_ast::transform_expr(scx, &mut param)?;
+        let expr = resolve_names_expr(&mut qcx, param)?;
 
         let ecx = &ExprContext {
             qcx: &qcx,
@@ -851,16 +1081,16 @@ pub fn plan_params<'a>(
         };
         let ex = plan_expr(ecx, &expr)?.type_as_any(ecx)?;
         let st = ecx.scalar_type(&ex);
-        if st != *ty {
+        if pgrepr::Type::from(&st) != *ty {
             sql_bail!(
                 "mismatched parameter type: expected {}, got {}",
-                ecx.humanize_scalar_type(&ty),
-                ecx.humanize_scalar_type(&st),
+                ty.name(),
+                pgrepr::Type::from(&st).name()
             );
         }
         let ex = ex.lower_uncorrelated()?;
         let evaled = ex.eval(&[], temp_storage)?;
-        packer.push(evaled);
+        datums.push(evaled);
         types.push(st);
     }
     Ok(Params { datums, types })
@@ -869,10 +1099,18 @@ pub fn plan_params<'a>(
 pub fn plan_index_exprs<'a>(
     scx: &'a StatementContext,
     on_desc: &RelationDesc,
-    exprs: Vec<Expr<Aug>>,
-) -> Result<Vec<mz_expr::MirScalarExpr>, PlanError> {
+    exprs: Vec<Expr<Raw>>,
+) -> Result<(Vec<::expr::MirScalarExpr>, Vec<GlobalId>), PlanError> {
     let scope = Scope::from_source(None, on_desc.iter_names());
-    let qcx = QueryContext::root(scx, QueryLifetime::Static);
+    let mut qcx = QueryContext::root(scx, QueryLifetime::Static);
+
+    let resolved_exprs = exprs
+        .into_iter()
+        .map(|mut e| {
+            transform_ast::transform_expr(scx, &mut e)?;
+            resolve_names_expr(&mut qcx, e)
+        })
+        .collect::<Result<Vec<Expr<Aug>>, _>>()?;
 
     let ecx = &ExprContext {
         qcx: &qcx,
@@ -884,12 +1122,11 @@ pub fn plan_index_exprs<'a>(
         allow_windows: false,
     };
     let mut out = vec![];
-    for mut expr in exprs {
-        transform_ast::transform_expr(scx, &mut expr)?;
+    for expr in resolved_exprs {
         let expr = plan_expr_or_col_index(ecx, &expr)?;
         out.push(expr.lower_uncorrelated()?);
     }
-    Ok(out)
+    Ok((out, qcx.ids.into_iter().collect()))
 }
 
 fn plan_expr_or_col_index(ecx: &ExprContext, e: &Expr<Aug>) -> Result<HirScalarExpr, PlanError> {
@@ -959,15 +1196,20 @@ fn plan_query_inner(
             &cte.alias.columns,
         )?;
 
-        let old_val = qcx.ctes.insert(
-            cte.id,
-            CteDesc {
-                val,
-                name: cte_name,
-                val_desc,
-            },
-        );
-        old_cte_values.push((cte.id, old_val));
+        match cte.id {
+            Id::Local(id) => {
+                let old_val = qcx.ctes.insert(
+                    id,
+                    CteDesc {
+                        val,
+                        name: cte_name,
+                        val_desc,
+                    },
+                );
+                old_cte_values.push((id, old_val));
+            }
+            _ => unreachable!(),
+        }
     }
     let limit = match &q.limit {
         None => None,
@@ -992,7 +1234,7 @@ fn plan_query_inner(
 
     let (mut result, scope, finishing) = match &q.body {
         SetExpr::Select(s) => {
-            let plan = plan_view_select(qcx, *s.clone(), q.order_by.clone())?;
+            let plan = plan_view_select(qcx, s, &q.order_by)?;
             let finishing = RowSetFinishing {
                 order_by: plan.order_by,
                 project: plan.project,
@@ -1064,8 +1306,8 @@ fn plan_set_expr(
 ) -> Result<(HirRelationExpr, Scope), PlanError> {
     match q {
         SetExpr::Select(select) => {
-            let order_by_exprs = Vec::new();
-            let plan = plan_view_select(qcx, *select.clone(), order_by_exprs)?;
+            let order_by_exprs = &[];
+            let plan = plan_view_select(qcx, select, order_by_exprs)?;
             // We didn't provide any `order_by_exprs`, so `plan_view_select`
             // should not have planned any ordering.
             assert!(plan.order_by.is_empty());
@@ -1077,90 +1319,32 @@ fn plan_set_expr(
             left,
             right,
         } => {
-            // Plan the LHS and RHS.
             let (left_expr, left_scope) = plan_set_expr(qcx, left)?;
-            let (right_expr, right_scope) = plan_set_expr(qcx, right)?;
+            let (right_expr, _right_scope) = plan_set_expr(qcx, right)?;
 
-            // Validate that the LHS and RHS are the same width.
-            let left_type = qcx.relation_type(&left_expr);
-            let right_type = qcx.relation_type(&right_expr);
-            if left_type.arity() != right_type.arity() {
+            // TODO(jamii) this type-checking is redundant with
+            // HirRelationExpr::typ, but currently it seems that we need both
+            // because HirRelationExpr::typ is not allowed to return errors
+            let left_types = qcx.relation_type(&left_expr).column_types;
+            let right_types = qcx.relation_type(&right_expr).column_types;
+            if left_types.len() != right_types.len() {
                 sql_bail!(
                     "each {} query must have the same number of columns: {} vs {}",
                     op,
-                    left_type.arity(),
-                    right_type.arity(),
+                    left_types.len(),
+                    right_types.len(),
                 );
             }
-
-            // Match the types of the corresponding columns on the LHS and RHS
-            // using the normal type coercion rules. This is equivalent to
-            // `coerce_homogeneous_exprs`, but implemented in terms of
-            // `HirRelationExpr` rather than `HirScalarExpr`.
-            let left_ecx = &ExprContext {
-                qcx: &qcx,
-                name: &op.to_string(),
-                scope: &left_scope,
-                relation_type: &left_type,
-                allow_aggregates: false,
-                allow_subqueries: false,
-                allow_windows: false,
-            };
-            let right_ecx = &ExprContext {
-                qcx: &qcx,
-                name: &op.to_string(),
-                scope: &right_scope,
-                relation_type: &right_type,
-                allow_aggregates: false,
-                allow_subqueries: false,
-                allow_windows: false,
-            };
-            let mut left_casts = vec![];
-            let mut right_casts = vec![];
-            for (i, (left_type, right_type)) in left_type
-                .column_types
-                .iter()
-                .zip(right_type.column_types.iter())
-                .enumerate()
-            {
-                let types = &[
-                    Some(left_type.scalar_type.clone()),
-                    Some(right_type.scalar_type.clone()),
-                ];
-                let target =
-                    typeconv::guess_best_common_type(&left_ecx.with_name(&op.to_string()), types)?;
-                match typeconv::plan_cast(
-                    left_ecx,
-                    CastContext::Implicit,
-                    HirScalarExpr::column(i),
-                    &target,
-                ) {
-                    Ok(expr) => left_casts.push(expr),
-                    Err(_) => sql_bail!(
+            for (left_col_type, right_col_type) in left_types.iter().zip(right_types.iter()) {
+                if left_col_type.union(right_col_type).is_err() {
+                    sql_bail!(
                         "{} types {} and {} cannot be matched",
                         op,
-                        qcx.humanize_scalar_type(&left_type.scalar_type),
-                        qcx.humanize_scalar_type(&target),
-                    ),
-                }
-                match typeconv::plan_cast(
-                    right_ecx,
-                    CastContext::Implicit,
-                    HirScalarExpr::column(i),
-                    &target,
-                ) {
-                    Ok(expr) => right_casts.push(expr),
-                    Err(_) => sql_bail!(
-                        "{} types {} and {} cannot be matched",
-                        op,
-                        qcx.humanize_scalar_type(&target),
-                        qcx.humanize_scalar_type(&right_type.scalar_type),
-                    ),
+                        qcx.humanize_scalar_type(&left_col_type.scalar_type),
+                        qcx.humanize_scalar_type(&right_col_type.scalar_type)
+                    );
                 }
             }
-            let project_key: Vec<_> = (left_type.arity()..left_type.arity() * 2).collect();
-            let left_expr = left_expr.map(left_casts).project(project_key.clone());
-            let right_expr = right_expr.map(right_casts).project(project_key);
 
             let relation_expr = match op {
                 SetOperator::Union => {
@@ -1204,7 +1388,7 @@ fn plan_set_expr(
 
             Ok((relation_expr, scope))
         }
-        SetExpr::Values(Values(values)) => plan_values(qcx, values),
+        SetExpr::Values(Values(values)) => plan_values(qcx, values, None),
         SetExpr::Query(query) => {
             let (expr, scope) = plan_nested_query(qcx, query)?;
             Ok((expr, scope))
@@ -1212,16 +1396,17 @@ fn plan_set_expr(
     }
 }
 
-/// Plans a `VALUES` clause that appears in a `SELECT` statement.
 fn plan_values(
     qcx: &QueryContext,
     values: &[Vec<Expr<Aug>>],
+    type_hints: Option<Vec<&ScalarType>>,
 ) -> Result<(HirRelationExpr, Scope), PlanError> {
-    assert!(!values.is_empty());
-
+    if values.is_empty() {
+        sql_bail!("Can't infer a type for empty VALUES expression");
+    }
     let ecx = &ExprContext {
         qcx,
-        name: "VALUES",
+        name: "values",
         scope: &Scope::empty(),
         relation_type: &RelationType::empty(),
         allow_aggregates: false,
@@ -1233,7 +1418,7 @@ fn plan_values(
     let nrows = values.len();
 
     // Arrange input expressions by columns, not rows, so that we can
-    // call `coerce_homogeneous_exprs` on each column.
+    // call `plan_homogeneous_exprs` on each column.
     let mut cols = vec![vec![]; ncols];
     for row in values {
         if row.len() != ncols {
@@ -1251,8 +1436,11 @@ fn plan_values(
     // Plan each column.
     let mut col_iters = Vec::with_capacity(ncols);
     let mut col_types = Vec::with_capacity(ncols);
-    for col in &cols {
-        let col = coerce_homogeneous_exprs(ecx, plan_exprs(ecx, col)?, None)?;
+    for (index, col) in cols.iter().enumerate() {
+        let type_hint = type_hints
+            .as_ref()
+            .and_then(|type_hints| type_hints.get(index).copied());
+        let col = coerce_homogeneous_exprs("VALUES", ecx, plan_exprs(ecx, col)?, type_hint)?;
         let mut col_type = ecx.column_type(&col[0]);
         for val in &col[1..] {
             col_type = col_type.union(&ecx.column_type(val))?;
@@ -1269,7 +1457,7 @@ fn plan_values(
         }
     }
     let out = HirRelationExpr::CallTable {
-        func: mz_expr::TableFunc::Wrap {
+        func: expr::TableFunc::Wrap {
             width: ncols,
             types: col_types,
         },
@@ -1284,75 +1472,6 @@ fn plan_values(
     }
 
     Ok((out, scope))
-}
-
-/// Plans a `VALUES` clause that appears at the top level of an `INSERT`
-/// statement.
-///
-/// This is special-cased in PostgreSQL and different enough from `plan_values`
-/// that it is easier to use a separate function entirely. Unlike a normal
-/// `VALUES` clause, each value is coerced to the type of the target table
-/// via an assignment cast.
-///
-/// See: <https://github.com/postgres/postgres/blob/ad77039fa/src/backend/parser/analyze.c#L504-L518>
-fn plan_values_insert(
-    qcx: &QueryContext,
-    target_names: &[&ColumnName],
-    target_types: &[&ScalarType],
-    values: &[Vec<Expr<Aug>>],
-) -> Result<HirRelationExpr, PlanError> {
-    assert!(!values.is_empty());
-
-    if !values.iter().map(|row| row.len()).all_equal() {
-        sql_bail!("VALUES lists must all be the same length");
-    }
-
-    let ecx = &ExprContext {
-        qcx,
-        name: "VALUES",
-        scope: &Scope::empty(),
-        relation_type: &RelationType::empty(),
-        allow_aggregates: false,
-        allow_subqueries: true,
-        allow_windows: false,
-    };
-
-    let mut exprs = vec![];
-    let mut types = vec![];
-    for row in values {
-        if row.len() > target_names.len() {
-            sql_bail!("INSERT has more expressions than target columns");
-        }
-        for (column, val) in row.into_iter().enumerate() {
-            let target_type = &target_types[column];
-            let val = plan_expr(ecx, val)?;
-            let val = typeconv::plan_coerce(&ecx, val, &target_type)?;
-            let source_type = &ecx.scalar_type(&val);
-            let val = match typeconv::plan_cast(ecx, CastContext::Assignment, val, target_type) {
-                Ok(val) => val,
-                Err(_) => sql_bail!(
-                    "column {} is of type {} but expression is of type {}",
-                    target_names[column].as_str().quoted(),
-                    qcx.humanize_scalar_type(target_type),
-                    qcx.humanize_scalar_type(source_type),
-                ),
-            };
-            if column >= types.len() {
-                types.push(ecx.column_type(&val));
-            } else {
-                types[column] = types[column].union(&ecx.column_type(&val))?;
-            }
-            exprs.push(val);
-        }
-    }
-
-    Ok(HirRelationExpr::CallTable {
-        func: mz_expr::TableFunc::Wrap {
-            width: values[0].len(),
-            types,
-        },
-        exprs,
-    })
 }
 
 fn plan_join_identity() -> (HirRelationExpr, Scope) {
@@ -1397,16 +1516,21 @@ struct SelectPlan {
 /// former class, see `plan_view_select`.
 fn plan_view_select(
     qcx: &QueryContext,
-    mut s: Select<Aug>,
-    mut order_by_exprs: Vec<OrderByExpr<Aug>>,
+    s: &Select<Aug>,
+    order_by_exprs: &[OrderByExpr<Aug>],
 ) -> Result<SelectPlan, PlanError> {
-    // TODO: Both `s` and `order_by_exprs` are not references because the
-    // AggregateTableFuncVisitor needs to be able to rewrite the expressions for
-    // table function support (the UUID mapping). Attempt to change this so callers
-    // don't need to clone the Select.
+    let Select {
+        distinct,
+        projection,
+        from,
+        selection,
+        group_by,
+        having,
+        options,
+    } = s;
 
     // Extract hints about group size if there are any
-    let mut options = crate::normalize::options(&s.options);
+    let mut options = crate::normalize::options(options);
 
     let option = options.remove("expected_group_size");
 
@@ -1417,8 +1541,8 @@ fn plan_view_select(
     };
 
     // Step 1. Handle FROM clause, including joins.
-    let (mut relation_expr, mut from_scope) =
-        s.from.iter().fold(Ok(plan_join_identity()), |l, twj| {
+    let (mut relation_expr, from_scope) =
+        from.iter().fold(Ok(plan_join_identity()), |l, twj| {
             let (left, left_scope) = l?;
             plan_join(
                 qcx,
@@ -1434,8 +1558,22 @@ fn plan_view_select(
             )
         })?;
 
+    // Checks if an unknown column error was the result of not including that
+    // column in the GROUP BY clause and produces a friendlier error instead.
+    let check_ungrouped_col = |e| match e {
+        PlanError::UnknownColumn { table, column } => {
+            match from_scope.resolve(&qcx.outer_scopes, table.as_ref(), &column) {
+                Ok(ColumnRef { level: 0, column }) => {
+                    PlanError::ungrouped_column(&from_scope.items[column])
+                }
+                _ => PlanError::UnknownColumn { table, column },
+            }
+        }
+        e => e,
+    };
+
     // Step 2. Handle WHERE clause.
-    if let Some(selection) = &s.selection {
+    if let Some(selection) = &selection {
         let ecx = &ExprContext {
             qcx,
             name: "WHERE clause",
@@ -1451,27 +1589,15 @@ fn plan_view_select(
         relation_expr = relation_expr.filter(vec![expr]);
     }
 
-    // Step 3. Gather aggregates and table functions.
-    let (aggregates, table_funcs) = {
-        let mut visitor = AggregateTableFuncVisitor::new(&qcx.scx);
-        visitor.visit_select_mut(&mut s);
-        for o in order_by_exprs.iter_mut() {
-            visitor.visit_order_by_expr_mut(o);
+    // Step 3. Gather aggregates.
+    let aggregates = {
+        let mut aggregate_visitor = AggregateFuncVisitor::new(&qcx.scx);
+        aggregate_visitor.visit_select(&s);
+        for o in order_by_exprs {
+            aggregate_visitor.visit_order_by_expr(o);
         }
-        visitor.into_result()?
+        aggregate_visitor.into_result()?
     };
-    let mut table_func_names: HashMap<String, Ident> = HashMap::new();
-    if !table_funcs.is_empty() {
-        let (expr, scope) = plan_scalar_table_funcs(
-            &qcx,
-            table_funcs,
-            &mut table_func_names,
-            &relation_expr,
-            &from_scope,
-        )?;
-        relation_expr = relation_expr.join(expr, HirScalarExpr::literal_true(), JoinKind::Inner);
-        from_scope = from_scope.product(scope)?;
-    }
 
     // Step 4. Expand SELECT clause.
     let projection = {
@@ -1485,11 +1611,11 @@ fn plan_view_select(
             allow_windows: true,
         };
         let mut out = vec![];
-        for si in &s.projection {
-            if *si == SelectItem::Wildcard && s.from.is_empty() {
+        for si in projection {
+            if *si == SelectItem::Wildcard && from.is_empty() {
                 sql_bail!("SELECT * with no tables specified is not valid");
             }
-            out.extend(expand_select_item(&ecx, si, &table_func_names)?);
+            out.extend(expand_select_item(&ecx, si)?);
         }
         out
     };
@@ -1507,54 +1633,39 @@ fn plan_view_select(
             allow_windows: false,
         };
         let mut group_key = vec![];
-        let mut group_exprs: HashMap<HirScalarExpr, ScopeItem> = HashMap::new();
-        let mut group_hir_exprs = vec![];
+        let mut group_exprs = vec![];
         let mut group_scope = Scope::empty();
         let mut select_all_mapping = BTreeMap::new();
-
-        for group_expr in &s.group_by {
+        for group_expr in group_by {
             let (group_expr, expr) = plan_group_by_expr(ecx, group_expr, &projection)?;
             let new_column = group_key.len();
-
-            if let Some(group_expr) = group_expr {
-                // Multiple AST expressions can map to the same HIR expression.
-                // If we already have a ScopeItem for this HIR, we can add this
-                // next AST expression to its set
-                if let Some(existing_scope_item) = group_exprs.get_mut(&expr) {
-                    existing_scope_item.exprs.insert(group_expr.clone());
-                    continue;
-                }
-            }
-
-            let mut scope_item = if let HirScalarExpr::Column(ColumnRef {
-                level: 0,
-                column: old_column,
-            }) = &expr
+            // Repeated expressions in GROUP BY confuse name resolution later,
+            // and dropping them doesn't change the result.
+            if group_exprs
+                .iter()
+                .find(|existing_expr| **existing_expr == expr)
+                .is_none()
             {
-                // If we later have `SELECT foo.*` then we have to find all
-                // the `foo` items in `from_scope` and figure out where they
-                // ended up in `group_scope`. This is really hard to do
-                // right using SQL name resolution, so instead we just track
-                // the movement here.
-                select_all_mapping.insert(*old_column, new_column);
-                let scope_item = ecx.scope.items[*old_column].clone();
-                scope_item
-            } else {
-                ScopeItem::empty()
-            };
+                let scope_item = if let HirScalarExpr::Column(ColumnRef {
+                    level: 0,
+                    column: old_column,
+                }) = &expr
+                {
+                    // If we later have `SELECT foo.*` then we have to find all
+                    // the `foo` items in `from_scope` and figure out where they
+                    // ended up in `group_scope`. This is really hard to do
+                    // right using SQL name resolution, so instead we just track
+                    // the movement here.
+                    select_all_mapping.insert(*old_column, new_column);
+                    let mut scope_item = ecx.scope.items[*old_column].clone();
+                    scope_item.expr = group_expr.cloned();
+                    scope_item
+                } else {
+                    ScopeItem::from_expr(group_expr.cloned())
+                };
 
-            if let Some(group_expr) = group_expr.cloned() {
-                scope_item.exprs.insert(group_expr);
-            }
-
-            group_key.push(from_scope.len() + group_exprs.len());
-            group_hir_exprs.push(expr.clone());
-            group_exprs.insert(expr, scope_item);
-        }
-
-        assert_eq!(group_hir_exprs.len(), group_exprs.len());
-        for expr in &group_hir_exprs {
-            if let Some(scope_item) = group_exprs.remove(expr) {
+                group_key.push(from_scope.len() + group_exprs.len());
+                group_exprs.push(expr);
                 group_scope.items.push(scope_item);
             }
         }
@@ -1564,25 +1675,24 @@ fn plan_view_select(
             qcx,
             name: "aggregate function",
             scope: &from_scope,
-            relation_type: &qcx.relation_type(&relation_expr.clone().map(group_hir_exprs.clone())),
+            relation_type: &qcx.relation_type(&relation_expr.clone().map(group_exprs.clone())),
             allow_aggregates: false,
             allow_subqueries: true,
             allow_windows: false,
         };
         let mut agg_exprs = vec![];
         for sql_function in aggregates {
-            agg_exprs.push(plan_aggregate(ecx, &sql_function)?);
+            agg_exprs.push(plan_aggregate(ecx, sql_function)?);
             group_scope
                 .items
                 .push(ScopeItem::from_expr(Expr::Function(sql_function.clone())));
         }
-        if !agg_exprs.is_empty() || !group_key.is_empty() || s.having.is_some() {
+        if !agg_exprs.is_empty() || !group_key.is_empty() || having.is_some() {
             // apply GROUP BY / aggregates
-            relation_expr = relation_expr.map(group_hir_exprs).reduce(
-                group_key,
-                agg_exprs,
-                expected_group_size,
-            );
+            relation_expr =
+                relation_expr
+                    .map(group_exprs)
+                    .reduce(group_key, agg_exprs, expected_group_size);
             (group_scope, select_all_mapping)
         } else {
             // if no GROUP BY, aggregates or having then all columns remain in scope
@@ -1593,22 +1703,8 @@ fn plan_view_select(
         }
     };
 
-    // Checks if an unknown column error was the result of not including that
-    // column in the GROUP BY clause and produces a friendlier error instead.
-    let check_ungrouped_col = |e| match e {
-        PlanError::UnknownColumn { table, column } => {
-            match from_scope.resolve(&qcx.outer_scopes, table.as_ref(), &column) {
-                Ok(ColumnRef { level: 0, column }) => {
-                    PlanError::ungrouped_column(&from_scope.items[column])
-                }
-                _ => PlanError::UnknownColumn { table, column },
-            }
-        }
-        e => e,
-    };
-
     // Step 6. Handle HAVING clause.
-    if let Some(having) = s.having {
+    if let Some(having) = having {
         let ecx = &ExprContext {
             qcx,
             name: "HAVING clause",
@@ -1618,7 +1714,7 @@ fn plan_view_select(
             allow_subqueries: true,
             allow_windows: false,
         };
-        let expr = plan_expr(ecx, &having)
+        let expr = plan_expr(ecx, having)
             .map_err(check_ungrouped_col)?
             .type_as(ecx, &ScalarType::Bool)?;
         relation_expr = relation_expr.filter(vec![expr]);
@@ -1688,12 +1784,12 @@ fn plan_view_select(
                 allow_subqueries: true,
                 allow_windows: true,
             },
-            &order_by_exprs,
+            order_by_exprs,
             &output_columns,
         )
         .map_err(check_ungrouped_col)?;
 
-        match s.distinct {
+        match distinct {
             None => relation_expr = relation_expr.map(map_exprs),
             Some(Distinct::EntireRow) => {
                 if relation_type.arity() == 0 {
@@ -1726,7 +1822,7 @@ fn plan_view_select(
                 };
 
                 let mut distinct_exprs = vec![];
-                for expr in &exprs {
+                for expr in exprs {
                     let expr = plan_order_by_or_distinct_expr(ecx, expr, &output_columns)
                         .map_err(check_ungrouped_col)?;
                     distinct_exprs.push(expr);
@@ -1803,49 +1899,6 @@ fn plan_view_select(
         order_by,
         project: project_key,
     })
-}
-
-fn plan_scalar_table_funcs(
-    qcx: &QueryContext,
-    table_funcs: HashMap<TableFunction<Aug>, String>,
-    table_func_names: &mut HashMap<String, Ident>,
-    relation_expr: &HirRelationExpr,
-    from_scope: &Scope,
-) -> Result<(HirRelationExpr, Scope), PlanError> {
-    let rows_from_qcx = qcx.derived_context(from_scope.clone(), qcx.relation_type(&relation_expr));
-    let (expr, mut scope, num_cols) =
-        plan_rows_from_internal(&rows_from_qcx, table_funcs.keys(), None)?;
-    for (table_func, id) in table_funcs.iter() {
-        table_func_names.insert(id.clone(), table_func.name.0.last().unwrap().clone());
-    }
-    // Munge the scope so table names match with the generated ids.
-    let mut i = 0;
-    for (id, num_cols) in table_funcs.values().zip(num_cols) {
-        for _ in 0..num_cols {
-            scope.items[i].table_name = Some(PartialObjectName {
-                database: None,
-                schema: None,
-                item: id.clone(),
-            });
-            scope.items[i].from_single_column_function = num_cols == 1;
-            scope.items[i].allow_unqualified_references = false;
-            i += 1;
-        }
-        // Ordinality column. This doubles as the
-        // `is_exists_column_for_a_table_function_that_was_in_the_target_list` later on
-        // because it only needs to be NULL or not.
-        scope.items[i].table_name = Some(PartialObjectName {
-            database: None,
-            schema: None,
-            item: id.clone(),
-        });
-        scope.items[i].is_exists_column_for_a_table_function_that_was_in_the_target_list = true;
-        scope.items[i].allow_unqualified_references = false;
-        i += 1;
-    }
-    // Coalesced ordinality column.
-    scope.items[i].allow_unqualified_references = false;
-    Ok((expr, scope))
 }
 
 /// Plans an expression in a `GROUP BY` clause.
@@ -2092,9 +2145,6 @@ fn plan_table_factor(
 ///
 /// This function creates a HirRelationExpr that follows the structure of the
 /// latter query.
-///
-/// `with_ordinality` can be used to have the output expression contain a
-/// single coalesced ordinality column at the end of the entire expression.
 fn plan_rows_from(
     qcx: &QueryContext,
     functions: &[TableFunction<Aug>],
@@ -2107,89 +2157,14 @@ fn plan_rows_from(
         return plan_solitary_table_function(qcx, function, alias, with_ordinality);
     }
 
-    // Per PostgreSQL, all scope items take the name of the first function
-    // (unless aliased).
-    // See: https://github.com/postgres/postgres/blob/639a86e36/src/backend/parser/parse_relation.c#L1701-L1705
-    let (expr, mut scope, num_cols) =
-        plan_rows_from_internal(qcx, functions, Some(&functions[0].name))?;
-
-    // Columns tracks the set of columns we will keep in the projection.
-    let mut columns = Vec::new();
-    let mut offset = 0;
-    // Retain table function's non-ordinality columns.
-    for (idx, cols) in num_cols.into_iter().enumerate() {
-        for i in 0..cols {
-            columns.push(offset + i);
-        }
-        offset += cols + 1;
-
-        // Remove the ordinality column from the scope, accounting for previous scope
-        // changes from this loop.
-        scope.items.remove(offset - idx - 1);
-    }
-
-    // If `WITH ORDINALITY` was specified, include the coalesced ordinality
-    // column. Otherwise remove it from the scope.
-    if with_ordinality {
-        columns.push(scope.items.len());
-    } else {
-        scope.items.pop();
-    }
-
-    let expr = expr.project(columns);
-
-    let scope = plan_table_alias(scope, alias)?;
-    Ok((expr, scope))
-}
-
-/// Plans an expression coalescing multiple table functions. Each table
-/// function is followed by its row ordinality. The entire expression is
-/// followed by the coalesced row ordinality.
-///
-/// The returned Scope will set all item's table_name's to the `table_name`
-/// parameter if it is `Some`. If `None`, they will be the name of each table
-/// function.
-///
-/// The returned `Vec<usize>` is the number of (non-ordinality) columns from
-/// each table function.
-///
-/// For example, with table functions tf1 returning 1 column (a) and tf2
-/// returning 2 columns (b, c), this function will return an expr 6 columns:
-///
-/// - tf1.a
-/// - tf1.ordinality
-/// - tf2.b
-/// - tf2.c
-/// - tf2.ordinality
-/// - coalesced_ordinality
-///
-/// And a `Vec<usize>` of `[1, 2]`.
-fn plan_rows_from_internal<'a>(
-    qcx: &QueryContext,
-    functions: impl IntoIterator<Item = &'a TableFunction<Aug>>,
-    table_name: Option<&UnresolvedObjectName>,
-) -> Result<(HirRelationExpr, Scope, Vec<usize>), PlanError> {
-    let mut functions = functions.into_iter();
-    let mut num_cols = Vec::new();
-
     // Join together each of the table functions in turn. The last column is
     // always the column to join against and is maintained to be the coalesence
     // of the row number column for all prior functions.
-    let (mut left_expr, mut left_scope) =
-        plan_table_function_internal(&qcx, functions.next().unwrap(), true, table_name)?;
-    num_cols.push(left_scope.len() - 1);
-    // Create the coalesced ordinality column.
-    left_expr = left_expr.map(vec![HirScalarExpr::column(left_scope.len() - 1)]);
-    left_scope
-        .items
-        .push(ScopeItem::from_column_name("ordinality"));
-
-    for function in functions {
+    let (mut left_expr, mut left_scope) = plan_table_function_internal(&qcx, &functions[0], true)?;
+    for function in &functions[1..] {
         // The right hand side of a join must be planned in a new scope.
         let qcx = qcx.empty_derived_context();
-        let (right_expr, mut right_scope) =
-            plan_table_function_internal(&qcx, function, true, table_name)?;
-        num_cols.push(right_scope.len() - 1);
+        let (right_expr, right_scope) = plan_table_function_internal(&qcx, function, true)?;
         let left_col = left_scope.len() - 1;
         let right_col = left_scope.len() + right_scope.len() - 1;
         let on = HirScalarExpr::CallBinary {
@@ -2205,22 +2180,37 @@ fn plan_rows_from_internal<'a>(
                     HirScalarExpr::column(left_col),
                     HirScalarExpr::column(right_col),
                 ],
-            }]);
-
-        // Project off the previous iteration's coalesced column, but keep both of this
-        // iteration's ordinality columns.
-        left_expr = left_expr.project(
-            (0..left_col) // non-coalesced ordinality columns from left function
-                .chain(left_col + 1..right_col + 2) // non-ordinality columns from right function
-                .collect(),
-        );
-        // Move the coalesced ordinality column.
-        right_scope.items.push(left_scope.items.pop().unwrap());
-
+            }])
+            .project(
+                (0..left_col) // non-ordinality columns from left function
+                    .chain(left_col + 1..right_col) // non-ordinality columns from right function
+                    .chain(iter::once(right_col + 1)) // new coalesced ordinality column
+                    .collect(),
+            );
+        left_scope.items.pop();
         left_scope.items.extend(right_scope.items);
     }
 
-    Ok((left_expr, left_scope, num_cols))
+    // If `WITH ORDINALITY` was not specified, project off the ordinality
+    // column.
+    if !with_ordinality {
+        left_expr = left_expr.project((0..left_scope.len() - 1).collect());
+        left_scope.items.pop();
+    }
+
+    // Per PostgreSQL, all scope items take the name of the first function
+    // (unless aliased).
+    // See: https://github.com/postgres/postgres/blob/639a86e36/src/backend/parser/parse_relation.c#L1701-L1705
+    for item in &mut left_scope.items {
+        item.table_name = Some(PartialName {
+            database: None,
+            schema: None,
+            item: normalize::unresolved_object_name(functions[0].name.clone())?.item,
+        });
+    }
+    left_scope = plan_table_alias(left_scope, alias)?;
+
+    Ok((left_expr, left_scope))
 }
 
 /// Plans a table function that appears alone, i.e., that is not part of a `ROWS
@@ -2232,7 +2222,7 @@ fn plan_solitary_table_function(
     alias: Option<&TableAlias>,
     with_ordinality: bool,
 ) -> Result<(HirRelationExpr, Scope), PlanError> {
-    let (expr, mut scope) = plan_table_function_internal(qcx, function, with_ordinality, None)?;
+    let (expr, mut scope) = plan_table_function_internal(qcx, function, with_ordinality)?;
 
     let single_column_function = scope.len() == 1 + if with_ordinality { 1 } else { 0 };
     if single_column_function {
@@ -2282,7 +2272,6 @@ fn plan_table_function_internal(
     qcx: &QueryContext,
     TableFunction { name, args }: &TableFunction<Aug>,
     with_ordinality: bool,
-    table_name: Option<&UnresolvedObjectName>,
 ) -> Result<(HirRelationExpr, Scope), PlanError> {
     if *name == UnresolvedObjectName::unqualified("values") {
         // Produce a nice error message for the common typo
@@ -2313,14 +2302,10 @@ fn plan_table_function_internal(
         }
     };
     let resolved_name = normalize::unresolved_object_name(name.clone())?;
-    let table_name = match table_name {
-        Some(table_name) => normalize::unresolved_object_name(table_name.clone())?.item,
-        None => resolved_name.item.clone(),
-    };
-    let scope_name = Some(PartialObjectName {
+    let scope_name = Some(PartialName {
         database: None,
         schema: None,
-        item: table_name,
+        item: resolved_name.item.clone(),
     });
 
     let (mut expr, mut scope) = match resolve_func(ecx, name, args)? {
@@ -2377,7 +2362,7 @@ fn plan_table_alias(mut scope: Scope, alias: Option<&TableAlias>) -> Result<Scop
                 .get(i)
                 .map(|a| normalize::column_name(a.clone()))
                 .unwrap_or_else(|| item.column_name.clone());
-            item.table_name = Some(PartialObjectName {
+            item.table_name = Some(PartialName {
                 database: None,
                 schema: None,
                 item: table_name.clone(),
@@ -2388,106 +2373,33 @@ fn plan_table_alias(mut scope: Scope, alias: Option<&TableAlias>) -> Result<Scop
     Ok(scope)
 }
 
-// `table_func_names` is a mapping from a UUID to the original function
-// name. The UUIDs are identifiers that have been rewritten from some table
-// function expression, and this mapping restores the original names.
-fn invent_column_name(
-    ecx: &ExprContext,
-    expr: &Expr<Aug>,
-    table_func_names: &HashMap<String, Ident>,
-) -> Option<ColumnName> {
-    // We follow PostgreSQL exactly here, which has some complicated rules
-    // around "high" and "low" quality names. Low quality names override other
-    // low quality names but not high quality names.
-    //
-    // See: https://github.com/postgres/postgres/blob/1f655fdc3/src/backend/parser/parse_target.c#L1716-L1728
-
-    #[derive(Debug)]
-    enum NameQuality {
-        Low,
-        High,
-    }
-
-    fn invent(
-        ecx: &ExprContext,
-        expr: &Expr<Aug>,
-        table_func_names: &HashMap<String, Ident>,
-    ) -> Option<(ColumnName, NameQuality)> {
-        match expr {
-            Expr::Identifier(names) => {
-                if let [name] = names.as_slice() {
-                    if let Some(table_func_name) = table_func_names.get(name.as_str()) {
-                        return Some((
-                            normalize::column_name(table_func_name.clone()),
-                            NameQuality::High,
-                        ));
-                    }
-                }
-                names
-                    .last()
-                    .map(|n| (normalize::column_name(n.clone()), NameQuality::High))
+fn invent_column_name(ecx: &ExprContext, expr: &Expr<Aug>) -> Option<ColumnName> {
+    match expr {
+        Expr::Identifier(names) => names.last().map(|n| normalize::column_name(n.clone())),
+        Expr::Function(func) => {
+            let name = normalize::unresolved_object_name(func.name.clone()).ok()?;
+            if name.schema.as_deref() == Some("mz_internal") {
+                None
+            } else {
+                Some(name.item.into())
             }
-            Expr::Value(v) => match v {
-                // Per PostgreSQL, `bool` and `interval` literals take on the name
-                // of their type, but not other literal types.
-                Value::Boolean(_) => Some(("bool".into(), NameQuality::High)),
-                Value::Interval(_) => Some(("interval".into(), NameQuality::High)),
-                _ => None,
-            },
-            Expr::Function(func) => {
-                let name = normalize::unresolved_object_name(func.name.clone()).ok()?;
-                if name.schema.as_deref() == Some("mz_internal") {
-                    None
-                } else {
-                    Some((name.item.into(), NameQuality::High))
-                }
-            }
-            Expr::HomogenizingFunction { function, .. } => Some((
-                function.to_string().to_lowercase().into(),
-                NameQuality::High,
-            )),
-            Expr::NullIf { .. } => Some(("nullif".into(), NameQuality::High)),
-            Expr::Array { .. } => Some(("array".into(), NameQuality::High)),
-            Expr::List { .. } => Some(("list".into(), NameQuality::High)),
-            Expr::Cast { expr, data_type } => match invent(ecx, expr, table_func_names) {
-                Some((name, NameQuality::High)) => Some((name, NameQuality::High)),
-                _ => {
-                    let ty = scalar_type_from_sql(&ecx.qcx.scx, data_type).ok()?;
-                    let pgrepr_type = mz_pgrepr::Type::from(&ty);
-                    let entry = ecx.catalog().get_item_by_oid(&pgrepr_type.oid());
-                    Some((entry.name().item.clone().into(), NameQuality::Low))
-                }
-            },
-            Expr::Case { else_result, .. } => {
-                match else_result
-                    .as_ref()
-                    .and_then(|else_result| invent(ecx, else_result, table_func_names))
-                {
-                    Some((name, NameQuality::High)) => Some((name, NameQuality::High)),
-                    _ => Some(("case".into(), NameQuality::Low)),
-                }
-            }
-            Expr::FieldAccess { field, .. } => {
-                Some((normalize::column_name(field.clone()), NameQuality::High))
-            }
-            Expr::Exists { .. } => Some(("exists".into(), NameQuality::High)),
-            Expr::Subscript { expr, .. } => invent(ecx, expr, table_func_names),
-            Expr::Subquery(query) | Expr::ListSubquery(query) | Expr::ArraySubquery(query) => {
-                // A bit silly to have to plan the query here just to get its column
-                // name, since we throw away the planned expression, but fixing this
-                // requires a separate semantic analysis phase.
-                let (_expr, scope) =
-                    plan_nested_query(&mut ecx.derived_query_context(), query).ok()?;
-                scope
-                    .items
-                    .first()
-                    .map(|name| (name.column_name.clone(), NameQuality::High))
-            }
-            _ => None,
         }
+        Expr::Coalesce { .. } => Some("coalesce".into()),
+        Expr::NullIf { .. } => Some("nullif".into()),
+        Expr::Array { .. } => Some("array".into()),
+        Expr::List { .. } => Some("list".into()),
+        Expr::Cast { expr, .. } => return invent_column_name(ecx, expr),
+        Expr::FieldAccess { field, .. } => Some(normalize::column_name(field.clone())),
+        Expr::Exists { .. } => Some("exists".into()),
+        Expr::Subquery(query) | Expr::ListSubquery(query) => {
+            // A bit silly to have to plan the query here just to get its column
+            // name, since we throw away the planned expression, but fixing this
+            // requires a separate semantic analysis phase.
+            let (_expr, scope) = plan_nested_query(&mut ecx.derived_query_context(), query).ok()?;
+            scope.items.first().map(|name| name.column_name.clone())
+        }
+        _ => None,
     }
-
-    invent(ecx, expr, table_func_names).map(|(name, _quality)| name)
 }
 
 #[derive(Debug)]
@@ -2508,7 +2420,6 @@ impl ExpandedSelectItem<'_> {
 fn expand_select_item<'a>(
     ecx: &ExprContext,
     s: &'a SelectItem<Aug>,
-    table_func_names: &HashMap<String, Ident>,
 ) -> Result<Vec<(ExpandedSelectItem<'a>, ColumnName)>, PlanError> {
     match s {
         SelectItem::Expr {
@@ -2547,39 +2458,14 @@ fn expand_select_item<'a>(
                 ScalarType::Record { fields, .. } => fields,
                 ty => sql_bail!("type {} is not composite", ecx.humanize_scalar_type(&ty)),
             };
-            let mut skip_cols: HashSet<ColumnName> = HashSet::new();
-            if let Expr::Identifier(ident) = sql_expr.as_ref() {
-                if let [name] = ident.as_slice() {
-                    if let Ok(items) = ecx.scope.items_from_table(
-                        &[],
-                        &PartialObjectName {
-                            database: None,
-                            schema: None,
-                            item: name.as_str().to_string(),
-                        },
-                    ) {
-                        for (_, item) in items {
-                            if item
-                                .is_exists_column_for_a_table_function_that_was_in_the_target_list
-                            {
-                                skip_cols.insert(item.column_name.clone());
-                            }
-                        }
-                    }
-                }
-            }
             let items = fields
                 .iter()
-                .filter_map(|(name, _ty)| {
-                    if skip_cols.contains(name) {
-                        None
-                    } else {
-                        let item = ExpandedSelectItem::Expr(Cow::Owned(Expr::FieldAccess {
-                            expr: sql_expr.clone(),
-                            field: Ident::new(name.as_str()),
-                        }));
-                        Some((item, name.clone()))
-                    }
+                .map(|(name, _ty)| {
+                    let item = ExpandedSelectItem::Expr(Cow::Owned(Expr::FieldAccess {
+                        expr: sql_expr.clone(),
+                        field: Ident::new(name.as_str()),
+                    }));
+                    (item, name.clone())
                 })
                 .collect();
             Ok(items)
@@ -2603,7 +2489,7 @@ fn expand_select_item<'a>(
             let name = alias
                 .clone()
                 .map(normalize::column_name)
-                .or_else(|| invent_column_name(ecx, &expr, &table_func_names))
+                .or_else(|| invent_column_name(ecx, &expr))
                 .unwrap_or_else(|| "?column?".into());
             Ok(vec![(ExpandedSelectItem::Expr(Cow::Borrowed(expr)), name)])
         }
@@ -2753,10 +2639,11 @@ fn plan_using_constraint(
 
         // Join keys must be resolved to same type.
         let mut exprs = coerce_homogeneous_exprs(
-            &ecx.with_name(&format!(
+            &format!(
                 "NATURAL/USING join column {}",
                 column_name.as_str().quoted()
-            )),
+            ),
+            &ecx,
             vec![
                 CoercibleScalarExpr::Coerced(HirScalarExpr::Column(lhs)),
                 CoercibleScalarExpr::Coerced(HirScalarExpr::Column(rhs)),
@@ -2859,7 +2746,7 @@ fn plan_expr_inner<'a>(
 
         // Generalized functions, operators, and casts.
         Expr::Op { op, expr1, expr2 } => {
-            Ok(plan_op(ecx, normalize::op(op)?, expr1, expr2.as_deref())?.into())
+            Ok(plan_op(ecx, op.op_str(), expr1, expr2.as_deref())?.into())
         }
         Expr::Cast { expr, data_type } => plan_cast(ecx, expr, data_type),
         Expr::Function(func) => Ok(plan_function(ecx, func)?.into()),
@@ -2879,9 +2766,7 @@ fn plan_expr_inner<'a>(
             results,
             else_result,
         } => Ok(plan_case(ecx, operand, conditions, results, else_result)?.into()),
-        Expr::HomogenizingFunction { function, exprs } => {
-            plan_homogenizing_function(ecx, function, exprs)
-        }
+        Expr::Coalesce { exprs } => plan_coalesce(ecx, exprs),
         Expr::NullIf { l_expr, r_expr } => Ok(plan_case(
             ecx,
             &None,
@@ -2892,28 +2777,13 @@ fn plan_expr_inner<'a>(
         .into()),
         Expr::FieldAccess { expr, field } => plan_field_access(ecx, expr, field),
         Expr::WildcardAccess(expr) => plan_expr(ecx, expr),
-        Expr::Subscript { expr, positions } => plan_subscript(ecx, expr, positions),
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            case_insensitive,
-            negated,
-        } => Ok(plan_like(
-            ecx,
-            expr,
-            pattern,
-            escape.as_deref(),
-            *case_insensitive,
-            *negated,
-        )?
-        .into()),
+        Expr::SubscriptIndex { expr, subscript } => plan_subscript_index(ecx, expr, subscript),
+        Expr::SubscriptSlice { expr, positions } => plan_subscript_slice(ecx, expr, positions),
 
         // Subqueries.
         Expr::Exists(query) => plan_exists(ecx, query),
         Expr::Subquery(query) => plan_subquery(ecx, query),
         Expr::ListSubquery(query) => plan_list_subquery(ecx, query),
-        Expr::ArraySubquery(query) => plan_array_subquery(ecx, query),
         Expr::Collate { expr, collation } => plan_collate(ecx, expr, collation),
         Expr::Nested(_) => unreachable!("Expr::Nested not desugared"),
         Expr::InList { .. } => unreachable!("Expr::InList not desugared"),
@@ -2953,7 +2823,7 @@ fn plan_row(ecx: &ExprContext, exprs: &[Expr<Aug>]) -> Result<CoercibleScalarExp
 fn plan_cast(
     ecx: &ExprContext,
     expr: &Expr<Aug>,
-    data_type: &ResolvedDataType,
+    data_type: &DataType<Aug>,
 ) -> Result<CoercibleScalarExpr, PlanError> {
     let to_scalar_type = scalar_type_from_sql(ecx.qcx.scx, data_type)?;
     let expr = match expr {
@@ -2969,10 +2839,16 @@ fn plan_cast(
         Expr::List(exprs) => plan_list(ecx, exprs, Some(&to_scalar_type))?,
         _ => plan_expr(ecx, expr)?,
     };
-    let ecx = &ecx.with_name("CAST");
-    let expr = typeconv::plan_coerce(ecx, expr, &to_scalar_type)?;
-    let expr = typeconv::plan_cast(ecx, CastContext::Explicit, expr, &to_scalar_type)?;
-    Ok(expr.into())
+
+    let expr = match expr {
+        // Maintain the stringness of literals strings to preserve any
+        // side effects of Explicit casts (going through plan_coerce
+        // uses Assignment casts).
+        CoercibleScalarExpr::LiteralString(..) => expr.type_as(&ecx, &ScalarType::String)?,
+        expr => typeconv::plan_coerce(ecx, expr, &to_scalar_type)?,
+    };
+
+    Ok(typeconv::plan_cast("CAST", ecx, CastContext::Explicit, expr, &to_scalar_type)?.into())
 }
 
 fn plan_not(ecx: &ExprContext, expr: &Expr<Aug>) -> Result<CoercibleScalarExpr, PlanError> {
@@ -3012,23 +2888,11 @@ fn plan_or(
     .into())
 }
 
-fn plan_homogenizing_function(
-    ecx: &ExprContext,
-    function: &HomogenizingFunction,
-    exprs: &[Expr<Aug>],
-) -> Result<CoercibleScalarExpr, PlanError> {
+fn plan_coalesce(ecx: &ExprContext, exprs: &[Expr<Aug>]) -> Result<CoercibleScalarExpr, PlanError> {
     assert!(!exprs.is_empty()); // `COALESCE()` is a syntax error
     let expr = HirScalarExpr::CallVariadic {
-        func: match function {
-            HomogenizingFunction::Coalesce => VariadicFunc::Coalesce,
-            HomogenizingFunction::Greatest => VariadicFunc::Greatest,
-            HomogenizingFunction::Least => VariadicFunc::Least,
-        },
-        exprs: coerce_homogeneous_exprs(
-            &ecx.with_name(&function.to_string().to_lowercase()),
-            plan_exprs(ecx, exprs)?,
-            None,
-        )?,
+        func: VariadicFunc::Coalesce,
+        exprs: coerce_homogeneous_exprs("coalesce", ecx, plan_exprs(ecx, exprs)?, None)?,
     };
     Ok(expr.into())
 }
@@ -3058,280 +2922,93 @@ fn plan_field_access(
     }
 }
 
-fn plan_subscript(
+fn plan_subscript_index(
+    ecx: &ExprContext,
+    expr: &Expr<Aug>,
+    subscript: &Expr<Aug>,
+) -> Result<CoercibleScalarExpr, PlanError> {
+    let expr = plan_expr(ecx, expr)?.type_as_any(ecx)?;
+    let ty = ecx.scalar_type(&expr);
+    let func = match &ty {
+        ScalarType::List { .. } => BinaryFunc::ListIndex,
+        ScalarType::Array(_) => BinaryFunc::ArrayIndex,
+        ty => sql_bail!("cannot subscript type {}", ecx.humanize_scalar_type(&ty)),
+    };
+
+    Ok(expr
+        .call_binary(
+            plan_expr(ecx, subscript)?.cast_to(
+                "subscript (indexing)",
+                ecx,
+                CastContext::Explicit,
+                &ScalarType::Int64,
+            )?,
+            func,
+        )
+        .into())
+}
+
+fn plan_subscript_slice(
     ecx: &ExprContext,
     expr: &Expr<Aug>,
     positions: &[SubscriptPosition<Aug>],
 ) -> Result<CoercibleScalarExpr, PlanError> {
-    assert!(
-        !positions.is_empty(),
+    assert_ne!(
+        positions.len(),
+        0,
         "subscript expression must contain at least one position"
     );
-
-    let ecx = &ecx.with_name("subscripting");
+    if positions.len() > 1 {
+        ecx.require_experimental_mode("layered/multidimensional slicing")?;
+    }
     let expr = plan_expr(ecx, expr)?.type_as_any(ecx)?;
     let ty = ecx.scalar_type(&expr);
     match &ty {
-        ScalarType::Array(..) | ScalarType::Int2Vector => plan_subscript_array(
-            ecx,
-            expr,
-            positions,
-            if matches!(ty, ScalarType::Array(..)) {
-                1
-            } else {
-                0
-            },
-        ),
-        ScalarType::Jsonb => plan_subscript_jsonb(ecx, expr, positions),
-        ScalarType::List { element_type, .. } => {
-            let elem_type_name = ecx.humanize_scalar_type(&element_type);
-            let n_layers = ty.unwrap_list_n_layers();
-            plan_subscript_list(ecx, expr, positions, n_layers, &elem_type_name)
+        ScalarType::List { .. } => {
+            let pos_len = positions.len();
+            let n_dims = ty.unwrap_list_n_dims();
+            if pos_len > n_dims {
+                sql_bail!(
+                    "cannot slice into {} layers; list only has {} layer{}",
+                    pos_len,
+                    n_dims,
+                    if n_dims == 1 { "" } else { "s" }
+                )
+            }
         }
         ty => sql_bail!("cannot subscript type {}", ecx.humanize_scalar_type(&ty)),
-    }
-}
-
-// All subscript positions are of the form [<expr>(:<expr>?)?]; extract all
-// expressions from those that look like indexes (i.e. `[<expr>]`) or error if
-// any were slices (i.e. included colon).
-fn extract_scalar_subscript_from_positions<'a>(
-    positions: &'a [SubscriptPosition<Aug>],
-    expr_type_name: &str,
-) -> Result<Vec<&'a Expr<Aug>>, PlanError> {
-    let mut scalar_subscripts = Vec::with_capacity(positions.len());
-    for p in positions {
-        if p.explicit_slice {
-            sql_bail!("{} subscript does not support slices", expr_type_name);
-        }
-        assert!(
-            p.end.is_none(),
-            "index-appearing subscripts cannot have end value"
-        );
-        scalar_subscripts.push(p.start.as_ref().expect("has start if not slice"));
-    }
-    Ok(scalar_subscripts)
-}
-
-fn plan_subscript_array(
-    ecx: &ExprContext,
-    expr: HirScalarExpr,
-    positions: &[SubscriptPosition<Aug>],
-    offset: usize,
-) -> Result<CoercibleScalarExpr, PlanError> {
-    let mut exprs = Vec::with_capacity(positions.len() + 1);
-    exprs.push(expr);
-
-    // Subscripting arrays doesn't yet support slicing, so we always want to
-    // extract scalars or error.
-    let indexes = extract_scalar_subscript_from_positions(positions, "array")?;
-
-    for i in indexes {
-        exprs.push(plan_expr(ecx, i)?.cast_to(ecx, CastContext::Explicit, &ScalarType::Int64)?);
-    }
-
-    Ok(HirScalarExpr::CallVariadic {
-        func: VariadicFunc::ArrayIndex { offset },
-        exprs,
-    }
-    .into())
-}
-
-fn plan_subscript_list(
-    ecx: &ExprContext,
-    mut expr: HirScalarExpr,
-    positions: &[SubscriptPosition<Aug>],
-    mut remaining_layers: usize,
-    elem_type_name: &str,
-) -> Result<CoercibleScalarExpr, PlanError> {
-    let mut i = 0;
-
-    while i < positions.len() {
-        // Take all contiguous index operations, i.e. find next slice operation.
-        let j = positions[i..]
-            .iter()
-            .position(|p| p.explicit_slice)
-            .unwrap_or(positions.len() - i);
-        if j != 0 {
-            let indexes = extract_scalar_subscript_from_positions(&positions[i..i + j], "")?;
-            let (n, e) = plan_index_list(
-                ecx,
-                expr,
-                indexes.as_slice(),
-                remaining_layers,
-                &elem_type_name,
-            )?;
-            remaining_layers = n;
-            expr = e;
-            i += j;
-        }
-
-        // Take all contiguous slice operations, i.e. find next index operation.
-        let j = positions[i..]
-            .iter()
-            .position(|p| !p.explicit_slice)
-            .unwrap_or(positions.len() - i);
-        if j != 0 {
-            expr = plan_slice_list(
-                ecx,
-                expr,
-                &positions[i..i + j],
-                remaining_layers,
-                &elem_type_name,
-            )?;
-            i += j;
-        }
-    }
-
-    Ok(expr.into())
-}
-
-fn plan_index_list(
-    ecx: &ExprContext,
-    expr: HirScalarExpr,
-    indexes: &[&Expr<Aug>],
-    n_layers: usize,
-    elem_type_name: &str,
-) -> Result<(usize, HirScalarExpr), PlanError> {
-    let depth = indexes.len();
-
-    if depth > n_layers {
-        if n_layers == 0 {
-            sql_bail!("cannot subscript type {}", elem_type_name)
-        } else {
-            sql_bail!(
-                "cannot index into {} layers; list only has {} layer{}",
-                depth,
-                n_layers,
-                if n_layers == 1 { "" } else { "s" }
-            )
-        }
-    }
-
-    let mut exprs = Vec::with_capacity(depth + 1);
-    exprs.push(expr);
-
-    for i in indexes {
-        exprs.push(plan_expr(ecx, i)?.cast_to(ecx, CastContext::Explicit, &ScalarType::Int64)?);
-    }
-
-    Ok((
-        n_layers - depth,
-        HirScalarExpr::CallVariadic {
-            func: VariadicFunc::ListIndex,
-            exprs,
-        },
-    ))
-}
-
-fn plan_slice_list(
-    ecx: &ExprContext,
-    expr: HirScalarExpr,
-    slices: &[SubscriptPosition<Aug>],
-    n_layers: usize,
-    elem_type_name: &str,
-) -> Result<HirScalarExpr, PlanError> {
-    if n_layers == 0 {
-        sql_bail!("cannot subscript type {}", elem_type_name)
-    }
-
-    // first arg will be list
-    let mut exprs = Vec::with_capacity(slices.len() + 1);
-    exprs.push(expr);
-    // extract (start, end) parts from collected slices
-    let extract_position_or_default = |position, default| -> Result<HirScalarExpr, PlanError> {
-        Ok(match position {
-            Some(p) => {
-                plan_expr(ecx, p)?.cast_to(ecx, CastContext::Explicit, &ScalarType::Int64)?
-            }
-            None => HirScalarExpr::literal(Datum::Int64(default), ScalarType::Int64),
-        })
     };
-    for p in slices {
-        let start = extract_position_or_default(p.start.as_ref(), 1)?;
-        let end = extract_position_or_default(p.end.as_ref(), i64::MAX - 1)?;
+
+    let mut exprs = vec![expr];
+    let op_str = "subscript (slicing)";
+
+    for p in positions {
+        let start = if let Some(start) = &p.start {
+            plan_expr(ecx, start)?.cast_to(
+                op_str,
+                ecx,
+                CastContext::Explicit,
+                &ScalarType::Int64,
+            )?
+        } else {
+            HirScalarExpr::literal(Datum::Int64(1), ScalarType::Int64)
+        };
+
+        let end = if let Some(end) = &p.end {
+            plan_expr(ecx, end)?.cast_to(op_str, ecx, CastContext::Explicit, &ScalarType::Int64)?
+        } else {
+            HirScalarExpr::literal(Datum::Int64(i64::MAX - 1), ScalarType::Int64)
+        };
+
         exprs.push(start);
         exprs.push(end);
     }
 
     Ok(HirScalarExpr::CallVariadic {
-        func: VariadicFunc::ListSliceLinear,
+        func: VariadicFunc::ListSlice,
         exprs,
-    })
-}
-
-fn plan_like(
-    ecx: &ExprContext,
-    expr: &Expr<Aug>,
-    pattern: &Expr<Aug>,
-    escape: Option<&Expr<Aug>>,
-    case_insensitive: bool,
-    not: bool,
-) -> Result<HirScalarExpr, PlanError> {
-    use CastContext::Implicit;
-    let ecx = ecx.with_name("LIKE argument");
-    let expr = plan_expr(&ecx, expr)?;
-    let haystack = match ecx.scalar_type(&expr) {
-        Some(ref ty @ ScalarType::Char { length }) => expr
-            .type_as(&ecx, ty)?
-            .call_unary(UnaryFunc::PadChar(expr_func::PadChar { length })),
-        _ => expr.cast_to(&ecx, Implicit, &ScalarType::String)?,
-    };
-    let mut pattern = plan_expr(&ecx, pattern)?.cast_to(&ecx, Implicit, &ScalarType::String)?;
-    if let Some(escape) = escape {
-        pattern = pattern.call_binary(
-            plan_expr(&ecx, escape)?.cast_to(&ecx, Implicit, &ScalarType::String)?,
-            BinaryFunc::LikeEscape,
-        );
     }
-    let like = haystack.call_binary(pattern, BinaryFunc::IsLikeMatch { case_insensitive });
-    if not {
-        Ok(like.call_unary(UnaryFunc::Not(expr_func::Not)))
-    } else {
-        Ok(like)
-    }
-}
-
-fn plan_subscript_jsonb(
-    ecx: &ExprContext,
-    expr: HirScalarExpr,
-    positions: &[SubscriptPosition<Aug>],
-) -> Result<CoercibleScalarExpr, PlanError> {
-    use CastContext::Implicit;
-    use ScalarType::{Int64, String};
-
-    // JSONB doesn't support the slicing syntax, so simply error if you
-    // encounter any explicit slices.
-    let subscripts = extract_scalar_subscript_from_positions(positions, "jsonb")?;
-
-    let mut exprs = Vec::with_capacity(subscripts.len());
-    for s in subscripts {
-        let subscript = plan_expr(ecx, s)?;
-        let subscript = if let Ok(subscript) = subscript.clone().cast_to(ecx, Implicit, &String) {
-            subscript
-        } else if let Ok(subscript) = subscript.cast_to(ecx, Implicit, &Int64) {
-            // Integers are converted to a string here and then re-parsed as an
-            // integer by `JsonbGetPath`. Weird, but this is how PostgreSQL says to
-            // do it.
-            typeconv::to_string(ecx, subscript)
-        } else {
-            sql_bail!("jsonb subscript type must be coercible to integer or text");
-        };
-        exprs.push(subscript);
-    }
-
-    // Subscripting works like `expr #> ARRAY[subscript]` rather than
-    // `expr->subscript` as you might expect.
-    let expr = expr.call_binary(
-        HirScalarExpr::CallVariadic {
-            func: VariadicFunc::ArrayCreate {
-                elem_type: ScalarType::String,
-            },
-            exprs,
-        },
-        BinaryFunc::JsonbGetPath { stringify: false },
-    );
-    Ok(expr.into())
+    .into())
 }
 
 fn plan_exists(ecx: &ExprContext, query: &Query<Aug>) -> Result<CoercibleScalarExpr, PlanError> {
@@ -3363,74 +3040,9 @@ fn plan_list_subquery(
     ecx: &ExprContext,
     query: &Query<Aug>,
 ) -> Result<CoercibleScalarExpr, PlanError> {
-    plan_vector_like_subquery(
-        ecx,
-        query,
-        |_| false,
-        |elem_type| VariadicFunc::ListCreate { elem_type },
-        |order_by| AggregateFunc::ListConcat { order_by },
-        BinaryFunc::ListListConcat,
-        |elem_type| {
-            HirScalarExpr::literal(
-                Datum::empty_list(),
-                ScalarType::List {
-                    element_type: Box::new(elem_type),
-                    custom_oid: None,
-                },
-            )
-        },
-        "list",
-    )
-}
-
-fn plan_array_subquery(
-    ecx: &ExprContext,
-    query: &Query<Aug>,
-) -> Result<CoercibleScalarExpr, PlanError> {
-    ecx.require_experimental_mode("array subquery")?;
-    plan_vector_like_subquery(
-        ecx,
-        query,
-        |elem_type| {
-            matches!(
-                elem_type,
-                ScalarType::Char { .. }
-                    | ScalarType::Array { .. }
-                    | ScalarType::List { .. }
-                    | ScalarType::Map { .. }
-            )
-        },
-        |elem_type| VariadicFunc::ArrayCreate { elem_type },
-        |order_by| AggregateFunc::ArrayConcat { order_by },
-        BinaryFunc::ArrayArrayConcat,
-        |elem_type| {
-            HirScalarExpr::literal(Datum::empty_array(), ScalarType::Array(Box::new(elem_type)))
-        },
-        "[]",
-    )
-}
-
-/// Generic function used to plan both array subqueries and list subqueries
-fn plan_vector_like_subquery<F1, F2, F3, F4>(
-    ecx: &ExprContext,
-    query: &Query<Aug>,
-    is_unsupported_type: F1,
-    vector_create: F2,
-    aggregate_concat: F3,
-    binary_concat: BinaryFunc,
-    empty_literal: F4,
-    vector_type_string: &str,
-) -> Result<CoercibleScalarExpr, PlanError>
-where
-    F1: Fn(&ScalarType) -> bool,
-    F2: Fn(ScalarType) -> VariadicFunc,
-    F3: Fn(Vec<ColumnOrder>) -> AggregateFunc,
-    F4: Fn(ScalarType) -> HirScalarExpr,
-{
     if !ecx.allow_subqueries {
         sql_bail!("{} does not allow subqueries", ecx.name)
     }
-
     let mut qcx = ecx.derived_query_context();
     let (mut expr, _scope, finishing) = plan_query(&mut qcx, query)?;
     if finishing.limit.is_some() || finishing.offset > 0 {
@@ -3459,18 +3071,12 @@ where
         .unwrap()
         .scalar_type();
 
-    if is_unsupported_type(&elem_type) {
-        bail_unsupported!(format!(
-            "cannot build array from subquery because return type {}{}",
-            ecx.humanize_scalar_type(&elem_type),
-            vector_type_string
-        ));
-    }
-
     // `ColumnRef`s in `aggregation_exprs` refers to the columns produced by planning the
     // subquery above.
     let aggregation_exprs: Vec<_> = iter::once(HirScalarExpr::CallVariadic {
-        func: vector_create(elem_type.clone()),
+        func: VariadicFunc::ListCreate {
+            elem_type: elem_type.clone(),
+        },
         exprs: vec![HirScalarExpr::column(project_column)],
     })
     .chain(
@@ -3496,7 +3102,9 @@ where
         .reduce(
             vec![],
             vec![AggregateExpr {
-                func: aggregate_concat(aggregation_order_by),
+                func: AggregateFunc::ListConcat {
+                    order_by: aggregation_order_by,
+                },
                 expr: Box::new(HirScalarExpr::CallVariadic {
                     func: VariadicFunc::RecordCreate {
                         field_names: iter::repeat(ColumnName::from(""))
@@ -3511,11 +3119,17 @@ where
         )
         .project(aggregation_projection);
 
-    // If `expr` has no rows, return an empty array/list rather than NULL.
+    // If `expr` has no rows, return an empty list rather than NULL.
     Ok(HirScalarExpr::CallBinary {
-        func: binary_concat,
+        func: BinaryFunc::ListListConcat,
         expr1: Box::new(HirScalarExpr::Select(Box::new(reduced_expr))),
-        expr2: Box::new(empty_literal(elem_type)),
+        expr2: Box::new(HirScalarExpr::literal(
+            Datum::empty_list(),
+            ScalarType::List {
+                element_type: Box::new(elem_type),
+                custom_oid: None,
+            },
+        )),
     }
     .into())
 }
@@ -3552,64 +3166,34 @@ where
     Ok(out)
 }
 
-/// Plans an `ARRAY` expression.
 fn plan_array(
     ecx: &ExprContext,
     exprs: &[Expr<Aug>],
     type_hint: Option<&ScalarType>,
 ) -> Result<CoercibleScalarExpr, PlanError> {
-    // Plan each element expression.
-    let mut out = vec![];
-    for expr in exprs {
-        out.push(match expr {
-            // Special case nested ARRAY expressions so we can plumb
-            // the type hint through.
-            Expr::Array(exprs) => plan_array(ecx, exprs, type_hint.clone())?,
-            _ => plan_expr(ecx, expr)?,
-        });
-    }
-
-    // Attempt to make use of the type hint.
-    let type_hint = match type_hint {
-        // The user has provided an explicit cast to an array type. We know the
-        // element type to coerce to. Need to be careful, though: if there's
-        // evidence that any of the array elements are themselves arrays, we
-        // want to coerce to the array type, not the element type.
-        Some(ScalarType::Array(elem_type)) => {
-            let multidimensional = out
-                .iter()
-                .any(|e| matches!(ecx.scalar_type(e), Some(ScalarType::Array(_))));
-            if multidimensional {
-                type_hint
-            } else {
-                Some(&**elem_type)
-            }
-        }
-        // The user provided an explicit cast to a non-array type. We'll have to
-        // guess what the correct type for the array. Our caller will then
-        // handle converting that array type to the desired non-array type.
-        Some(_) => None,
-        // No type hint. We'll have to guess the correct type for the array.
-        None => None,
-    };
-
-    // Coerce all elements to the same type.
     let (elem_type, exprs) = if exprs.is_empty() {
-        if let Some(elem_type) = type_hint {
-            (elem_type.clone(), vec![])
+        if let Some(ScalarType::Array(elem_type)) = type_hint {
+            ((**elem_type).clone(), vec![])
         } else {
             sql_bail!("cannot determine type of empty array");
         }
     } else {
-        let out = coerce_homogeneous_exprs(&ecx.with_name("ARRAY"), out, type_hint)?;
+        let mut out = vec![];
+        for expr in exprs {
+            out.push(match expr {
+                // Special case nested ARRAY expressions so we can plumb
+                // the type hint through.
+                Expr::Array(exprs) => plan_array(ecx, exprs, type_hint.clone())?,
+                _ => plan_expr(ecx, expr)?,
+            });
+        }
+        let type_hint = match type_hint {
+            Some(ScalarType::Array(elem_type)) => Some(&**elem_type),
+            _ => None,
+        };
+        let out = coerce_homogeneous_exprs("ARRAY expression", ecx, out, type_hint)?;
         (ecx.scalar_type(&out[0]), out)
     };
-
-    // Arrays of `char` type are disallowed due to a known limitation:
-    // https://github.com/MaterializeInc/materialize/issues/7613.
-    //
-    // Arrays of `list` and `map` types are disallowed due to mind-bending
-    // semantics.
     if matches!(
         elem_type,
         ScalarType::Char { .. } | ScalarType::List { .. } | ScalarType::Map { .. }
@@ -3631,7 +3215,7 @@ fn plan_list(
 ) -> Result<CoercibleScalarExpr, PlanError> {
     let (elem_type, exprs) = if exprs.is_empty() {
         if let Some(ScalarType::List { element_type, .. }) = type_hint {
-            (element_type.without_modifiers(), vec![])
+            (element_type.default_embedded_value(), vec![])
         } else {
             sql_bail!("cannot determine type of empty list");
         }
@@ -3650,8 +3234,8 @@ fn plan_list(
                 _ => plan_expr(ecx, expr)?,
             });
         }
-        let out = coerce_homogeneous_exprs(&ecx.with_name("LIST"), out, type_hint)?;
-        (ecx.scalar_type(&out[0]).without_modifiers(), out)
+        let out = coerce_homogeneous_exprs("LIST expression", ecx, out, type_hint)?;
+        (ecx.scalar_type(&out[0]).default_embedded_value(), out)
     };
 
     if matches!(elem_type, ScalarType::Char { .. }) {
@@ -3670,11 +3254,6 @@ fn plan_list(
 /// same order as the input, where each expression has the appropriate casts to
 /// make them all of a uniform type.
 ///
-/// If `force_type` is `Some`, the expressions are forced to the specified type
-/// via an explicit cast. Otherwise the best common type is guessed via
-/// [`typeconv::guess_best_common_type`] and conversions are attempted via
-/// implicit casts
-///
 /// Note that this is our implementation of Postgres' type conversion for
 /// ["`UNION`, `CASE`, and Related Constructs"][union-type-conv], though it
 /// isn't yet used in all of those cases.
@@ -3682,35 +3261,29 @@ fn plan_list(
 /// [union-type-conv]:
 /// https://www.postgresql.org/docs/12/typeconv-union-case.html
 pub fn coerce_homogeneous_exprs(
+    name: &str,
     ecx: &ExprContext,
     exprs: Vec<CoercibleScalarExpr>,
-    force_type: Option<&ScalarType>,
+    type_hint: Option<&ScalarType>,
 ) -> Result<Vec<HirScalarExpr>, PlanError> {
     assert!(!exprs.is_empty());
 
-    let target_holder;
-    let target = match force_type {
+    let types: Vec<_> = exprs.iter().map(|e| ecx.scalar_type(e)).collect();
+
+    let target = match typeconv::guess_best_common_type(&types, type_hint) {
         Some(t) => t,
-        None => {
-            let types: Vec<_> = exprs.iter().map(|e| ecx.scalar_type(e)).collect();
-            target_holder = typeconv::guess_best_common_type(ecx, &types)?;
-            &target_holder
-        }
+        None => sql_bail!("Cannot determine homogenous type for arguments to {}", name),
     };
 
     // Try to cast all expressions to `target`.
     let mut out = Vec::new();
     for expr in exprs {
-        let arg = typeconv::plan_coerce(&ecx, expr, &target)?;
-        let ccx = match force_type {
-            None => CastContext::Implicit,
-            Some(_) => CastContext::Explicit,
-        };
-        match typeconv::plan_cast(ecx, ccx, arg.clone(), &target) {
+        let arg = typeconv::plan_coerce(ecx, expr, &target)?;
+        match typeconv::plan_cast(name, ecx, CastContext::Implicit, arg.clone(), &target) {
             Ok(expr) => out.push(expr),
             Err(_) => sql_bail!(
-                "{} could not convert type {} to {}",
-                ecx.name,
+                "{} cannot be cast to uniform type: {} vs {}",
+                name,
                 ecx.humanize_scalar_type(&ecx.scalar_type(&arg)),
                 ecx.humanize_scalar_type(&target),
             ),
@@ -3880,7 +3453,7 @@ fn plan_identifier(ecx: &ExprContext, names: &[Ident]) -> Result<HirScalarExpr, 
     // to a table.
     let items = ecx.scope.items_from_table(
         &ecx.qcx.outer_scopes,
-        &PartialObjectName {
+        &PartialName {
             database: None,
             schema: None,
             item: col_name.as_str().to_owned(),
@@ -3900,41 +3473,18 @@ fn plan_identifier(ecx: &ExprContext, names: &[Ident]) -> Result<HirScalarExpr, 
         // The name refers to a normal table. Return a record containing all the
         // columns of the table.
         _ => {
-            let mut has_exists_column = None;
             let (exprs, field_names): (Vec<_>, Vec<_>) = items
                 .into_iter()
-                .filter_map(|(column, item)| {
-                    if item.is_exists_column_for_a_table_function_that_was_in_the_target_list {
-                        has_exists_column = Some(column);
-                        None
-                    } else {
-                        let expr = HirScalarExpr::Column(column);
-                        let name = item.column_name.clone();
-                        Some((expr, name))
-                    }
+                .map(|(column, item)| {
+                    let expr = HirScalarExpr::Column(column);
+                    let name = item.column_name.clone();
+                    (expr, name)
                 })
                 .unzip();
-            // For the special case of a table function with a single column, the single column is instead not wrapped.
-            let expr = if exprs.len() == 1 && has_exists_column.is_some() {
-                exprs.into_element()
-            } else {
-                HirScalarExpr::CallVariadic {
-                    func: VariadicFunc::RecordCreate { field_names },
-                    exprs,
-                }
-            };
-            if let Some(has_exists_column) = has_exists_column {
-                Ok(HirScalarExpr::If {
-                    cond: Box::new(HirScalarExpr::CallUnary {
-                        func: UnaryFunc::IsNull(mz_expr::func::IsNull),
-                        expr: Box::new(HirScalarExpr::Column(has_exists_column)),
-                    }),
-                    then: Box::new(HirScalarExpr::literal_null(ecx.scalar_type(&expr))),
-                    els: Box::new(expr),
-                })
-            } else {
-                Ok(expr)
-            }
+            Ok(HirScalarExpr::CallVariadic {
+                func: VariadicFunc::RecordCreate { field_names },
+                exprs,
+            })
         }
     }
 }
@@ -4094,7 +3644,7 @@ fn plan_function<'a>(
 pub fn resolve_func(
     ecx: &ExprContext,
     name: &UnresolvedObjectName,
-    args: &mz_sql_parser::ast::FunctionArgs<Aug>,
+    args: &sql_parser::ast::FunctionArgs<Aug>,
 ) -> Result<&'static Func, PlanError> {
     if let Ok(i) = ecx.qcx.scx.resolve_function(name.clone()) {
         if let Ok(f) = i.func() {
@@ -4105,8 +3655,8 @@ pub fn resolve_func(
     // Couldn't resolve function with this name, so generate verbose error
     // message.
     let cexprs = match args {
-        mz_sql_parser::ast::FunctionArgs::Star => vec![],
-        mz_sql_parser::ast::FunctionArgs::Args { args, order_by } => {
+        sql_parser::ast::FunctionArgs::Star => vec![],
+        sql_parser::ast::FunctionArgs::Args { args, order_by } => {
             if !order_by.is_empty() {
                 sql_bail!(
                     "ORDER BY specified, but {} is not an aggregate function",
@@ -4186,11 +3736,8 @@ fn plan_case<'a>(
         Some(else_result) => else_result,
         None => &Expr::Value(Value::Null),
     });
-    let mut result_exprs = coerce_homogeneous_exprs(
-        &ecx.with_name("CASE"),
-        plan_exprs(ecx, &result_exprs)?,
-        None,
-    )?;
+    let mut result_exprs =
+        coerce_homogeneous_exprs("CASE", ecx, plan_exprs(ecx, &result_exprs)?, None)?;
     let mut expr = result_exprs.pop().unwrap();
     assert_eq!(cond_exprs.len(), result_exprs.len());
     for (cexpr, rexpr) in cond_exprs.into_iter().zip(result_exprs).rev() {
@@ -4214,10 +3761,10 @@ fn plan_literal<'a>(l: &'a Value) -> Result<CoercibleScalarExpr, PlanError> {
                 } else if let Ok(n) = d.0.try_into() {
                     (Datum::Int64(n), ScalarType::Int64)
                 } else {
-                    (Datum::Numeric(d), ScalarType::Numeric { max_scale: None })
+                    (Datum::Numeric(d), ScalarType::Numeric { scale: None })
                 }
             } else {
-                (Datum::Numeric(d), ScalarType::Numeric { max_scale: None })
+                (Datum::Numeric(d), ScalarType::Numeric { scale: None })
             }
         }
         Value::HexString(_) => bail_unsupported!(3114, "hex string literals"),
@@ -4226,14 +3773,8 @@ fn plan_literal<'a>(l: &'a Value) -> Result<CoercibleScalarExpr, PlanError> {
             true => (Datum::True, ScalarType::Bool),
         },
         Value::Interval(iv) => {
-            let leading_precision = parser_datetimefield_to_adt(iv.precision_high);
             let mut i = strconv::parse_interval_w_disambiguator(
                 &iv.value,
-                match leading_precision {
-                    mz_repr::adt::datetime::DateTimeField::Hour
-                    | mz_repr::adt::datetime::DateTimeField::Minute => Some(leading_precision),
-                    _ => None,
-                },
                 parser_datetimefield_to_adt(iv.precision_low),
             )?;
             i.truncate_high_fields(parser_datetimefield_to_adt(iv.precision_high));
@@ -4258,40 +3799,48 @@ fn plan_literal<'a>(l: &'a Value) -> Result<CoercibleScalarExpr, PlanError> {
 // Implement these as two identical enums without From/Into impls so that they
 // have no cross-package dependencies, leaving that work up to this crate.
 fn parser_datetimefield_to_adt(
-    dtf: mz_sql_parser::ast::DateTimeField,
-) -> mz_repr::adt::datetime::DateTimeField {
-    use mz_sql_parser::ast::DateTimeField::*;
+    dtf: sql_parser::ast::DateTimeField,
+) -> repr::adt::datetime::DateTimeField {
+    use sql_parser::ast::DateTimeField::*;
     match dtf {
-        Millennium => mz_repr::adt::datetime::DateTimeField::Millennium,
-        Century => mz_repr::adt::datetime::DateTimeField::Century,
-        Decade => mz_repr::adt::datetime::DateTimeField::Decade,
-        Year => mz_repr::adt::datetime::DateTimeField::Year,
-        Month => mz_repr::adt::datetime::DateTimeField::Month,
-        Day => mz_repr::adt::datetime::DateTimeField::Day,
-        Hour => mz_repr::adt::datetime::DateTimeField::Hour,
-        Minute => mz_repr::adt::datetime::DateTimeField::Minute,
-        Second => mz_repr::adt::datetime::DateTimeField::Second,
-        Milliseconds => mz_repr::adt::datetime::DateTimeField::Milliseconds,
-        Microseconds => mz_repr::adt::datetime::DateTimeField::Microseconds,
+        Year => repr::adt::datetime::DateTimeField::Year,
+        Month => repr::adt::datetime::DateTimeField::Month,
+        Day => repr::adt::datetime::DateTimeField::Day,
+        Hour => repr::adt::datetime::DateTimeField::Hour,
+        Minute => repr::adt::datetime::DateTimeField::Minute,
+        Second => repr::adt::datetime::DateTimeField::Second,
     }
 }
 
 pub fn scalar_type_from_sql(
     scx: &StatementContext,
-    data_type: &ResolvedDataType,
+    data_type: &DataType<Aug>,
 ) -> Result<ScalarType, PlanError> {
-    match data_type {
-        ResolvedDataType::AnonymousList(elem_type) => {
+    Ok(match data_type {
+        DataType::Array(elem_type) => {
             let elem_type = scalar_type_from_sql(scx, &elem_type)?;
+            if matches!(
+                elem_type,
+                ScalarType::Char { .. } | ScalarType::List { .. } | ScalarType::Map { .. }
+            ) {
+                bail_unsupported!(format!("{}[]", scx.humanize_scalar_type(&elem_type)));
+            }
+
+            ScalarType::Array(Box::new(elem_type))
+        }
+        DataType::List(elem_type) => {
+            let elem_type = scalar_type_from_sql(scx, &elem_type)?;
+
             if matches!(elem_type, ScalarType::Char { .. }) {
                 bail_unsupported!("char list");
             }
-            Ok(ScalarType::List {
+
+            ScalarType::List {
                 element_type: Box::new(elem_type),
                 custom_oid: None,
-            })
+            }
         }
-        ResolvedDataType::AnonymousMap {
+        DataType::Map {
             key_type,
             value_type,
         } => {
@@ -4303,333 +3852,162 @@ pub fn scalar_type_from_sql(
                     scx.humanize_scalar_type(&other)
                 ),
             }
-            Ok(ScalarType::Map {
+            ScalarType::Map {
                 value_type: Box::new(scalar_type_from_sql(scx, &value_type)?),
                 custom_oid: None,
-            })
+            }
         }
-        ResolvedDataType::Named { id, modifiers, .. } => {
-            scalar_type_from_catalog(scx, *id, modifiers)
-        }
-        ResolvedDataType::Error => unreachable!("should have been caught in name resolution"),
-    }
-}
-
-fn scalar_type_from_catalog(
-    scx: &StatementContext,
-    id: GlobalId,
-    modifiers: &[i64],
-) -> Result<ScalarType, PlanError> {
-    let entry = scx.catalog.get_item(&id);
-    let type_details = match entry.type_details() {
-        Some(type_details) => type_details,
-        None => sql_bail!(
-            "{} does not refer to a type",
-            scx.catalog
-                .resolve_full_name(entry.name())
-                .to_string()
-                .quoted()
-        ),
-    };
-    match &type_details.typ {
-        CatalogType::Numeric => {
-            let mut modifiers = modifiers.iter().fuse();
-            let precision = match modifiers.next() {
-                Some(p) if *p < 1 || *p > i64::from(NUMERIC_DATUM_MAX_PRECISION) => {
-                    sql_bail!(
-                        "precision for type numeric must be between 1 and {}",
-                        NUMERIC_DATUM_MAX_PRECISION,
-                    );
-                }
-                Some(p) => Some(*p),
-                None => None,
+        DataType::Other { name, typ_mod } => {
+            let item = match scx.catalog.resolve_item(&name.raw_name()) {
+                Ok(i) => i,
+                Err(_) => sql_bail!(
+                    "type {} does not exist",
+                    name.raw_name().to_string().quoted()
+                ),
             };
-            let scale = match modifiers.next() {
-                Some(scale) => {
-                    if let Some(precision) = precision {
-                        if *scale > precision {
-                            sql_bail!(
-                                "scale for type numeric must be between 0 and precision {}",
-                                precision
-                            );
-                        }
+            match scx.catalog.try_get_lossy_scalar_type_by_id(&item.id()) {
+                Some(t) => match t {
+                    ScalarType::Numeric { .. } => {
+                        let scale = numeric::extract_typ_mod(typ_mod)?;
+                        ScalarType::Numeric { scale }
                     }
-                    Some(NumericMaxScale::try_from(*scale)?)
-                }
-                None => None,
-            };
-            if modifiers.next().is_some() {
-                sql_bail!("type numeric supports at most two type modifiers");
-            }
-            Ok(ScalarType::Numeric { max_scale: scale })
-        }
-        CatalogType::Char => {
-            let mut modifiers = modifiers.iter().fuse();
-            let length = match modifiers.next() {
-                Some(l) => Some(CharLength::try_from(*l)?),
-                None => Some(CharLength::ONE),
-            };
-            if modifiers.next().is_some() {
-                sql_bail!("type character supports at most one type modifier");
-            }
-            Ok(ScalarType::Char { length })
-        }
-        CatalogType::VarChar => {
-            let mut modifiers = modifiers.iter().fuse();
-            let length = match modifiers.next() {
-                Some(l) => Some(VarCharMaxLength::try_from(*l)?),
-                None => None,
-            };
-            if modifiers.next().is_some() {
-                sql_bail!("type character varying supports at most one type modifier");
-            }
-            Ok(ScalarType::VarChar { max_length: length })
-        }
-        t => {
-            if !modifiers.is_empty() {
-                sql_bail!(
-                    "{} does not support type modifiers",
-                    scx.catalog.resolve_full_name(entry.name()).to_string()
-                );
-            }
-            match t {
-                CatalogType::Array {
-                    element_reference: element_id,
-                } => Ok(ScalarType::Array(Box::new(scalar_type_from_catalog(
-                    scx,
-                    *element_id,
-                    modifiers,
-                )?))),
-                CatalogType::List {
-                    element_reference: element_id,
-                } => Ok(ScalarType::List {
-                    element_type: Box::new(scalar_type_from_catalog(scx, *element_id, &[])?),
-                    custom_oid: Some(scx.catalog.get_item(&id).oid()),
-                }),
-                CatalogType::Map {
-                    key_reference: _,
-                    value_reference: value_id,
-                } => Ok(ScalarType::Map {
-                    value_type: Box::new(scalar_type_from_catalog(scx, *value_id, &[])?),
-                    custom_oid: Some(scx.catalog.get_item(&id).oid()),
-                }),
-                CatalogType::Record { fields } => {
-                    let scalars: Vec<(ColumnName, ColumnType)> = fields
-                        .iter()
-                        .map(|(column, id)| {
-                            let scalar_type = scalar_type_from_catalog(scx, *id, &[])?;
-                            Ok((
-                                column.clone(),
-                                ColumnType {
-                                    scalar_type,
-                                    nullable: true,
-                                },
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, PlanError>>()?;
-                    let catalog_item = scx.catalog.get_item(&id);
-                    Ok(ScalarType::Record {
-                        fields: scalars,
-                        custom_name: None,
-                        custom_oid: Some(catalog_item.oid()),
-                    })
-                }
-                CatalogType::Bool => Ok(ScalarType::Bool),
-                CatalogType::Bytes => Ok(ScalarType::Bytes),
-                CatalogType::Date => Ok(ScalarType::Date),
-                CatalogType::Float32 => Ok(ScalarType::Float32),
-                CatalogType::Float64 => Ok(ScalarType::Float64),
-                CatalogType::Int16 => Ok(ScalarType::Int16),
-                CatalogType::Int32 => Ok(ScalarType::Int32),
-                CatalogType::Int64 => Ok(ScalarType::Int64),
-                CatalogType::Interval => Ok(ScalarType::Interval),
-                CatalogType::Jsonb => Ok(ScalarType::Jsonb),
-                CatalogType::Oid => Ok(ScalarType::Oid),
-                CatalogType::PgLegacyChar => Ok(ScalarType::PgLegacyChar),
-                CatalogType::Pseudo => {
-                    sql_bail!(
-                        "cannot reference pseudo type {}",
-                        scx.catalog.resolve_full_name(entry.name()).to_string()
-                    )
-                }
-                CatalogType::RegClass => Ok(ScalarType::RegClass),
-                CatalogType::RegProc => Ok(ScalarType::RegProc),
-                CatalogType::RegType => Ok(ScalarType::RegType),
-                CatalogType::String => Ok(ScalarType::String),
-                CatalogType::Time => Ok(ScalarType::Time),
-                CatalogType::Timestamp => Ok(ScalarType::Timestamp),
-                CatalogType::TimestampTz => Ok(ScalarType::TimestampTz),
-                CatalogType::Uuid => Ok(ScalarType::Uuid),
-                CatalogType::Int2Vector => Ok(ScalarType::Int2Vector),
-                CatalogType::Numeric => unreachable!("handled above"),
-                CatalogType::Char => unreachable!("handled above"),
-                CatalogType::VarChar => unreachable!("handled above"),
+                    ScalarType::Char { .. } => {
+                        let length = repr::adt::char::extract_typ_mod(&typ_mod)?;
+                        ScalarType::Char { length }
+                    }
+                    ScalarType::VarChar { .. } => {
+                        let length = repr::adt::varchar::extract_typ_mod(&typ_mod)?;
+                        ScalarType::VarChar { length }
+                    }
+                    t => {
+                        if !typ_mod.is_empty() {
+                            sql_bail!("{} does not support type modifiers", &name.to_string());
+                        }
+                        t
+                    }
+                },
+                None => sql_bail!(
+                    "type {} does not exist",
+                    name.raw_name().to_string().quoted()
+                ),
             }
         }
+    })
+}
+
+pub fn scalar_type_from_pg(ty: &pgrepr::Type) -> Result<ScalarType, PlanError> {
+    match ty {
+        pgrepr::Type::Bool => Ok(ScalarType::Bool),
+        pgrepr::Type::Int2 => Ok(ScalarType::Int16),
+        pgrepr::Type::Int4 => Ok(ScalarType::Int32),
+        pgrepr::Type::Int8 => Ok(ScalarType::Int64),
+        pgrepr::Type::Float4 => Ok(ScalarType::Float32),
+        pgrepr::Type::Float8 => Ok(ScalarType::Float64),
+        pgrepr::Type::Numeric => Ok(ScalarType::Numeric { scale: None }),
+        pgrepr::Type::Date => Ok(ScalarType::Date),
+        pgrepr::Type::Time => Ok(ScalarType::Time),
+        pgrepr::Type::Timestamp => Ok(ScalarType::Timestamp),
+        pgrepr::Type::TimestampTz => Ok(ScalarType::TimestampTz),
+        pgrepr::Type::Interval => Ok(ScalarType::Interval),
+        pgrepr::Type::Bytea => Ok(ScalarType::Bytes),
+        pgrepr::Type::Text => Ok(ScalarType::String),
+        pgrepr::Type::Char => Ok(ScalarType::Char { length: None }),
+        pgrepr::Type::VarChar => Ok(ScalarType::VarChar { length: None }),
+        pgrepr::Type::Jsonb => Ok(ScalarType::Jsonb),
+        pgrepr::Type::Uuid => Ok(ScalarType::Uuid),
+        pgrepr::Type::Array(t) => Ok(ScalarType::Array(Box::new(scalar_type_from_pg(t)?))),
+        pgrepr::Type::List(l) => Ok(ScalarType::List {
+            element_type: Box::new(scalar_type_from_pg(l)?),
+            custom_oid: None,
+        }),
+        pgrepr::Type::Record(_) => {
+            sql_bail!("internal error: can't convert from pg record to materialize record")
+        }
+        pgrepr::Type::Oid => Ok(ScalarType::Oid),
+        pgrepr::Type::RegClass => Ok(ScalarType::RegClass),
+        pgrepr::Type::RegProc => Ok(ScalarType::RegProc),
+        pgrepr::Type::RegType => Ok(ScalarType::RegType),
+        pgrepr::Type::Map { value_type } => Ok(ScalarType::Map {
+            value_type: Box::new(scalar_type_from_pg(value_type)?),
+            custom_oid: None,
+        }),
     }
 }
 
-/// This is used to collect aggregates and table functions from within an `Expr`.
+/// This is used to collect aggregates from within an `Expr`.
 /// See the explanation of aggregate handling at the top of the file for more details.
-struct AggregateTableFuncVisitor<'a> {
+struct AggregateFuncVisitor<'a, 'ast> {
     scx: &'a StatementContext<'a>,
-    aggs: Vec<Function<Aug>>,
+    aggs: Vec<&'ast Function<Aug>>,
     within_aggregate: bool,
-    tables: HashMap<TableFunction<Aug>, String>,
-    table_disallowed_context: Vec<&'static str>,
-    in_select_item: bool,
     err: Option<PlanError>,
 }
 
-impl<'a> AggregateTableFuncVisitor<'a> {
-    fn new(scx: &'a StatementContext<'a>) -> AggregateTableFuncVisitor<'a> {
-        AggregateTableFuncVisitor {
+impl<'a, 'ast> AggregateFuncVisitor<'a, 'ast> {
+    fn new(scx: &'a StatementContext<'a>) -> AggregateFuncVisitor<'a, 'ast> {
+        AggregateFuncVisitor {
             scx,
             aggs: Vec::new(),
             within_aggregate: false,
-            tables: HashMap::new(),
-            table_disallowed_context: Vec::new(),
-            in_select_item: false,
             err: None,
         }
     }
 
-    fn into_result(
-        self,
-    ) -> Result<(Vec<Function<Aug>>, HashMap<TableFunction<Aug>, String>), PlanError> {
+    fn into_result(self) -> Result<Vec<&'ast Function<Aug>>, PlanError> {
         match self.err {
             Some(err) => Err(err),
             None => {
-                // Dedup while preserving the order. We don't care what the order is, but it
-                // has to be reproducible so that EXPLAIN PLAN tests work.
+                // dedup aggs while preserving the order
+                // (we don't care what the order is, but it has to be reproducible so that EXPLAIN PLAN tests work)
                 let mut seen = HashSet::new();
-                let aggs = self
+                Ok(self
                     .aggs
                     .into_iter()
-                    .filter(move |agg| seen.insert(agg.clone()))
-                    .collect();
-                Ok((aggs, self.tables))
+                    .filter(move |agg| seen.insert(&**agg))
+                    .collect())
             }
         }
     }
 }
 
-impl<'a> VisitMut<'_, Aug> for AggregateTableFuncVisitor<'a> {
-    fn visit_function_mut(&mut self, func: &mut Function<Aug>) {
+impl<'a, 'ast> Visit<'ast, Aug> for AggregateFuncVisitor<'a, 'ast> {
+    fn visit_function(&mut self, func: &'ast Function<Aug>) {
         let item = match self.scx.resolve_function(func.name.clone()) {
             Ok(i) => i,
             // Catching missing functions later in planning improves error messages.
             Err(_) => return,
         };
 
-        match item.func() {
-            Ok(Func::Aggregate { .. }) => {
-                if self.within_aggregate {
-                    self.err = Some(PlanError::Unstructured(
-                        "nested aggregate functions are not allowed".into(),
-                    ));
-                    return;
-                }
-                self.aggs.push(func.clone());
-                let Function {
-                    name: _,
-                    args,
-                    filter,
-                    over: _,
-                    distinct: _,
-                } = func;
-                if let Some(filter) = filter {
-                    self.visit_expr_mut(filter);
-                }
-                let old_within_aggregate = self.within_aggregate;
-                self.within_aggregate = true;
-                self.table_disallowed_context
-                    .push("aggregate function calls");
-
-                self.visit_function_args_mut(args);
-
-                self.within_aggregate = old_within_aggregate;
-                self.table_disallowed_context.pop();
+        if let Ok(Func::Aggregate { .. }) = item.func() {
+            if self.within_aggregate {
+                self.err = Some(PlanError::Unstructured(
+                    "nested aggregate functions are not allowed".into(),
+                ));
+                return;
             }
-            Ok(Func::Table { .. }) => {
-                self.table_disallowed_context.push("other table functions");
-                visit_mut::visit_function_mut(self, func);
-                self.table_disallowed_context.pop();
-            }
-            _ => visit_mut::visit_function_mut(self, func),
-        }
-    }
-
-    fn visit_query_mut(&mut self, _query: &mut Query<Aug>) {
-        // Don't go into subqueries.
-    }
-
-    fn visit_expr_mut(&mut self, expr: &mut Expr<Aug>) {
-        let (disallowed_context, func) = match expr {
-            Expr::Case { .. } => (Some("CASE"), None),
-            Expr::HomogenizingFunction {
-                function: HomogenizingFunction::Coalesce,
-                ..
-            } => (Some("COALESCE"), None),
-            Expr::Function(func) if self.in_select_item => {
-                // If we're in a SELECT list, replace table functions with a uuid identifier
-                // and save the table func so it can be planned elsewhere.
-                let mut table_func = None;
-                if let Ok(item) = self.scx.resolve_function(func.name.clone()) {
-                    if let Ok(Func::Table { .. }) = item.func() {
-                        if let Some(context) = self.table_disallowed_context.last() {
-                            self.err = Some(PlanError::Unstructured(format!(
-                                "table functions are not allowed in {}",
-                                context
-                            )));
-                            return;
-                        }
-                        table_func = Some(func.clone());
-                    }
-                }
-                // Since we will descend into the table func below, don't add its own disallow
-                // context here, instead use visit_function to set that.
-                (None, table_func)
-            }
-            _ => (None, None),
-        };
-        if let Some(func) = func {
-            // Since we are trading out expr, we need to visit the table func here.
-            visit_mut::visit_expr_mut(self, expr);
-            // Don't attempt to replace table functions with unsupported syntax.
-            if let Function {
-                name,
+            self.aggs.push(func);
+            let Function {
+                name: _,
                 args,
-                filter: None,
-                over: None,
-                distinct: false,
-            } = func
-            {
-                let func = TableFunction { name, args };
-                // Identical table functions can be de-duplicated.
-                let id = self
-                    .tables
-                    .entry(func)
-                    .or_insert_with(|| format!("table_func_{}", Uuid::new_v4()));
-                *expr = Expr::Identifier(vec![Ident::from(id.clone())]);
+                filter,
+                over: _,
+                distinct: _,
+            } = func;
+            if let Some(filter) = filter {
+                self.visit_expr(filter);
             }
-        }
-        if let Some(context) = disallowed_context {
-            self.table_disallowed_context.push(context);
-        }
+            let old_within_aggregate = self.within_aggregate;
+            self.within_aggregate = true;
+            self.visit_function_args(args);
 
-        visit_mut::visit_expr_mut(self, expr);
-
-        if disallowed_context.is_some() {
-            self.table_disallowed_context.pop();
+            self.within_aggregate = old_within_aggregate;
+        } else {
+            visit::visit_function(self, func);
         }
     }
 
-    fn visit_select_item_mut(&mut self, si: &mut SelectItem<Aug>) {
-        let old = self.in_select_item;
-        self.in_select_item = true;
-        visit_mut::visit_select_item_mut(self, si);
-        self.in_select_item = old;
+    fn visit_query(&mut self, _query: &'ast Query<Aug>) {
+        // Don't go into subqueries.
     }
 }
 
@@ -4666,6 +4044,8 @@ pub struct QueryContext<'a> {
     pub outer_relation_types: Vec<RelationType>,
     /// CTEs for this query, mapping their assigned LocalIds to their definition.
     pub ctes: HashMap<LocalId, CteDesc>,
+    /// The GlobalIds of the items the `Query` is dependent upon.
+    pub ids: HashSet<GlobalId>,
     pub recursion_guard: RecursionGuard,
 }
 
@@ -4683,6 +4063,7 @@ impl<'a> QueryContext<'a> {
             outer_scopes: vec![],
             outer_relation_types: vec![],
             ctes: HashMap::new(),
+            ids: HashSet::new(),
             recursion_guard: RecursionGuard::with_limit(1024), // chosen arbitrarily
         }
     }
@@ -4706,6 +4087,7 @@ impl<'a> QueryContext<'a> {
             outer_scopes,
             outer_relation_types,
             ctes,
+            ids: HashSet::new(),
             recursion_guard: self.recursion_guard.clone(),
         }
     }
@@ -4723,24 +4105,9 @@ impl<'a> QueryContext<'a> {
         &self,
         object: ResolvedObjectName,
     ) -> Result<(HirRelationExpr, Scope), PlanError> {
-        match object {
-            ResolvedObjectName::Object { id, full_name, .. } => {
-                let name = full_name.into();
-                let item = self.scx.get_item(&id);
-                let desc = item
-                    .desc(&self.scx.catalog.resolve_full_name(item.name()))?
-                    .clone();
-                let expr = HirRelationExpr::Get {
-                    id: Id::Global(item.id()),
-                    typ: desc.typ().clone(),
-                };
-
-                let scope = Scope::from_source(Some(name), desc.iter_names().cloned());
-
-                Ok((expr, scope))
-            }
-            ResolvedObjectName::Cte { id, name } => {
-                let name = name.into();
+        match object.id {
+            Id::Local(id) => {
+                let name = object.raw_name;
                 let cte = self.ctes.get(&id).unwrap();
                 let expr = HirRelationExpr::Get {
                     id: Id::Local(id),
@@ -4751,7 +4118,22 @@ impl<'a> QueryContext<'a> {
 
                 Ok((expr, scope))
             }
-            ResolvedObjectName::Error => unreachable!("should have been caught in name resolution"),
+            Id::Global(id) => {
+                let item = self.scx.get_item_by_id(&id);
+                let desc = item.desc()?.clone();
+                let expr = HirRelationExpr::Get {
+                    id: Id::Global(item.id()),
+                    typ: desc.typ().clone(),
+                };
+
+                let scope = Scope::from_source(Some(object.raw_name), desc.iter_names().cloned());
+
+                Ok((expr, scope))
+            }
+            Id::LocalBareSource => {
+                // This is never introduced except when planning source transformations.
+                unreachable!()
+            }
         }
     }
 
@@ -4765,7 +4147,7 @@ impl<'a> QueryContext<'a> {
 pub struct ExprContext<'a> {
     pub qcx: &'a QueryContext<'a>,
     /// The name of this kind of expression eg "WHERE clause". Used only for error messages.
-    pub name: &'a str,
+    pub name: &'static str,
     /// The context for the `Query` that contains this `Expr`.
     /// The current scope.
     pub scope: &'a Scope,
@@ -4791,7 +4173,7 @@ impl<'a> ExprContext<'a> {
         self.qcx.scx.catalog
     }
 
-    pub fn with_name(&self, name: &'a str) -> ExprContext<'a> {
+    fn with_name(&self, name: &'static str) -> ExprContext<'a> {
         let mut ecx = self.clone();
         ecx.name = name;
         ecx

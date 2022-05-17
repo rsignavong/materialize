@@ -6,47 +6,41 @@ such as TPC-H.
 
 # Running
 
-The `--help` option can be used to show supported options:
+First, make sure your python environment is up to speed:
 
 ```
-./mzcompose run feature-benchmark --help
+bin/pyactivate --dev
 ```
 
-To run the default benchmark scenarios:
+To run all benchmarks:
 ```
 cd test/feature-benchmark
-./mzcompose run default --other-tag unstable
-```
-
-Or, from the root of the repository:
-
-```
-bin/mzcompose --find feature-benchmark run default --other-tag unstable
+OTHER_IMAGE=materialize/materialized:unstable ./mzcompose run feature-benchmark
 ```
 
 This is going to benchmark the current source against the `materialize/materialized:unstable` container from DockerHub.
 
-To run one benchmark scenario or a named subset:
+To run one benchmark or a subset:
 
 ```
-./mzcompose run default --root-scenario=FastPath
+FB_SCENARIO=FastPath ./mzcompose run feature-benchmark
 ```
 
 To use specific Mz command-line options:
 
 ```
- ./mzcompose run default --this-options "--workers 16" --other-options "--workers 1"
+THIS_OPTIONS="--workers 16" OTHER_OPTIONS="--workers 1" ./mzcompose run feature-benchmark
 ```
 
 To compare specific Mz versions:
 
 ```
-./mzcompose run default --this-tag v1.2.3 --other-tag v2.3.4 ...
+THIS_IMAGE=materialize/materialized:v1.2.3 OTHER_IMAGE=materialize/materialized:v2.3.4 ./mzcompose ...
 ```
 
 To compare specific Mz git revisions:
 ```
-./mzcompose run default --this-tag unstable-42ad7432657d3e5c1a3492fa76985cd6b79fcab6 ...
+THIS_IMAGE=materialize/materialized:unstable-42ad7432657d3e5c1a3492fa76985cd6b79fcab6 OTHER_IMAGE=... ./mzcompose ...
 ```
 
 # Output
@@ -65,12 +59,6 @@ Update                    |       0.781 |       0.803 | about the same -2.7%
 ```
 
 The table is printed periodically as new rows arrive so that the information is not lost in case of failure.
-
-# Available scenarios
-
-The `test/feature-benchmark/scenarios.py` file contains the definitive list of scenarios. Scenarios follow a hierarchical structure.
-
-The default scenarios derive from the `Scenario` class, those that take longer to execute derive from the `ScenarioBig` class.
 
 # Features
 
@@ -91,7 +79,7 @@ This framework has the following features:
 
 The framework is organized around the idea of repeatedly executing the feature under test until a termination condition is met. After measurements have been accumulated, a definitive performance value is chosen.
 
-All the rules and constants governing the process can be seen at the top of `test/feature-benchmark/mzcompose.py`.
+All the rules and constants governing the process can be seen at the top of `test/feature-benchmark/mzworkflows.py`.
 
 ## Executor
 
@@ -112,8 +100,6 @@ Currently, two criteria are used:
 The code currently assumes that the data follows a normal distribution, which is decidedly not the case, especially since extreme outliers are frequently observed. More advanced statistical
 techniques for massaging the numbers may be required in the future. In particular, there is some evidence that the distribution of values is multi-modal with: A) one peak for all operations that completed
 within some "tick" (either the kernel rescheduling some thread, or e.g. the timestamper thread kicking in): B) one peak for operations that completed immediately after the "tick" and C) extreme outliers that were particularily unlucky.
-
-To limit the maximum number of measurements at the expense of accuracy, use the `--max-measurements N` option.
 
 ## Aggregation policy
 
@@ -136,12 +122,7 @@ Failed! giving up: testdrive_this --no-reset --seed=1639555967 --initial-backoff
 ```
 
 This indicates that testdrive could not run the queries from the benchmark definition. To understand what went wrong, use `docker ps -a` to see the ID
-of the `feature-benchmark_testdrive_*` container that exited most recently and then `docker logs <id_of_the_container>` to obtain the output from testdrive.
-
-## Dealing with false positives
-
-The feature benchmark will retry any regressed scenarios up to `--max-cycles=3` times in order to weed out false positives. mzcompose.py will exit with a non-zero
-exit code only if there are scenarios that reported a regression every time they were tried.
+of the `feature-benchmark_testdrive_*' container that exited most recently and then `docker logs <id_of_the_container>` to obtain the output from testdrive.
 
 # Writing benchmark scenarios
 
@@ -150,9 +131,8 @@ exit code only if there are scenarios that reported a regression every time they
 Benchmark scenarios live in `test/feature-benchmark/scenarios.py` and follow the following format:
 
 ```
-class NewBenchmark(Scenario):
-    def shared(self) -> Action:
-        return TdAction("""
+class SomeClass(SomeBenchmarkFamily):
+    SHARED = Td("""
 #
 # Place here the testdrive commands that need to be run only once for both Mz instances under test
 # and that prepare resources that will be common for both Mz instances.
@@ -161,8 +141,7 @@ class NewBenchmark(Scenario):
 #
 """)
 
-    def init(self) -> Action:
-        return TdAction("""
+    INIT = Td("""
 #
 # Place here any testdrive commands that need to be run once for each Mz instance before
 # starting the respective benchmark.
@@ -173,26 +152,23 @@ class NewBenchmark(Scenario):
 #
 """)
 
-    def before(self) -> Action:
-        return ...
+    BEFORE = ...
 
-# The before() section is reserved for actions that need to happen immediately prior to the
+# The BEFORE section is reserved for actions that need to happen immediately prior to the
 # queries being benchmarked, for example, restarting Mz in order to force a recovery
 
-    def benchmark(self) -> MeasurementSource:
-        return Td(f"""
+
+    BENCHMARK = Td("""
 #
 # Place here all queries that need to be repeated at each iteration of the benchmark, including
 # the queries that will be benchmarked themselves. The execution time between the *end* of the
 # query marked with /* A */ and the end of the query marked with /* B */ will be measured
 #
->  SELECT 1
-   /* A */
+> /* A */ SELECT 1;
 1
 
->  SELECT COUNT(*) FROM t1
-   /* B */
-{self.n()}
+> /* B */ SELECT COUNT(*) FROM t1;
+1000
 
 #
 # Make sure you delete any database objects created in this section
@@ -201,46 +177,6 @@ class NewBenchmark(Scenario):
 > DROP this_and_that
 
 """)
-```
-
-## Scale and `N`
-
-The benchmarks are parameterized on their scale, that is, one can create scenarios that run with some default size which can then be overwritten:
-
-```
-class ReallyReallyLargeBenchmark(ScenarioBig):
-    SCALE = 10
-```
-
-From `SCALE`, the framework calculates `N`, which is `10^SCALE` and makes them available within the scenario as `self.scale()` and `self.n()` respectively.
-
-The default `SCALE` is 6 , that is, any benchmark scenario that is properly parameterized will run benchmark 1M of the thing being benchmarked.
-
-To force the framework to run with a specific scale, use the `--scale N` option. If `N` is prefixed by `+` or `-`, it is interpreted as a relative adjustment to apply to the default scale.
-
-## Actions vs. Measurements
-
-The `shared()`, `init()`, and `before()` sections of the benchmark must return an `Action` object or a list of `Action` objects (usually `TdAction`) while the `benchmark()` section
-must return a `MeasurementSource` object (currently, only `Td` is supported).
-
-Available `Action`s:
-
-* `TdAction(...)` - executes the testdrive fragment provided
-* `Kgen(...)` - executes the `Kgen` to ingest data into a Kafka topic (see the KafkaRecoveryBig scenario for an example)
-* `Lambda(lambda e: e.RestartMz())` - restarts the Mz service
-
-
-## Running the same scenario with multiple times within the same run
-
-It is possible to use the python `parameterized` module to cause the same scenario to be executed multiple times. For example, with different scale factors:
-
-```
-@parameterized_class(
-    [{"SCALE": i} for i in [5,6,7,8]], class_name_func=Scenario.name_with_scale
-)
-class ScalingScenario(ScenarioBig):
-    def benchmark(self) -> MeasurementSource:
-        ...
 ```
 
 ## Caveats and considerations
@@ -261,30 +197,3 @@ If you are benchmarking a single query, put the `/* A */` marker on a dummy `SEL
 
 * Before attempting to run your testdrive fragments, put them in a stand-alone .td file and run them manually through `testdrive` so as to avoid repeated debugging
 cycles with the benchmark running.
-
-# Bisection
-
-It is possible to use `git bisect` to determine the specific revision when a performance regression occurred
-
-## Running
-
-The steps are pretty straightforward
-
-```
-git bisect start
-git bisect good vGOOD.MZ.VERSION
-git bisect bad HEAD
-git bisect run /path/to/bisect.sh
-```
-
-The `bisect.sh` can be something along the following lines:
-
-```
-#!/bin/bash
-THIS_SHA=$(git rev-parse HEAD)
-GOOD_MZ_VERSION="vX.Y.Z"
-
-pushd /path/to/test/feature-benchmark
-./mzcompose down -v
-./mzcompose run feature-benchmark --this-tag unstable-$THIS_SHA --other-tag $GOOD_MZ_VERSION --root-scenario=...
-```

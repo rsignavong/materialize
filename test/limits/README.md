@@ -16,10 +16,10 @@ in practice it is hoped that regressions will be caught by one of the following 
 
 # Running
 
-```bash
+```
 ./mzcompose down -v
 
-./mzcompose run default
+./mzcompose run limits
 ```
 
 # Adding new content

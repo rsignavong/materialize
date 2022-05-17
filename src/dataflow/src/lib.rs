@@ -11,17 +11,17 @@
 
 //! Driver for timely/differential dataflow.
 
-mod boundary;
+mod activator;
+mod arrangement;
+mod decode;
+mod metrics;
+mod operator;
+mod render;
+mod replay;
 mod server;
 mod sink;
 
-mod compute;
-mod storage;
-
 pub mod logging;
+pub mod source;
 
-pub(crate) use mz_timely_util as common;
-
-pub use boundary::{tcp_boundary, ComputeReplay, DummyBoundary, EventLinkBoundary, StorageCapture};
-
-pub use server::{serve, serve_boundary, serve_boundary_requests, Config, Server};
+pub use server::{serve, Config, Server};

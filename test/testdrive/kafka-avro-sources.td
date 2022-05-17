@@ -95,30 +95,16 @@ $ set schema={
           ],
           "connect.name": "io.debezium.connector.mysql.Source"
         }
-      },
-      {
-        "name": "transaction",
-        "type": {
-          "type": "record",
-          "name": "Transaction",
-          "namespace": "whatever",
-          "fields": [
-            {
-              "name": "total_order",
-              "type": ["long", "null"]
-            }
-          ]
-        }
       }
     ]
   }
 
-$ kafka-create-topic topic=data partitions=1
+$ kafka-create-topic topic=data
 
 $ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
-{"before": null, "after": {"row": {"a": 1, "b": 1, "json": "null", "c": "True", "d": "False", "e": {"nested_data_1": {"n1_a": 42, "n1_b": {"double": 86.5}}}, "f": null}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"boolean": false}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row": {"a": 2, "b": 3, "json": "{\"hello\": \"world\"}", "c": "False", "d": "FileNotFound", "e": {"nested_data_1": {"n1_a": 43, "n1_b":{"nested_data_2": {"n2_a": 44, "n2_b": -1}}}}, "f": {"nested_data_2": {"n2_a": 45, "n2_b": -2}}}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"boolean": false}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row": {"a": -1, "b": 7, "json": "[1, 2, 3]", "c": "FileNotFound", "d": "True", "e": null, "f": null}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"boolean": false}}, "transaction": {"total_order": null}}
+{"before": null, "after": {"row": {"a": 1, "b": 1, "json": "null", "c": "True", "d": "False", "e": {"nested_data_1": {"n1_a": 42, "n1_b": {"double": 86.5}}}, "f": null}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"boolean": false}}}
+{"before": null, "after": {"row": {"a": 2, "b": 3, "json": "{\"hello\": \"world\"}", "c": "False", "d": "FileNotFound", "e": {"nested_data_1": {"n1_a": 43, "n1_b":{"nested_data_2": {"n2_a": 44, "n2_b": -1}}}}, "f": {"nested_data_2": {"n2_a": 45, "n2_b": -2}}}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"boolean": false}}}
+{"before": null, "after": {"row": {"a": -1, "b": 7, "json": "[1, 2, 3]", "c": "FileNotFound", "d": "True", "e": null, "f": null}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"boolean": false}}}
 
 # We should refuse to create a source with invalid WITH options
 ! CREATE MATERIALIZED SOURCE invalid_with_option
@@ -132,7 +118,7 @@ $ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
   )
   FORMAT AVRO USING SCHEMA '${schema}'
   ENVELOPE DEBEZIUM
-contains:unexpected parameters for CREATE SOURCE: badoption
+unexpected parameters for CREATE SOURCE: badoption
 
 > SHOW SOURCES
 name
@@ -149,7 +135,7 @@ name
 > SHOW CREATE SOURCE data_schema_inline
 Source   "Create Source"
 ------------------------
-materialize.public.data_schema_inline "CREATE SOURCE \"materialize\".\"public\".\"data_schema_inline\" FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}' FORMAT AVRO USING SCHEMA '{   \"type\": \"record\",   \"name\": \"envelope\",   \"fields\": [     {       \"name\": \"before\",       \"type\": [         {           \"name\": \"row\",           \"type\": \"record\",           \"fields\": [             {\"name\": \"a\", \"type\": \"long\"},             {\"name\": \"b\", \"type\": \"long\"},             {               \"name\": \"json\",               \"type\": {                 \"connect.name\": \"io.debezium.data.Json\",                 \"type\": \"string\"               }             },             {               \"name\": \"c\",               \"type\": {                 \"type\": \"enum\",                 \"name\": \"Bool\",                 \"symbols\": [\"True\", \"False\", \"FileNotFound\"]               }             },             {\"name\": \"d\", \"type\": \"Bool\"},             {\"name\": \"e\", \"type\": [\"null\",{               \"type\": \"record\",               \"name\": \"nested_data_1\",               \"fields\": [                   {\"name\": \"n1_a\", \"type\": \"long\"},                   {\"name\": \"n1_b\", \"type\": [\"null\", \"double\", {                       \"type\": \"record\",                       \"name\": \"nested_data_2\",                       \"fields\": [                         {\"name\": \"n2_a\", \"type\": \"long\"},                         {\"name\": \"n2_b\", \"type\": \"int\"}                       ]                     }]                   }                 ]               }]             },             {\"name\": \"f\", \"type\": [\"null\", \"nested_data_2\"]}           ]         },         \"null\"       ]     },     { \"name\": \"after\", \"type\": [\"row\", \"null\"] },     {       \"name\": \"source\",       \"type\": {         \"type\": \"record\",         \"name\": \"Source\",         \"namespace\": \"io.debezium.connector.mysql\",         \"fields\": [           {             \"name\": \"file\",             \"type\": \"string\"           },           {             \"name\": \"pos\",             \"type\": \"long\"           },           {             \"name\": \"row\",             \"type\": \"int\"           },           {             \"name\": \"snapshot\",             \"type\": [               {                 \"type\": \"boolean\",                 \"connect.default\": false               },               \"null\"             ],             \"default\": false           }         ],         \"connect.name\": \"io.debezium.connector.mysql.Source\"       }     },     {       \"name\": \"transaction\",       \"type\": {         \"type\": \"record\",         \"name\": \"Transaction\",         \"namespace\": \"whatever\",         \"fields\": [           {             \"name\": \"total_order\",             \"type\": [\"long\", \"null\"]           }         ]       }     }   ] }' ENVELOPE DEBEZIUM"
+materialize.public.data_schema_inline "CREATE SOURCE \"materialize\".\"public\".\"data_schema_inline\" FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}' FORMAT AVRO USING SCHEMA \'{   \"type\": \"record\",   \"name\": \"envelope\",   \"fields\": [     {       \"name\": \"before\",       \"type\": [         {           \"name\": \"row\",           \"type\": \"record\",           \"fields\": [             {\"name\": \"a\", \"type\": \"long\"},             {\"name\": \"b\", \"type\": \"long\"},             {               \"name\": \"json\",               \"type\": {                 \"connect.name\": \"io.debezium.data.Json\",                 \"type\": \"string\"               }             },             {               \"name\": \"c\",               \"type\": {                 \"type\": \"enum\",                 \"name\": \"Bool\",                 \"symbols\": [\"True\", \"False\", \"FileNotFound\"]               }             },             {\"name\": \"d\", \"type\": \"Bool\"},             {\"name\": \"e\", \"type\": [\"null\",{               \"type\": \"record\",               \"name\": \"nested_data_1\",               \"fields\": [                   {\"name\": \"n1_a\", \"type\": \"long\"},                   {\"name\": \"n1_b\", \"type\": [\"null\", \"double\", {                       \"type\": \"record\",                       \"name\": \"nested_data_2\",                       \"fields\": [                         {\"name\": \"n2_a\", \"type\": \"long\"},                         {\"name\": \"n2_b\", \"type\": \"int\"}                       ]                     }]                   }                 ]               }]             },             {\"name\": \"f\", \"type\": [\"null\", \"nested_data_2\"]}           ]         },         \"null\"       ]     },     { \"name\": \"after\", \"type\": [\"row\", \"null\"] },     {       \"name\": \"source\",       \"type\": {         \"type\": \"record\",         \"name\": \"Source\",         \"namespace\": \"io.debezium.connector.mysql\",         \"fields\": [           {             \"name\": \"file\",             \"type\": \"string\"           },           {             \"name\": \"pos\",             \"type\": \"long\"           },           {             \"name\": \"row\",             \"type\": \"int\"           },           {             \"name\": \"snapshot\",             \"type\": [               {                 \"type\": \"boolean\",                 \"connect.default\": false               },               \"null\"             ],             \"default\": false           }         ],         \"connect.name\": \"io.debezium.connector.mysql.Source\"       }     }   ] }\' ENVELOPE DEBEZIUM"
 
 > SELECT a, b, json, c, d, e::text, f::text FROM data_schema_inline
 a  b  json                     c            d             e                   f
@@ -171,8 +157,8 @@ a  b  json            c            d
 
 # Check that repeated Debezium messages are skipped.
 $ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
-{"before": null, "after": {"row": {"a": 2, "b": 3, "json": "{\"hello\": \"world\"}", "c": "False", "d": "FileNotFound", "e": null, "f": null}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"boolean": false}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row": {"a": 42, "b": 19, "json": "[4, 5, 6]", "c": "FileNotFound", "d": "True", "e": null, "f": null}}, "source": {"file": "binlog2", "pos": 1, "row": 1, "snapshot": {"boolean": false}}, "transaction": {"total_order": null}}
+{"before": null, "after": {"row": {"a": 2, "b": 3, "json": "{\"hello\": \"world\"}", "c": "False", "d": "FileNotFound", "e": null, "f": null}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"boolean": false}}}
+{"before": null, "after": {"row": {"a": 42, "b": 19, "json": "[4, 5, 6]", "c": "FileNotFound", "d": "True", "e": null, "f": null}}, "source": {"file": "binlog2", "pos": 1, "row": 1, "snapshot": {"boolean": false}}}
 
 > SELECT a, b, json, c, d, e::text, f::text FROM data_schema_inline
 a  b  json                     c            d             e                   f
@@ -189,7 +175,7 @@ a  b  json                     c            d             e                   f
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
   FORMAT AVRO USING SCHEMA FILE 'data-schema.json'
   ENVELOPE DEBEZIUM
-contains:No such file or directory
+No such file or directory
 
 $ file-append path=data-schema.json
 \${schema}
@@ -202,7 +188,7 @@ $ file-append path=data-schema.json
 > SHOW CREATE SOURCE data_schema_file
 Source   "Create Source"
 ------------------------
-materialize.public.data_schema_file "CREATE SOURCE \"materialize\".\"public\".\"data_schema_file\" FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}' FORMAT AVRO USING SCHEMA '{   \"type\": \"record\",   \"name\": \"envelope\",   \"fields\": [     {       \"name\": \"before\",       \"type\": [         {           \"name\": \"row\",           \"type\": \"record\",           \"fields\": [             {\"name\": \"a\", \"type\": \"long\"},             {\"name\": \"b\", \"type\": \"long\"},             {               \"name\": \"json\",               \"type\": {                 \"connect.name\": \"io.debezium.data.Json\",                 \"type\": \"string\"               }             },             {               \"name\": \"c\",               \"type\": {                 \"type\": \"enum\",                 \"name\": \"Bool\",                 \"symbols\": [\"True\", \"False\", \"FileNotFound\"]               }             },             {\"name\": \"d\", \"type\": \"Bool\"},             {\"name\": \"e\", \"type\": [\"null\",{               \"type\": \"record\",               \"name\": \"nested_data_1\",               \"fields\": [                   {\"name\": \"n1_a\", \"type\": \"long\"},                   {\"name\": \"n1_b\", \"type\": [\"null\", \"double\", {                       \"type\": \"record\",                       \"name\": \"nested_data_2\",                       \"fields\": [                         {\"name\": \"n2_a\", \"type\": \"long\"},                         {\"name\": \"n2_b\", \"type\": \"int\"}                       ]                     }]                   }                 ]               }]             },             {\"name\": \"f\", \"type\": [\"null\", \"nested_data_2\"]}           ]         },         \"null\"       ]     },     { \"name\": \"after\", \"type\": [\"row\", \"null\"] },     {       \"name\": \"source\",       \"type\": {         \"type\": \"record\",         \"name\": \"Source\",         \"namespace\": \"io.debezium.connector.mysql\",         \"fields\": [           {             \"name\": \"file\",             \"type\": \"string\"           },           {             \"name\": \"pos\",             \"type\": \"long\"           },           {             \"name\": \"row\",             \"type\": \"int\"           },           {             \"name\": \"snapshot\",             \"type\": [               {                 \"type\": \"boolean\",                 \"connect.default\": false               },               \"null\"             ],             \"default\": false           }         ],         \"connect.name\": \"io.debezium.connector.mysql.Source\"       }     },     {       \"name\": \"transaction\",       \"type\": {         \"type\": \"record\",         \"name\": \"Transaction\",         \"namespace\": \"whatever\",         \"fields\": [           {             \"name\": \"total_order\",             \"type\": [\"long\", \"null\"]           }         ]       }     }   ] }\n' WITH (\"confluent_wire_format\" = true) ENVELOPE DEBEZIUM"
+materialize.public.data_schema_file  "CREATE SOURCE \"materialize\".\"public\".\"data_schema_file\" FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}' FORMAT AVRO USING SCHEMA \'{   \"type\": \"record\",   \"name\": \"envelope\",   \"fields\": [     {       \"name\": \"before\",       \"type\": [         {           \"name\": \"row\",           \"type\": \"record\",           \"fields\": [             {\"name\": \"a\", \"type\": \"long\"},             {\"name\": \"b\", \"type\": \"long\"},             {               \"name\": \"json\",               \"type\": {                 \"connect.name\": \"io.debezium.data.Json\",                 \"type\": \"string\"               }             },             {               \"name\": \"c\",               \"type\": {                 \"type\": \"enum\",                 \"name\": \"Bool\",                 \"symbols\": [\"True\", \"False\", \"FileNotFound\"]               }             },             {\"name\": \"d\", \"type\": \"Bool\"},             {\"name\": \"e\", \"type\": [\"null\",{               \"type\": \"record\",               \"name\": \"nested_data_1\",               \"fields\": [                   {\"name\": \"n1_a\", \"type\": \"long\"},                   {\"name\": \"n1_b\", \"type\": [\"null\", \"double\", {                       \"type\": \"record\",                       \"name\": \"nested_data_2\",                       \"fields\": [                         {\"name\": \"n2_a\", \"type\": \"long\"},                         {\"name\": \"n2_b\", \"type\": \"int\"}                       ]                     }]                   }                 ]               }]             },             {\"name\": \"f\", \"type\": [\"null\", \"nested_data_2\"]}           ]         },         \"null\"       ]     },     { \"name\": \"after\", \"type\": [\"row\", \"null\"] },     {       \"name\": \"source\",       \"type\": {         \"type\": \"record\",         \"name\": \"Source\",         \"namespace\": \"io.debezium.connector.mysql\",         \"fields\": [           {             \"name\": \"file\",             \"type\": \"string\"           },           {             \"name\": \"pos\",             \"type\": \"long\"           },           {             \"name\": \"row\",             \"type\": \"int\"           },           {             \"name\": \"snapshot\",             \"type\": [               {                 \"type\": \"boolean\",                 \"connect.default\": false               },               \"null\"             ],             \"default\": false           }         ],         \"connect.name\": \"io.debezium.connector.mysql.Source\"       }     }   ] }\n\' WITH (\"confluent_wire_format\" = true) ENVELOPE DEBEZIUM"
 
 > SELECT a, b, json, c, d FROM data_schema_file
 a  b  json                     c            d
@@ -223,7 +209,7 @@ $ set non-dbz-schema={
     ]
   }
 
-$ kafka-create-topic topic=non-dbz-data partitions=1
+$ kafka-create-topic topic=non-dbz-data
 
 $ kafka-ingest format=avro topic=non-dbz-data schema=${non-dbz-schema} timestamp=1
 {"a": 1, "b": 2}
@@ -247,7 +233,7 @@ a b
   FORMAT AVRO USING SCHEMA '${non-dbz-schema}'
   INCLUDE TOPIC
   ENVELOPE NONE
-contains:INCLUDE TOPIC not yet supported
+INCLUDE TOPIC not yet supported
 
 > CREATE MATERIALIZED SOURCE non_dbz_data_metadata
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-non-dbz-data-${testdrive.seed}'
@@ -459,36 +445,22 @@ $ set new-dbz-schema={
           ],
           "connect.name": "io.debezium.connector.mysql.Source"
         }
-      },
-      {
-        "name": "transaction",
-        "type": {
-          "type": "record",
-          "name": "Transaction",
-          "namespace": "whatever",
-          "fields": [
-            {
-              "name": "total_order",
-              "type": ["long", "null"]
-            }
-          ]
-        }
       }
     ]
   }
 
-$ kafka-create-topic topic=new-dbz-data partitions=1
+$ kafka-create-topic topic=new-dbz-data
 
 # We don't do anything sensible yet for snapshot "true" or "last", so just test that those are ingested.
 
 $ kafka-ingest format=avro topic=new-dbz-data schema=${new-dbz-schema} timestamp=1
-{"before": null, "after": {"row":{"a": 9, "b": 10}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "true"}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row":{"a": 11, "b": 11}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "last"}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row":{"a": 14, "b": 6}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": null}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
+{"before": null, "after": {"row":{"a": 9, "b": 10}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "true"}}}
+{"before": null, "after": {"row":{"a": 11, "b": 11}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "last"}}}
+{"before": null, "after": {"row":{"a": 14, "b": 6}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": null}}
+{"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"file": "binlog", "pos": 0, "row": 0, "snapshot": {"string": "false"}}}
+{"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}}
+{"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}}
+{"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}}
 
 > CREATE MATERIALIZED SOURCE new_dbz
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-new-dbz-data-${testdrive.seed}'
@@ -528,14 +500,14 @@ $ kafka-create-topic topic=misordered-dbz-data
 $ set new-dbz-key-schema={"type": "record", "name": "row", "fields": [{"name": "a", "type": "long"}]}
 
 $ kafka-ingest format=avro key-format=avro topic=misordered-dbz-data schema=${new-dbz-schema} key-schema=${new-dbz-key-schema} timestamp=1 publish=true
-{"a": 5} {"before": null, "after": {"row":{"a": 5, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "true"}}, "transaction": {"total_order": null}}
-{"a": 5} {"before": null, "after": {"row":{"a": 5, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "true"}}, "transaction": {"total_order": null}}
-{"a": 1} {"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"file": "binlog", "pos": 2, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"a": 2} {"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"a": -1} {"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"a": 2} {"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"a": 1} {"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"file": "binlog", "pos": 2, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"a": 3} {"before": null, "after": {"row":{"a": 3, "b": 4}}, "source": {"file": "binlog2", "pos": 2, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
+{"a": 5} {"before": null, "after": {"row":{"a": 5, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "true"}}}
+{"a": 5} {"before": null, "after": {"row":{"a": 5, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "true"}}}
+{"a": 1} {"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"file": "binlog", "pos": 2, "row": 0, "snapshot": {"string": "false"}}}
+{"a": 2} {"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}}
+{"a": -1} {"before": null, "after": {"row":{"a": -1, "b": 7}}, "source": {"file": "binlog", "pos": 1, "row": 1, "snapshot": {"string": "false"}}}
+{"a": 2} {"before": null, "after": {"row":{"a": 2, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}}
+{"a": 1} {"before": null, "after": {"row":{"a": 1, "b": 1}}, "source": {"file": "binlog", "pos": 2, "row": 0, "snapshot": {"string": "false"}}}
+{"a": 3} {"before": null, "after": {"row":{"a": 3, "b": 4}}, "source": {"file": "binlog2", "pos": 2, "row": 0, "snapshot": {"string": "false"}}}
 
 > CREATE MATERIALIZED SOURCE misordered_dbz
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-misordered-dbz-data-${testdrive.seed}'
@@ -559,20 +531,20 @@ $ kafka-create-topic topic=invalid-keyed-dbz-data
 $ set wrong-dbz-key-schema={"type": "record", "name": "row", "fields": [{"name": "c", "type": "long"}]}
 
 $ kafka-ingest format=avro key-format=avro topic=invalid-keyed-dbz-data schema=${new-dbz-schema} key-schema=${wrong-dbz-key-schema} timestamp=1 publish=true
-{"c": 5} {"before": null, "after": {"row":{"a": 5, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "true"}}, "transaction": {"total_order": null}}
+{"c": 5} {"before": null, "after": {"row":{"a": 5, "b": 3}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "true"}}}
 
 ! CREATE MATERIALIZED SOURCE invalid_keyed_dbz
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-invalid-keyed-dbz-data-${testdrive.seed}'
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
   ENVELOPE DEBEZIUM
-contains:Value schema missing primary key column: c
+Cannot use key due to error: Value schema missing primary key column: c
 
 ! CREATE MATERIALIZED SOURCE invalid_keyed_dbz_with_dedup
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-invalid-keyed-dbz-data-${testdrive.seed}'
   WITH (deduplication = 'full')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
   ENVELOPE DEBEZIUM
-contains:Value schema missing primary key column: c
+Cannot use key due to error: Value schema missing primary key column: c
 
 ! CREATE MATERIALIZED SOURCE invalid_keyed_dbz_with_range_dedup
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-invalid-keyed-dbz-data-${testdrive.seed}'
@@ -583,7 +555,7 @@ contains:Value schema missing primary key column: c
   )
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
   ENVELOPE DEBEZIUM
-contains:Value schema missing primary key column: c
+Cannot use key due to error: Value schema missing primary key column: c
 
 # Test that deduplication=full_in_range accepts mis-ordered debezium data in the range
 
@@ -596,25 +568,25 @@ $ kafka-create-topic topic=misordered-dbz-in-range-data
 # * 1600005000000 = 2020-09-13 13:50 -- no longer possibly duplicate
 
 $ kafka-ingest format=avro topic=misordered-dbz-in-range-data schema=${new-dbz-schema} timestamp=1599990000000
-{"before": null, "after": {"row":{"a": 1, "b": 0}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
+{"before": null, "after": {"row":{"a": 1, "b": 0}}, "source": {"file": "binlog", "pos": 1, "row": 0, "snapshot": {"string": "false"}}}
 
 # padding window
 $ kafka-ingest format=avro topic=misordered-dbz-in-range-data schema=${new-dbz-schema} timestamp=1599999600000
-{"before": null, "after": {"row":{"a": 4, "b": 0}}, "source": {"file": "binlog", "pos": 4, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
+{"before": null, "after": {"row":{"a": 4, "b": 0}}, "source": {"file": "binlog", "pos": 4, "row": 0, "snapshot": {"string": "false"}}}
 
 $ kafka-ingest format=avro topic=misordered-dbz-in-range-data schema=${new-dbz-schema} timestamp=1600000000000
-{"before": null, "after": {"row":{"a": 3, "b": 1}}, "source": {"file": "binlog", "pos": 3, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row":{"a": 4, "b": 0}}, "source": {"file": "binlog", "pos": 4, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
+{"before": null, "after": {"row":{"a": 3, "b": 1}}, "source": {"file": "binlog", "pos": 3, "row": 0, "snapshot": {"string": "false"}}}
+{"before": null, "after": {"row":{"a": 4, "b": 0}}, "source": {"file": "binlog", "pos": 4, "row": 0, "snapshot": {"string": "false"}}}
 
 # full dedupe catches reversed, invalid data
 $ kafka-ingest format=avro topic=misordered-dbz-in-range-data schema=${new-dbz-schema} timestamp=1600000000000
-{"before": null, "after": {"row":{"a": 6, "b": 0}}, "source": {"file": "binlog", "pos": 6, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row":{"a": 5, "b": 0}}, "source": {"file": "binlog", "pos": 5, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
+{"before": null, "after": {"row":{"a": 6, "b": 0}}, "source": {"file": "binlog", "pos": 6, "row": 0, "snapshot": {"string": "false"}}}
+{"before": null, "after": {"row":{"a": 5, "b": 0}}, "source": {"file": "binlog", "pos": 5, "row": 0, "snapshot": {"string": "false"}}}
 
 # return to just binlog-based deduplication, item 7 will be stripped because it is out of order!
 $ kafka-ingest format=avro topic=misordered-dbz-in-range-data schema=${new-dbz-schema} timestamp=1600005000000
-{"before": null, "after": {"row":{"a": 8, "b": 0}}, "source": {"file": "binlog", "pos": 8, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"row":{"a": 7, "b": 0}}, "source": {"file": "binlog", "pos": 7, "row": 0, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
+{"before": null, "after": {"row":{"a": 8, "b": 0}}, "source": {"file": "binlog", "pos": 8, "row": 0, "snapshot": {"string": "false"}}}
+{"before": null, "after": {"row":{"a": 7, "b": 0}}, "source": {"file": "binlog", "pos": 7, "row": 0, "snapshot": {"string": "false"}}}
 
 > CREATE MATERIALIZED SOURCE misordered_dbz_in_range
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-misordered-dbz-in-range-data-${testdrive.seed}'
@@ -661,7 +633,7 @@ a b
 ! CREATE SOURCE recursive
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'ignored'
   FORMAT AVRO USING SCHEMA '{"type":"record","name":"a","fields":[{"name":"f","type":["a","null"]}]}'
-contains:validating avro schema: Recursive types are not supported: .a
+validating avro schema: Recursive types are not supported: .a
 
 $ set key-schema={"type": "string"}
 $ set value-schema={"type": "record", "name": "r", "fields": [{"name": "a", "type": "string"}]}
@@ -747,7 +719,7 @@ $ set pg-dbz-schema={
     ]
   }
 
-$ kafka-create-topic topic=pg-dbz-data partitions=1
+$ kafka-create-topic topic=pg-dbz-data
 
 # The third and fourth records will be skipped, since `(lsn, total_order)` has gone backwards.
 $ kafka-ingest format=avro topic=pg-dbz-data schema=${pg-dbz-schema} timestamp=1
@@ -851,20 +823,6 @@ $ set ms-dbz-schema={
           "namespace": "io.debezium.connector.sqlserver",
           "type": "record"
         }
-      },
-      {
-        "name": "transaction",
-        "type": {
-          "type": "record",
-          "name": "Transaction",
-          "namespace": "whatever",
-          "fields": [
-            {
-              "name": "total_order",
-              "type": ["long", "null"]
-            }
-          ]
-        }
       }
     ],
     "name": "Envelope",
@@ -872,13 +830,13 @@ $ set ms-dbz-schema={
     "type": "record"
   }
 
-$ kafka-create-topic topic=ms-dbz-data partitions=1
+$ kafka-create-topic topic=ms-dbz-data
 
 # The third record will be skipped, since `lsn` has gone backwards.
 $ kafka-ingest format=avro topic=ms-dbz-data schema=${ms-dbz-schema} timestamp=1
-{"before": null, "after": {"Value":{"a": 1, "b": 1}}, "source": {"change_lsn": {"string": "00000025:00000728:001b"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"Value":{"a": 2, "b": 3}}, "source": {"change_lsn": {"string": "00000025:00000728:001c"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
-{"before": null, "after": {"Value":{"a": -1, "b": 7}}, "source": {"change_lsn": {"string": "00000025:00000728:001a"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}, "transaction": {"total_order": null}}
+{"before": null, "after": {"Value":{"a": 1, "b": 1}}, "source": {"change_lsn": {"string": "00000025:00000728:001b"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}}
+{"before": null, "after": {"Value":{"a": 2, "b": 3}}, "source": {"change_lsn": {"string": "00000025:00000728:001c"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}}
+{"before": null, "after": {"Value":{"a": -1, "b": 7}}, "source": {"change_lsn": {"string": "00000025:00000728:001a"}, "sequence": null, "event_serial_no": {"long": 1}, "snapshot": {"string": "false"}}}
 
 > CREATE MATERIALIZED SOURCE ms_dbz
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-ms-dbz-data-${testdrive.seed}'

@@ -20,7 +20,7 @@
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'foo'
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://127.0.0.1:65535'
   ENVELOPE NONE
-contains:connect error: Connection refused
+connect error: Connection refused
 
 #
 # Point to invalid URL schema
@@ -30,7 +30,7 @@ contains:connect error: Connection refused
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'foo'
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'ftp://127.0.0.1'
   ENVELOPE NONE
-contains:URL scheme is not allowed
+URL scheme is not allowed
 
 #
 # Point to a valid HTTP/S URL that is not a registry service
@@ -40,7 +40,7 @@ contains:URL scheme is not allowed
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'foo'
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}/no-such-path'
   ENVELOPE NONE
-contains:fetching latest schema for subject 'foo-value' from registry: subject not found
+fetching latest schema for subject 'foo-value' from registry: subject not found
 
 #
 # HTTP connection to a non-HTTP port port
@@ -50,7 +50,7 @@ contains:fetching latest schema for subject 'foo-value' from registry: subject n
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'foo'
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://${testdrive.kafka-addr}'
   ENVELOPE NONE
-contains:error sending request for url
+error sending request for url
 
 #
 # HTTPS connection to a non-HTTPS port
@@ -60,4 +60,4 @@ contains:error sending request for url
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'foo'
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'https://${testdrive.kafka-addr}'
   ENVELOPE NONE
-contains:error sending request for url
+error sending request for url

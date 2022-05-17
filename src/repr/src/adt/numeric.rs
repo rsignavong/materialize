@@ -12,52 +12,36 @@
 //!
 //! [`rust-dec`]: https://github.com/MaterializeInc/rust-dec/
 
-use std::error::Error;
-use std::fmt;
-
 use anyhow::bail;
 use dec::{Context, Decimal};
 use lazy_static::lazy_static;
-use serde::{Deserialize, Serialize};
 
-use mz_lowertest::MzReflect;
-use mz_ore::cast;
+use super::util;
 
-/// The number of internal decimal units in a [`Numeric`] value.
-pub const NUMERIC_DATUM_WIDTH: u8 = 13;
+/// The maximum number of digits expressable in a numeric.
+pub const NUMERIC_DATUM_WIDTH: usize = 13;
+pub const NUMERIC_DATUM_MAX_PRECISION: usize = NUMERIC_DATUM_WIDTH * 3;
+pub type Numeric = Decimal<NUMERIC_DATUM_WIDTH>;
 
-/// The value of [`NUMERIC_DATUM_WIDTH`] as a [`u8`].
-pub const NUMERIC_DATUM_WIDTH_USIZE: usize = cast::u8_to_usize(NUMERIC_DATUM_WIDTH);
-
-/// The maximum number of digits expressable in a [`Numeric`] value.
-pub const NUMERIC_DATUM_MAX_PRECISION: u8 = NUMERIC_DATUM_WIDTH * 3;
-
-/// A numeric value.
-pub type Numeric = Decimal<NUMERIC_DATUM_WIDTH_USIZE>;
-
-/// The number of internal decimal units in a [`NumericAgg`] value.
-pub const NUMERIC_AGG_WIDTH: u8 = 27;
-
-/// The value of [`NUMERIC_AGG_WIDTH`] as a [`u8`].
-pub const NUMERIC_AGG_WIDTH_USIZE: usize = cast::u8_to_usize(NUMERIC_AGG_WIDTH);
-
-/// The maximum number of digits expressable in a [`NumericAgg`] value.
-pub const NUMERIC_AGG_MAX_PRECISION: u8 = NUMERIC_AGG_WIDTH * 3;
-
-/// A double-width version of [`Numeric`] for use in aggregations.
-pub type NumericAgg = Decimal<NUMERIC_AGG_WIDTH_USIZE>;
+pub const NUMERIC_AGG_WIDTH: usize = 27;
+pub const NUMERIC_AGG_MAX_PRECISION: usize = NUMERIC_AGG_WIDTH * 3;
+pub type NumericAgg = Decimal<NUMERIC_AGG_WIDTH>;
 
 lazy_static! {
     static ref CX_DATUM: Context<Numeric> = {
         let mut cx = Context::<Numeric>::default();
-        cx.set_max_exponent(isize::from(NUMERIC_DATUM_MAX_PRECISION - 1)).unwrap();
-        cx.set_min_exponent(-isize::from(NUMERIC_DATUM_MAX_PRECISION)).unwrap();
+        cx.set_max_exponent(isize::try_from(NUMERIC_DATUM_MAX_PRECISION - 1).unwrap())
+            .unwrap();
+        cx.set_min_exponent(-(isize::try_from(NUMERIC_DATUM_MAX_PRECISION).unwrap()))
+            .unwrap();
         cx
     };
     static ref CX_AGG: Context<NumericAgg> = {
         let mut cx = Context::<NumericAgg>::default();
-        cx.set_max_exponent(isize::from(NUMERIC_AGG_MAX_PRECISION - 1)).unwrap();
-        cx.set_min_exponent(-isize::from(NUMERIC_AGG_MAX_PRECISION)).unwrap();
+        cx.set_max_exponent(isize::try_from(NUMERIC_AGG_MAX_PRECISION - 1).unwrap())
+            .unwrap();
+        cx.set_min_exponent(-(isize::try_from(NUMERIC_AGG_MAX_PRECISION).unwrap()))
+            .unwrap();
         cx
     };
     static ref U128_SPLITTER_DATUM: Numeric = {
@@ -72,64 +56,6 @@ lazy_static! {
     };
 }
 
-/// The `max_scale` of a [`ScalarType::Numeric`].
-///
-/// This newtype wrapper ensures that the scale is within the valid range.
-///
-/// [`ScalarType::Numeric`]: crate::ScalarType::Numeric
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize, MzReflect,
-)]
-pub struct NumericMaxScale(pub(crate) u8);
-
-impl NumericMaxScale {
-    /// A max scale of zero.
-    pub const ZERO: NumericMaxScale = NumericMaxScale(0);
-
-    /// Consumes the newtype wrapper, returning the inner `u8`.
-    pub fn into_u8(self) -> u8 {
-        self.0
-    }
-}
-
-impl TryFrom<i64> for NumericMaxScale {
-    type Error = InvalidNumericMaxScaleError;
-
-    fn try_from(max_scale: i64) -> Result<Self, Self::Error> {
-        match u8::try_from(max_scale) {
-            Ok(max_scale) if max_scale <= NUMERIC_DATUM_MAX_PRECISION => {
-                Ok(NumericMaxScale(max_scale))
-            }
-            _ => Err(InvalidNumericMaxScaleError),
-        }
-    }
-}
-
-impl TryFrom<usize> for NumericMaxScale {
-    type Error = InvalidNumericMaxScaleError;
-
-    fn try_from(max_scale: usize) -> Result<Self, Self::Error> {
-        Self::try_from(i64::try_from(max_scale).map_err(|_| InvalidNumericMaxScaleError)?)
-    }
-}
-
-/// The error returned when constructing a [`NumericMaxScale`] from an invalid
-/// value.
-#[derive(Debug, Clone)]
-pub struct InvalidNumericMaxScaleError;
-
-impl fmt::Display for InvalidNumericMaxScaleError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "scale for type numeric must be between 0 and {}",
-            NUMERIC_DATUM_MAX_PRECISION
-        )
-    }
-}
-
-impl Error for InvalidNumericMaxScaleError {}
-
 /// Traits to generalize converting [`Decimal`] values to and from their
 /// coefficients' two's complements.
 pub trait Dec<const N: usize> {
@@ -143,7 +69,7 @@ pub trait Dec<const N: usize> {
     fn u128_splitter() -> &'static Decimal<N>;
 }
 
-impl Dec<NUMERIC_DATUM_WIDTH_USIZE> for Numeric {
+impl Dec<NUMERIC_DATUM_WIDTH> for Numeric {
     const TWOS_COMPLEMENT_BYTE_WIDTH: usize = 17;
     fn context() -> Context<Numeric> {
         CX_DATUM.clone()
@@ -153,7 +79,7 @@ impl Dec<NUMERIC_DATUM_WIDTH_USIZE> for Numeric {
     }
 }
 
-impl Dec<NUMERIC_AGG_WIDTH_USIZE> for NumericAgg {
+impl Dec<NUMERIC_AGG_WIDTH> for NumericAgg {
     const TWOS_COMPLEMENT_BYTE_WIDTH: usize = 33;
     fn context() -> Context<NumericAgg> {
         CX_AGG.clone()
@@ -222,9 +148,7 @@ pub fn numeric_to_twos_complement_be(
         cx.scaleb(&mut numeric, &s);
     }
 
-    numeric_to_twos_complement_inner::<Numeric, NUMERIC_DATUM_WIDTH_USIZE>(
-        numeric, &mut cx, &mut buf,
-    );
+    numeric_to_twos_complement_inner::<Numeric, NUMERIC_DATUM_WIDTH>(numeric, &mut cx, &mut buf);
     buf
 }
 
@@ -257,7 +181,7 @@ pub fn numeric_to_twos_complement_wide(
     cx.abs(&mut scaler);
     cx.scaleb(&mut d, &scaler);
 
-    numeric_to_twos_complement_inner::<NumericAgg, NUMERIC_AGG_WIDTH_USIZE>(d, &mut cx, &mut buf);
+    numeric_to_twos_complement_inner::<NumericAgg, NUMERIC_AGG_WIDTH>(d, &mut cx, &mut buf);
     buf
 }
 
@@ -316,7 +240,7 @@ pub fn twos_complement_be_to_numeric(
     let mut cx = cx_datum();
     if input.len() <= 17 {
         if let Ok(mut n) =
-            twos_complement_be_to_numeric_inner::<Numeric, NUMERIC_DATUM_WIDTH_USIZE>(input)
+            twos_complement_be_to_numeric_inner::<Numeric, NUMERIC_DATUM_WIDTH>(input)
         {
             n.set_exponent(-i32::from(scale));
             return Ok(n);
@@ -324,7 +248,7 @@ pub fn twos_complement_be_to_numeric(
     }
     // If bytes were invalid for narrower representation, try to use wider
     // representation in case e.g. simply has more trailing zeroes.
-    let mut n = twos_complement_be_to_numeric_inner::<NumericAgg, NUMERIC_AGG_WIDTH_USIZE>(input)?;
+    let mut n = twos_complement_be_to_numeric_inner::<NumericAgg, NUMERIC_AGG_WIDTH>(input)?;
     // Exponent must be set before converting to `Numeric` width, otherwise values can overflow 39 dop.
     n.set_exponent(-i32::from(scale));
     let d = cx.to_width(n);
@@ -628,9 +552,9 @@ pub fn munge_numeric(n: &mut Numeric) -> Result<(), anyhow::Error> {
 /// possible.
 fn rescale_within_max_precision(n: &mut Numeric) -> Result<(), anyhow::Error> {
     let current_precision = get_precision(n);
-    if current_precision > u32::from(NUMERIC_DATUM_MAX_PRECISION) {
+    if current_precision > NUMERIC_DATUM_MAX_PRECISION as u32 {
         if n.exponent() < 0 {
-            let precision_diff = current_precision - u32::from(NUMERIC_DATUM_MAX_PRECISION);
+            let precision_diff = current_precision - NUMERIC_DATUM_MAX_PRECISION as u32;
             let current_scale = get_scale(n);
             let scale_diff = current_scale - u8::try_from(precision_diff).unwrap();
             rescale(n, scale_diff)?;
@@ -652,8 +576,7 @@ fn rescale_within_max_precision(n: &mut Numeric) -> Result<(), anyhow::Error> {
 pub fn rescale(n: &mut Numeric, scale: u8) -> Result<(), anyhow::Error> {
     let mut cx = cx_datum();
     cx.rescale(n, &Numeric::from(-i32::from(scale)));
-    if cx.status().invalid_operation() || get_precision(n) > u32::from(NUMERIC_DATUM_MAX_PRECISION)
-    {
+    if cx.status().invalid_operation() || get_precision(n) > NUMERIC_DATUM_MAX_PRECISION as u32 {
         bail!(
             "numeric value {} exceed maximum precision {}",
             n,
@@ -665,35 +588,31 @@ pub fn rescale(n: &mut Numeric, scale: u8) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// A type that can represent Real Numbers. Useful for interoperability between Numeric and
-/// floating point.
-pub trait DecimalLike:
-    From<u8>
-    + From<u16>
-    + From<u32>
-    + From<i8>
-    + From<i16>
-    + From<i32>
-    + From<f32>
-    + From<f64>
-    + std::ops::Add<Output = Self>
-    + std::ops::Sub<Output = Self>
-    + std::ops::Mul<Output = Self>
-    + std::ops::Div<Output = Self>
-{
-    /// Used to do value-to-value conversions while consuming the input value. Depending on the
-    /// implementation it may be potentially lossy.
-    fn lossy_from(i: i64) -> Self;
-}
+/// Validates the typ_mod is valid for numeric type and returns a specified
+/// scale is appropriate (we ignore the specified precision).
+pub fn extract_typ_mod(typ_mod: &[u64]) -> Result<Option<u8>, anyhow::Error> {
+    let max_precision = u8::try_from(NUMERIC_DATUM_MAX_PRECISION).unwrap();
+    let typ_mod = util::extract_typ_mod::<u8>(
+        "numeric",
+        &typ_mod,
+        &[("precision", 1, max_precision), ("scale", 0, max_precision)],
+    )?;
 
-impl DecimalLike for f64 {
-    fn lossy_from(i: i64) -> Self {
-        i as f64
-    }
-}
-
-impl DecimalLike for Numeric {
-    fn lossy_from(i: i64) -> Self {
-        Numeric::from(i)
-    }
+    // Poor man's VecDeque
+    Ok(match typ_mod.len() {
+        0 | 1 => None,
+        2 => {
+            let precision = typ_mod[0];
+            let scale = typ_mod[1];
+            if scale > precision {
+                bail!(
+                    "numeric scale {} must be between 0 and precision {}",
+                    scale,
+                    precision
+                );
+            }
+            Some(scale)
+        }
+        _ => unreachable!(),
+    })
 }

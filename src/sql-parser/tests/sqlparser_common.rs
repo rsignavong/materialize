@@ -22,13 +22,13 @@ use std::error::Error;
 
 use unicode_width::UnicodeWidthStr;
 
-use mz_ore::collections::CollectionExt;
-use mz_ore::fmt::FormatBuffer;
-use mz_sql_parser::ast::display::AstDisplay;
-use mz_sql_parser::ast::visit::Visit;
-use mz_sql_parser::ast::visit_mut::{self, VisitMut};
-use mz_sql_parser::ast::{AstInfo, Expr, Ident, Raw, RawObjectName, UnresolvedDataType};
-use mz_sql_parser::parser::{self, ParserError};
+use ore::collections::CollectionExt;
+use ore::fmt::FormatBuffer;
+use sql_parser::ast::display::AstDisplay;
+use sql_parser::ast::visit::Visit;
+use sql_parser::ast::visit_mut::{self, VisitMut};
+use sql_parser::ast::{AstInfo, Expr, Ident, Raw, RawName};
+use sql_parser::parser::{self, ParserError};
 
 #[test]
 fn datadriven() {
@@ -59,12 +59,12 @@ fn datadriven() {
                 if s.len() != 1 {
                     "expected exactly one statement".to_string()
                 } else if tc.args.get("roundtrip").is_some() {
-                    format!("{}\n", s.into_element())
+                    format!("{}\n", s.into_element().to_string())
                 } else {
                     let stmt = s.into_element();
                     // TODO(justin): it would be nice to have a middle-ground between this
                     // all-on-one-line and {:#?}'s huge number of lines.
-                    format!("{}\n=>\n{:?}\n", stmt, stmt)
+                    format!("{}\n=>\n{:?}\n", stmt.to_string(), stmt)
                 }
             }
             Err(e) => render_error(input, e),
@@ -76,7 +76,7 @@ fn datadriven() {
         match parser::parse_expr(input) {
             Ok(s) => {
                 if tc.args.get("roundtrip").is_some() {
-                    format!("{}\n", s)
+                    format!("{}\n", s.to_string())
                 } else {
                     // TODO(justin): it would be nice to have a middle-ground between this
                     // all-on-one-line and {:#?}'s huge number of lines.
@@ -179,15 +179,10 @@ fn test_basic_visitor() -> Result<(), Box<dyn Error>> {
             self.seen_idents.push(ident.as_str());
         }
         fn visit_object_name(&mut self, object_name: &'a <Raw as AstInfo>::ObjectName) {
-            if let RawObjectName::Name(name) = object_name {
+            if let RawName::Name(name) = object_name {
                 for ident in &name.0 {
                     self.seen_idents.push(ident.as_str());
                 }
-            }
-        }
-        fn visit_data_type(&mut self, data_type: &'a <Raw as AstInfo>::DataType) {
-            if let UnresolvedDataType::Other { name, .. } = data_type {
-                self.visit_object_name(name)
             }
         }
     }
@@ -213,7 +208,7 @@ fn test_basic_visitor() -> Result<(), Box<dyn Error>> {
                 AND CASE a27 WHEN a28 THEN a29 ELSE a30 END
                 AND a31 BETWEEN a32 AND a33
                 AND a34 COLLATE a35 = a36
-                AND DATE_PART('YEAR', a37)
+                AND EXTRACT(YEAR FROM a37)
                 AND (SELECT a38)
                 AND EXISTS (SELECT a39)
             FROM a40(a41) AS a42

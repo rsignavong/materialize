@@ -11,9 +11,9 @@
 # Basic sanity checks around the SET failpoints syntax
 
 ! SET failpoints = 'a';
-contains:parameter "failpoints" cannot have value "a": missing failpoint action
+parameter "failpoints" cannot have value "a": missing failpoint action
 
 ! SET failpoints = 'a=1';
-contains:parameter "failpoints" cannot have value "a=1": unrecognized command "1"
+parameter "failpoints" cannot have value "a=1": unrecognized command "1"
 
 > SET failpoints = 'a=off';

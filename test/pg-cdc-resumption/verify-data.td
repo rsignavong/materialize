@@ -11,6 +11,3 @@
 true
 > SELECT COUNT(*) = 500000 FROM t2;
 true
-
-! SELECT * FROM to_be_altered;
-contains:altered

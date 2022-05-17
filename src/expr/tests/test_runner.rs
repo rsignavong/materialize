@@ -8,12 +8,12 @@
 // by the Apache License, Version 2.0.
 
 mod test {
-    use mz_expr::canonicalize::{canonicalize_equivalences, canonicalize_predicates};
-    use mz_expr::{MapFilterProject, MirScalarExpr};
-    use mz_expr_test_util::*;
-    use mz_lowertest::{deserialize, tokenize};
-    use mz_ore::str::separated;
-    use mz_repr::RelationType;
+    use expr::canonicalize::{canonicalize_equivalences, canonicalize_predicates};
+    use expr::{MapFilterProject, MirScalarExpr};
+    use expr_test_util::*;
+    use lowertest::{deserialize, tokenize};
+    use ore::str::separated;
+    use repr::RelationType;
 
     fn reduce(s: &str) -> Result<MirScalarExpr, String> {
         let mut input_stream = tokenize(&s)?.into_iter();
@@ -21,16 +21,7 @@ mod test {
         let mut scalar: MirScalarExpr =
             deserialize(&mut input_stream, "MirScalarExpr", &RTI, &mut ctx)?;
         let typ: RelationType = deserialize(&mut input_stream, "RelationType", &RTI, &mut ctx)?;
-        let before = scalar.typ(&typ);
         scalar.reduce(&typ);
-        let after = scalar.typ(&typ);
-        // Verify that `reduce` did not change the type of the scalar.
-        if before.scalar_type != after.scalar_type {
-            return Err(format!(
-                "FAIL: Type of scalar has changed:\nbefore: {:?}\nafter: {:?}\n",
-                before, after
-            ));
-        }
         Ok(scalar)
     }
 
@@ -116,7 +107,7 @@ mod test {
                     // tests simplification of scalars
                     "reduce" => match reduce(&s.input) {
                         Ok(scalar) => {
-                            format!("{}\n", scalar)
+                            format!("{}\n", scalar.to_string())
                         }
                         Err(err) => format!("error: {}\n", err),
                     },

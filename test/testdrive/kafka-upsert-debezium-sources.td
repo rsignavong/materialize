@@ -46,7 +46,7 @@ $ set schema={
     ]
   }
 
-$ kafka-create-topic topic=dbzupsert partitions=1
+$ kafka-create-topic topic=dbzupsert
 
 $ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschema} schema=${schema} publish=true timestamp=1
 {"id": 1} {"before": {"row": {"id": 1, "creature": "fish"}}, "after": {"row": {"id": 1, "creature": "mudskipper"}}}
@@ -62,13 +62,13 @@ $ kafka-ingest format=avro topic=dbzupsert key-format=avro key-schema=${keyschem
   ENVELOPE DEBEZIUM
 
 ! SELECT * FROM start_offset_misconfigured
-contains:Invalid data in source, saw retractions (1) for row that does not exist
+Updates and deletes are not allowed for this source! This probably means it was started with `start_offset` and without `UPSERT` semantics.
 
 ! CREATE MATERIALIZED SOURCE doin_upsert
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-dbzupsert-${testdrive.seed}'
   FORMAT AVRO USING SCHEMA '${schema}'
   ENVELOPE DEBEZIUM UPSERT
-contains:ENVELOPE [DEBEZIUM] UPSERT requires that KEY FORMAT be specified
+ENVELOPE [DEBEZIUM] UPSERT requires that KEY FORMAT be specified
 
 > CREATE MATERIALIZED SOURCE doin_upsert
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-dbzupsert-${testdrive.seed}'
@@ -122,7 +122,7 @@ moros
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
   INCLUDE OFFSET
   ENVELOPE DEBEZIUM
-contains:INCLUDE OFFSET with Debezium requires UPSERT semantics
+INCLUDE OFFSET with Debezium requires UPSERT semantics
 
 > CREATE MATERIALIZED SOURCE doin_upsert_metadata
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-dbzupsert-${testdrive.seed}'
@@ -167,13 +167,25 @@ id creature
 -----------
 3  triceratops
 
+# Test that `WITH (kafka_time_offset=<whatever>)` works
+> CREATE MATERIALIZED SOURCE upsert_time_skip
+  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-dbzupsert-${testdrive.seed}'
+  WITH (kafka_time_offset = 6)
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+  ENVELOPE DEBEZIUM UPSERT
+
+> SELECT * FROM upsert_time_skip
+id creature
+-----------
+4  chicken
+
 # Test that it doesn't work with full deduplication
 ! CREATE MATERIALIZED SOURCE upsert_full_dedupe
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-dbzupsert-${testdrive.seed}'
   WITH (deduplication = 'full')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
   ENVELOPE DEBEZIUM UPSERT
-contains:unexpected parameters for CREATE SOURCE: deduplication
+Debezium deduplication does not make sense with upsert sources
 
 
 # test include metadata

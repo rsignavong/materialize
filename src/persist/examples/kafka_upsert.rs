@@ -16,30 +16,29 @@ use std::time::Duration;
 use std::{cmp, env, process};
 
 use differential_dataflow::Hashable;
-use mz_persist::operators::stream::Persist;
+use persist::operators::stream::Persist;
 use serde::{Deserialize, Serialize};
-use tracing::info;
 
-use mz_ore::metrics::MetricsRegistry;
-use mz_ore::now::{NowFn, SYSTEM_TIME};
-use mz_persist::client::{MultiWriteHandle, RuntimeClient, StreamReadHandle};
-use mz_persist::error::Error as PersistError;
-use mz_persist::file::{FileBlob, FileLog};
-use mz_persist::location::{Blob, LockInfo};
-use mz_persist::operators::stream::{AwaitFrontier, Seal};
-use mz_persist::operators::upsert::{PersistentUpsert, PersistentUpsertConfig};
-use mz_persist::runtime::{self, RuntimeConfig};
-use mz_persist::Data;
-use mz_persist_types::Codec;
+use ore::metrics::MetricsRegistry;
+use ore::now::{NowFn, SYSTEM_TIME};
+use persist::error::Error as PersistError;
+use persist::file::{FileBlob, FileLog};
+use persist::indexed::runtime::{self, RuntimeClient, RuntimeConfig, StreamReadHandle};
+use persist::indexed::Snapshot;
+use persist::operators::stream::{AwaitFrontier, Seal};
+use persist::operators::upsert::{PersistentUpsert, PersistentUpsertConfig};
+use persist::storage::{Blob, LockInfo};
+use persist::Data;
+use persist_types::Codec;
 
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
 use timely::dataflow::operators::generic::operator;
-use timely::dataflow::operators::{Concat, Inspect, Map, Probe, ToStream};
+use timely::dataflow::operators::{Concat, Inspect, Map, ToStream};
 use timely::dataflow::{Scope, Stream};
 use timely::progress::Antichain;
 
 fn main() {
-    mz_ore::test::init_logging_default("trace");
+    ore::test::init_logging_default("trace");
 
     if let Err(err) = run(env::args().collect()) {
         eprintln!("error: {}", err);
@@ -61,7 +60,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             RuntimeConfig::default(),
             log,
             blob,
-            mz_build_info::DUMMY_BUILD_INFO,
+            build_info::DUMMY_BUILD_INFO,
             &MetricsRegistry::new(),
             None,
         )?
@@ -81,8 +80,8 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
                 let err_stream = vec![(err.to_string(), 0, 1)].to_stream(scope);
                 (ok_stream, err_stream)
             });
-            ok_stream.inspect(|d| info!("ok: {:?}", d));
-            err_stream.inspect(|d| info!("err: {:?}", d));
+            ok_stream.inspect(|d| log::info!("ok: {:?}", d));
+            err_stream.inspect(|d| log::info!("err: {:?}", d));
         })
     })?;
 
@@ -100,8 +99,8 @@ fn construct_persistent_upsert_source<G, S>(
     name_base: &str,
 ) -> Result<
     (
-        Stream<G, ((S::K, S::V), u64, i64)>,
-        Stream<G, (String, u64, i64)>,
+        Stream<G, ((S::K, S::V), u64, isize)>,
+        Stream<G, (String, u64, isize)>,
     ),
     Box<dyn Error>,
 >
@@ -120,10 +119,10 @@ where
     //
     // An "epoch" source that is an input to the "real" sources could do the
     // trick.
-    // let epoch_interval = Duration::from_secs(1);
+    // let epoch_interval_ms = 1000;
 
-    let source_interval = Duration::from_secs(1);
-    let timestamp_interval = Duration::from_secs(5);
+    let source_interval_ms = 1000;
+    let timestamp_interval_ms = 5000;
     let now_fn = SYSTEM_TIME.clone();
 
     let start_ts = cmp::min(sealed_ts(&ts_read)?, sealed_ts(&out_read)?);
@@ -133,8 +132,8 @@ where
         scope,
         start_ts,
         now_fn,
-        source_interval,
-        timestamp_interval,
+        source_interval_ms,
+        timestamp_interval_ms,
         ts_read,
     )?;
 
@@ -154,15 +153,11 @@ where
         PersistentUpsertConfig::new(start_ts, out_read, out_write.clone()),
     );
 
-    let mut seal_handle = MultiWriteHandle::new(&out_write);
-    seal_handle
-        .add_stream(&ts_write)
-        .expect("known from same runtime");
-
-    let upsert_oks = upsert_oks.seal(
+    let upsert_oks = upsert_oks.conditional_seal(
         "timestamp_bindings|upsert_state",
-        vec![bindings_persist_oks.probe()],
-        seal_handle,
+        &bindings_persist_oks,
+        out_write,
+        ts_write,
     );
 
     // Wait for persistent collections to be sealed before forwarding results.  We could do this
@@ -190,13 +185,13 @@ fn read_source<G, S>(
     scope: &mut G,
     start_ts: u64,
     now_fn: NowFn,
-    emission_interval: Duration,
-    timestamp_interval: Duration,
+    emission_interval_ms: u64,
+    timestamp_interval_ms: u64,
     bindings_read: StreamReadHandle<S::SourceTimestamp, AssignedTimestamp>,
 ) -> Result<
     (
-        Stream<G, ((S::K, S::V), S::SourceTimestamp, u64, i64)>,
-        Stream<G, ((S::SourceTimestamp, AssignedTimestamp), u64, i64)>,
+        Stream<G, ((S::K, S::V), S::SourceTimestamp, u64, isize)>,
+        Stream<G, ((S::SourceTimestamp, AssignedTimestamp), u64, isize)>,
     ),
     Box<dyn Error>,
 >
@@ -222,7 +217,7 @@ where
 
     let mut source = S::new(
         starting_offsets,
-        emission_interval,
+        emission_interval_ms,
         now_fn.clone(),
         worker_index,
         num_workers,
@@ -243,7 +238,7 @@ where
         move |_frontiers| {
             // only emit a binding update if we actually have a current offset
             let now = now_fn();
-            let now_clamped = now - (now % timestamp_interval.as_millis() as u64);
+            let now_clamped = now - (now % timestamp_interval_ms);
             if now_clamped != current_ts {
                 // emit bindings for all offsets we're currently aware of
                 let mut bindings_out = bindings_out.activate();
@@ -293,13 +288,13 @@ fn sealed_ts<K: Data, V: Data>(read: &StreamReadHandle<K, V>) -> Result<u64, Box
 /// Cheapo version of our current `SourceReader`. The new source trait from Petros uses an async
 /// `Stream` instead of polling for messages.
 trait Source {
-    type SourceTimestamp: timely::Data + timely::ExchangeData + mz_persist::Data + Ord;
-    type K: timely::Data + timely::ExchangeData + mz_persist::Data + Hash + Codec;
-    type V: timely::Data + timely::ExchangeData + mz_persist::Data + Hash + Codec;
+    type SourceTimestamp: timely::Data + timely::ExchangeData + persist::Data + Ord;
+    type K: timely::Data + timely::ExchangeData + persist::Data + Hash + Codec;
+    type V: timely::Data + timely::ExchangeData + persist::Data + Hash + Codec;
 
     fn new(
         starting_offsets: Vec<Self::SourceTimestamp>,
-        emission_interval: Duration,
+        emission_interval_ms: u64,
         now_fn: NowFn,
         worker_index: usize,
         num_workers: usize,
@@ -315,7 +310,7 @@ trait Source {
 struct KafkaSource {
     current_offsets: HashMap<KafkaPartition, KafkaOffset>,
     last_message_time: u64,
-    emission_interval: Duration,
+    emission_interval_ms: u64,
     now_fn: NowFn,
     last_partition: usize,
 }
@@ -327,7 +322,7 @@ impl Source for KafkaSource {
 
     fn new(
         starting_offsets: Vec<Self::SourceTimestamp>,
-        emission_interval: Duration,
+        emission_interval_ms: u64,
         now_fn: NowFn,
         worker_index: usize,
         num_workers: usize,
@@ -368,7 +363,7 @@ impl Source for KafkaSource {
         KafkaSource {
             last_message_time: u64::MIN,
             current_offsets,
-            emission_interval,
+            emission_interval_ms,
             now_fn,
             last_partition: 0,
         }
@@ -381,7 +376,7 @@ impl Source for KafkaSource {
         SourceTimestamp<KafkaPartition, KafkaOffset>,
     )> {
         let now = (self.now_fn)();
-        let now_clamped = now - (now % self.emission_interval.as_millis() as u64);
+        let now_clamped = now - (now % self.emission_interval_ms);
 
         if self.current_offsets.is_empty() {
             // this sink doesn't have any partitions assigned
@@ -436,9 +431,7 @@ struct AssignedTimestamp(u64);
 struct SourceTimestamp<P, O>(P, O);
 
 mod kafka_offset_impls {
-    use bytes::BufMut;
-
-    use mz_persist_types::Codec;
+    use persist_types::Codec;
 
     use crate::AssignedTimestamp;
     use crate::KafkaOffset;
@@ -450,11 +443,8 @@ mod kafka_offset_impls {
             "KafkaPartition".into()
         }
 
-        fn encode<B>(&self, buf: &mut B)
-        where
-            B: BufMut,
-        {
-            buf.put_slice(&self.0.to_le_bytes())
+        fn encode<E: for<'a> Extend<&'a u8>>(&self, buf: &mut E) {
+            buf.extend(&self.0.to_le_bytes())
         }
 
         fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
@@ -469,11 +459,8 @@ mod kafka_offset_impls {
             "KafkaOffset".into()
         }
 
-        fn encode<B>(&self, buf: &mut B)
-        where
-            B: BufMut,
-        {
-            buf.put_slice(&self.0.to_le_bytes())
+        fn encode<E: for<'a> Extend<&'a u8>>(&self, buf: &mut E) {
+            buf.extend(&self.0.to_le_bytes())
         }
 
         fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
@@ -488,11 +475,8 @@ mod kafka_offset_impls {
             "AssignedTimestamp".into()
         }
 
-        fn encode<B>(&self, buf: &mut B)
-        where
-            B: BufMut,
-        {
-            buf.put_slice(&self.0.to_le_bytes())
+        fn encode<E: for<'a> Extend<&'a u8>>(&self, buf: &mut E) {
+            buf.extend(&self.0.to_le_bytes())
         }
 
         fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
@@ -507,19 +491,16 @@ mod kafka_offset_impls {
             "SourceTimestamp".into()
         }
 
-        fn encode<B>(&self, buf: &mut B)
-        where
-            B: BufMut,
-        {
+        fn encode<E: for<'a> Extend<&'a u8>>(&self, buf: &mut E) {
             let mut inner_buf = Vec::new();
             self.0.encode(&mut inner_buf);
-            buf.put_slice(&inner_buf.len().to_le_bytes());
-            buf.put_slice(&inner_buf);
+            buf.extend(&inner_buf.len().to_le_bytes());
+            buf.extend(&inner_buf);
 
             inner_buf.clear();
             self.1.encode(&mut inner_buf);
-            buf.put_slice(&inner_buf.len().to_le_bytes());
-            buf.put_slice(&inner_buf);
+            buf.extend(&inner_buf.len().to_le_bytes());
+            buf.extend(&inner_buf);
         }
 
         fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {

@@ -16,12 +16,12 @@
 
 target:
   type: materialize
-  host: "{{ env_var('DBT_HOST', 'localhost') }}"
+  host: "{{ env_var('DBT_HOST') }}"
   user: materialize
   pass: password
   database: materialize
   schema: "dbt_test_{{ var('_dbt_random_suffix') }}"
-  port: "{{ env_var('DBT_PORT', 6875) }}"
+  port: 6875
   threads: 1
   sslmode: "{{ env_var('DBT_SSLMODE', '') }}"
   sslcert: "{{ env_var('DBT_SSLCERT', '') }}"
@@ -69,120 +69,7 @@ sequences:
   test_dbt_schema_test: schema_test
   test_dbt_ephemeral: ephemeral
   test_dbt_ephemeral_data_tests: data_test_ephemeral_models
-  test_dbt_custom_materializations:
-    project: custom_materializations
-    sequence:
-      - type: dbt
-        cmd: seed
-      - type: dbt
-        cmd: run
-      - type: relations_equal
-        relations: [test_materialized_view, test_view_index, test_source_index]
-      - type: relations_equal
-        relations: [actual_indexes, expected_indexes]
-      # TODO(benesch): figure out how to test that the sink emits the correct
-      # data. Ideally we'd just ingest the sink back into Materialize with a
-      # source and then use a `relations_equal` step, but that's hard to do
-      # presently because Avro OCF sinks do not have a stable output filename
-      # and Avro OCF sources do not support glob patterns.
   # dbt-materialize does not support incremental models or snapshots
   # test_dbt_incremental: incremental
   # test_dbt_snapshot_strategy_timestamp: snapshot_strategy_timestamp
   # test_dbt_snapshot_strategy_check_cols: snapshot_strategy_check_cols
-projects:
-  - overrides: base
-    facts:
-      # Since tables in Materialize are ephemeral, "table" and "seed"
-      # materializations use views for now.
-      expected_types_table:
-        base: view
-        view_model: view
-        table_model: view
-        swappable: view
-      expected_types_view:
-        base: view
-        view_model: view
-        table_model: view
-        swappable: view
-  - name: custom_materializations
-    paths:
-        testdata/test_csv.csv: |
-            a,b
-            chicken,pig
-            cow,horse
-
-        models/test_materialized_view.sql: |
-            {{ config(materialized='materializedview') }}
-
-            SELECT * FROM (VALUES ('chicken', 'pig'), ('cow', 'horse')) _ (a, b)
-
-        models/test_materialized_view_index.sql: |
-            {{ config(
-                materialized='materializedview',
-                indexes=[{'columns': ['a']}]
-            ) }}
-
-            SELECT * FROM (VALUES ('chicken', 'pig'), ('cow', 'horse')) _ (a, b)
-
-        models/test_view_index.sql: |
-            {{ config(
-                materialized='view',
-                indexes=[{'columns': ['a', 'length(a)']}]
-            ) }}
-
-            SELECT * FROM (VALUES ('chicken', 'pig'), ('cow', 'horse')) _ (a, b)
-
-        models/test_source.sql: |
-            {{ config(materialized='source') }}
-
-            CREATE SOURCE {{ mz_generate_name('test_source') }}
-            -- TODO(benesch): is there a better way to get the CWD in a test?
-            FROM FILE '{{ flags.os.getcwd() }}/testdata/test_csv.csv'
-            FORMAT CSV WITH HEADER
-
-        models/test_index.sql: |
-            {{ config(materialized='index') }}
-
-            CREATE DEFAULT INDEX test_index
-            ON {{ ref('test_source') }}
-
-        models/test_source_index.sql: |
-            {{ config(
-                materialized='source',
-                indexes=[{'columns': ['a']}]
-            ) }}
-
-            CREATE SOURCE {{ mz_generate_name('test_source_index') }}
-            FROM FILE '{{ flags.os.getcwd() }}/testdata/test_csv.csv'
-            FORMAT CSV WITH HEADER
-
-        models/test_sink.sql: |
-            {{ config(materialized='sink') }}
-
-            CREATE SINK {{ mz_generate_name('test_sink') }}
-            FROM {{ ref('test_source') }}
-            INTO AVRO OCF 'test_sink.ocf'
-
-        models/actual_indexes.sql: |
-            SELECT
-                o.name, ic.index_position, ic.on_position, ic.on_expression
-            FROM mz_indexes i
-            JOIN mz_index_columns ic ON i.id = ic.index_id
-            JOIN mz_objects o ON i.on_id = o.id
-            WHERE i.id LIKE 'u%'
-
-        seeds/expected_indexes.csv: |
-            name,index_position,on_position,on_expression
-            expected_indexes,1,1,
-            expected_indexes,2,2,
-            expected_indexes,3,3,
-            expected_indexes,4,4,
-            test_materialized_view,1,1,
-            test_materialized_view_index,1,1,
-            test_materialized_view_index,1,1,
-            test_source,1,1,
-            test_source,2,2,
-            test_source,3,3,
-            test_source_index,1,1,
-            test_view_index,1,1,
-            test_view_index,2,,pg_catalog.length(a)

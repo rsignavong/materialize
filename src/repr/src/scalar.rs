@@ -9,7 +9,6 @@
 
 use std::fmt::{self, Write};
 use std::hash::Hash;
-use std::iter;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use dec::OrderedDecimal;
@@ -20,14 +19,14 @@ use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use mz_lowertest::MzReflect;
+use lowertest::MzEnumReflect;
 
 use crate::adt::array::Array;
-use crate::adt::char::{Char, CharLength};
+use crate::adt::char::Char;
 use crate::adt::interval::Interval;
-use crate::adt::numeric::{Numeric, NumericMaxScale};
-use crate::adt::system::{Oid, PgLegacyChar, RegClass, RegProc, RegType};
-use crate::adt::varchar::{VarChar, VarCharMaxLength};
+use crate::adt::numeric::Numeric;
+use crate::adt::system::{Oid, RegClass, RegProc, RegType};
+use crate::adt::varchar::VarChar;
 use crate::{ColumnName, ColumnType, DatumList, DatumMap};
 use crate::{Row, RowArena};
 
@@ -47,10 +46,6 @@ pub enum Datum<'a> {
     Int32(i32),
     /// A 64-bit signed integer.
     Int64(i64),
-    /// An 8-bit unsigned integer.
-    UInt8(u8),
-    /// A 32-bit unsigned integer.
-    UInt32(u32),
     /// A 32-bit floating point number.
     Float32(OrderedFloat<f32>),
     /// A 64-bit floating point number.
@@ -319,32 +314,6 @@ impl<'a> Datum<'a> {
         }
     }
 
-    /// Unwraps the 8-bit integer value within this datum.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the datum is not [`Datum::UInt8`].
-    #[track_caller]
-    pub fn unwrap_uint8(&self) -> u8 {
-        match self {
-            Datum::UInt8(u) => *u,
-            _ => panic!("Datum::unwrap_uint8 called on {:?}", self),
-        }
-    }
-
-    /// Unwraps the 64-bit integer value within this datum.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the datum is not [`Datum::UInt32`].
-    #[track_caller]
-    pub fn unwrap_uint32(&self) -> u32 {
-        match self {
-            Datum::UInt32(u) => *u,
-            _ => panic!("Datum::unwrap_uint32 called on {:?}", self),
-        }
-    }
-
     #[track_caller]
     pub fn unwrap_ordered_float32(&self) -> OrderedFloat<f32> {
         match self {
@@ -574,16 +543,13 @@ impl<'a> Datum<'a> {
                     (Datum::Int16(_), ScalarType::Int16) => true,
                     (Datum::Int16(_), _) => false,
                     (Datum::Int32(_), ScalarType::Int32) => true,
+                    (Datum::Int32(_), ScalarType::Oid) => true,
+                    (Datum::Int32(_), ScalarType::RegClass) => true,
+                    (Datum::Int32(_), ScalarType::RegProc) => true,
+                    (Datum::Int32(_), ScalarType::RegType) => true,
                     (Datum::Int32(_), _) => false,
                     (Datum::Int64(_), ScalarType::Int64) => true,
                     (Datum::Int64(_), _) => false,
-                    (Datum::UInt8(_), ScalarType::PgLegacyChar) => true,
-                    (Datum::UInt8(_), _) => false,
-                    (Datum::UInt32(_), ScalarType::Oid) => true,
-                    (Datum::UInt32(_), ScalarType::RegClass) => true,
-                    (Datum::UInt32(_), ScalarType::RegProc) => true,
-                    (Datum::UInt32(_), ScalarType::RegType) => true,
-                    (Datum::UInt32(_), _) => false,
                     (Datum::Float32(_), ScalarType::Float32) => true,
                     (Datum::Float32(_), _) => false,
                     (Datum::Float64(_), ScalarType::Float64) => true,
@@ -609,15 +575,9 @@ impl<'a> Datum<'a> {
                     (Datum::Array(array), ScalarType::Array(t)) => {
                         array.elements.iter().all(|e| match e {
                             Datum::Null => true,
+                            Datum::Array(_) => is_instance_of_scalar(e, scalar_type),
                             _ => is_instance_of_scalar(e, t),
                         })
-                    }
-                    (Datum::Array(array), ScalarType::Int2Vector) => {
-                        array.dims().len() == 1
-                            && array
-                                .elements
-                                .iter()
-                                .all(|e| is_instance_of_scalar(e, &ScalarType::Int16))
                     }
                     (Datum::Array(_), _) => false,
                     (Datum::List(list), ScalarType::List { element_type, .. }) => list
@@ -714,7 +674,14 @@ impl<'a> From<Numeric> for Datum<'a> {
 
 impl<'a> From<chrono::Duration> for Datum<'a> {
     fn from(duration: chrono::Duration) -> Datum<'a> {
-        Datum::Interval(Interval::new(0, 0, duration.num_microseconds().unwrap_or(0)).unwrap())
+        Datum::Interval(
+            Interval::new(
+                0,
+                duration.num_seconds(),
+                duration.num_nanoseconds().unwrap_or(0) % 1_000_000_000,
+            )
+            .unwrap(),
+        )
     }
 }
 
@@ -808,8 +775,6 @@ impl fmt::Display for Datum<'_> {
             Datum::Int16(num) => write!(f, "{}", num),
             Datum::Int32(num) => write!(f, "{}", num),
             Datum::Int64(num) => write!(f, "{}", num),
-            Datum::UInt8(num) => write!(f, "{}", num),
-            Datum::UInt32(num) => write!(f, "{}", num),
             Datum::Float32(num) => write!(f, "{}", num),
             Datum::Float64(num) => write!(f, "{}", num),
             Datum::Date(d) => write!(f, "{}", d),
@@ -863,7 +828,17 @@ impl fmt::Display for Datum<'_> {
 /// There is a direct correspondence between `Datum` variants and `ScalarType`
 /// variants.
 #[derive(
-    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd, Hash, EnumKind, MzReflect,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Ord,
+    PartialOrd,
+    Hash,
+    EnumKind,
+    MzEnumReflect,
 )]
 #[enum_kind(ScalarBaseType, derive(Hash))]
 pub enum ScalarType {
@@ -884,11 +859,13 @@ pub enum ScalarType {
     /// `Numeric` values cannot exceed [`NUMERIC_DATUM_MAX_PRECISION`] digits of
     /// precision.
     ///
-    /// This type additionally specifies the maximum scale of the decimal. The
-    /// scale specifies the number of digits after the decimal point.
+    /// This type additionally specifies the scale of the decimal. The scale
+    /// specifies the number of digits after the decimal point. The scale must
+    /// be less than or equal to the maximum precision.
     ///
-    /// [`NUMERIC_DATUM_MAX_PRECISION`]: crate::adt::numeric::NUMERIC_DATUM_MAX_PRECISION
-    Numeric { max_scale: Option<NumericMaxScale> },
+    /// [`NUMERIC_DATUM_MAX_PRECISION`]:
+    /// crate::adt::numeric::NUMERIC_DATUM_MAX_PRECISION
+    Numeric { scale: Option<u8> },
     /// The type of [`Datum::Date`].
     Date,
     /// The type of [`Datum::Time`].
@@ -899,11 +876,6 @@ pub enum ScalarType {
     TimestampTz,
     /// The type of [`Datum::Interval`].
     Interval,
-    /// A single byte character type backed by a [`Datum::UInt8`].
-    ///
-    /// PostgreSQL calls this type `"char"`. Note the quotes, which distinguish
-    /// it from the type `ScalarType::Char`.
-    PgLegacyChar,
     /// The type of [`Datum::Bytes`].
     Bytes,
     /// The type of [`Datum::String`].
@@ -913,12 +885,9 @@ pub enum ScalarType {
     ///
     /// Note that a `length` of `None` is used in special cases, such as
     /// creating lists.
-    Char { length: Option<CharLength> },
-    /// Stored as [`Datum::String`], but can optionally express a limit on the
-    /// string's length.
-    VarChar {
-        max_length: Option<VarCharMaxLength>,
-    },
+    Char { length: Option<usize> },
+    /// Stored as [`Datum::String`], but can optionally express a limit on the string's length.
+    VarChar { length: Option<usize> },
     /// The type of a datum that may represent any valid JSON value.
     ///
     /// Valid datum variants for this type are:
@@ -952,7 +921,6 @@ pub enum ScalarType {
         /// The names and types of the fields of the record, in order from left
         /// to right.
         fields: Vec<(ColumnName, ColumnType)>,
-        // TODO: turn custom_oid and name into an enum. it should only be possible to set one at a time
         custom_oid: Option<u32>,
         custom_name: Option<String>,
     },
@@ -973,9 +941,6 @@ pub enum ScalarType {
     RegType,
     /// A PostgreSQL class name.
     RegClass,
-    /// A vector on small ints; this is a legacy type in PG used primarily in
-    /// the catalog.
-    Int2Vector,
 }
 
 /// Types that implement this trait can be stored in an SQL column with the specified ColumnType
@@ -1212,7 +1177,7 @@ impl<'a, E> DatumType<'a, E> for Vec<u8> {
 
 impl AsColumnType for Numeric {
     fn as_column_type() -> ColumnType {
-        ScalarType::Numeric { max_scale: None }.nullable(false)
+        ScalarType::Numeric { scale: None }.nullable(false)
     }
 }
 
@@ -1233,29 +1198,6 @@ impl<'a, E> DatumType<'a, E> for Numeric {
     }
 }
 
-impl AsColumnType for PgLegacyChar {
-    fn as_column_type() -> ColumnType {
-        ScalarType::PgLegacyChar.nullable(false)
-    }
-}
-
-impl<'a, E> DatumType<'a, E> for PgLegacyChar {
-    fn nullable() -> bool {
-        false
-    }
-
-    fn try_from_result(res: Result<Datum<'a>, E>) -> Result<Self, Result<Datum<'a>, E>> {
-        match res {
-            Ok(Datum::UInt8(a)) => Ok(PgLegacyChar(a)),
-            _ => Err(res),
-        }
-    }
-
-    fn into_result(self, _temp_storage: &'a RowArena) -> Result<Datum<'a>, E> {
-        Ok(Datum::UInt8(self.0))
-    }
-}
-
 impl AsColumnType for Oid {
     fn as_column_type() -> ColumnType {
         ScalarType::Oid.nullable(false)
@@ -1269,13 +1211,13 @@ impl<'a, E> DatumType<'a, E> for Oid {
 
     fn try_from_result(res: Result<Datum<'a>, E>) -> Result<Self, Result<Datum<'a>, E>> {
         match res {
-            Ok(Datum::UInt32(a)) => Ok(Oid(a)),
+            Ok(Datum::Int32(a)) => Ok(Oid(a)),
             _ => Err(res),
         }
     }
 
     fn into_result(self, _temp_storage: &'a RowArena) -> Result<Datum<'a>, E> {
-        Ok(Datum::UInt32(self.0))
+        Ok(Datum::Int32(self.0))
     }
 }
 
@@ -1292,13 +1234,13 @@ impl<'a, E> DatumType<'a, E> for RegClass {
 
     fn try_from_result(res: Result<Datum<'a>, E>) -> Result<Self, Result<Datum<'a>, E>> {
         match res {
-            Ok(Datum::UInt32(a)) => Ok(RegClass(a)),
+            Ok(Datum::Int32(a)) => Ok(RegClass(a)),
             _ => Err(res),
         }
     }
 
     fn into_result(self, _temp_storage: &'a RowArena) -> Result<Datum<'a>, E> {
-        Ok(Datum::UInt32(self.0))
+        Ok(Datum::Int32(self.0))
     }
 }
 
@@ -1315,13 +1257,13 @@ impl<'a, E> DatumType<'a, E> for RegProc {
 
     fn try_from_result(res: Result<Datum<'a>, E>) -> Result<Self, Result<Datum<'a>, E>> {
         match res {
-            Ok(Datum::UInt32(a)) => Ok(RegProc(a)),
+            Ok(Datum::Int32(a)) => Ok(RegProc(a)),
             _ => Err(res),
         }
     }
 
     fn into_result(self, _temp_storage: &'a RowArena) -> Result<Datum<'a>, E> {
-        Ok(Datum::UInt32(self.0))
+        Ok(Datum::Int32(self.0))
     }
 }
 
@@ -1338,13 +1280,13 @@ impl<'a, E> DatumType<'a, E> for RegType {
 
     fn try_from_result(res: Result<Datum<'a>, E>) -> Result<Self, Result<Datum<'a>, E>> {
         match res {
-            Ok(Datum::UInt32(a)) => Ok(RegType(a)),
+            Ok(Datum::Int32(a)) => Ok(RegType(a)),
             _ => Err(res),
         }
     }
 
     fn into_result(self, _temp_storage: &'a RowArena) -> Result<Datum<'a>, E> {
-        Ok(Datum::UInt32(self.0))
+        Ok(Datum::Int32(self.0))
     }
 }
 
@@ -1417,14 +1359,14 @@ impl<'a, E> DatumType<'a, E> for VarChar<String> {
 }
 
 impl<'a> ScalarType {
-    /// Returns the contained numeric maximum scale.
+    /// Returns the contained numeric scale.
     ///
     /// # Panics
     ///
     /// Panics if the scalar type is not [`ScalarType::Numeric`].
-    pub fn unwrap_numeric_max_scale(&self) -> Option<NumericMaxScale> {
+    pub fn unwrap_numeric_scale(&self) -> Option<u8> {
         match self {
-            ScalarType::Numeric { max_scale } => *max_scale,
+            ScalarType::Numeric { scale } => *scale,
             _ => panic!("ScalarType::unwrap_numeric_scale called on {:?}", self),
         }
     }
@@ -1441,153 +1383,63 @@ impl<'a> ScalarType {
         }
     }
 
-    /// Returns the [`ScalarType`] of elements in the nth layer a
-    /// [`ScalarType::List`].
-    ///
-    /// For example, in an `int list list`, the:
-    /// - 0th layer is `int list list`
-    /// - 1st layer is `int list`
-    /// - 2nd layer is `int`
-    ///
-    /// # Panics
-    ///
-    /// Panics if the nth-1 layer is anything other than a
-    /// [`ScalarType::List`].
-    pub fn unwrap_list_nth_layer_type(&self, layer: usize) -> &ScalarType {
-        if layer == 0 {
-            return self;
-        }
-        match self {
-            ScalarType::List { element_type, .. } => {
-                element_type.unwrap_list_nth_layer_type(layer - 1)
-            }
-            _ => panic!(
-                "ScalarType::unwrap_list_nth_layer_type called on {:?}",
-                self
-            ),
-        }
-    }
-
-    /// Returns vector of [`ScalarType`] elements in a [`ScalarType::Record`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if called on anything other than a [`ScalarType::Record`].
-    pub fn unwrap_record_element_type(&self) -> Vec<&ScalarType> {
-        match self {
-            ScalarType::Record { fields, .. } => {
-                fields.iter().map(|(_, t)| &t.scalar_type).collect_vec()
-            }
-            _ => panic!(
-                "ScalarType::unwrap_record_element_type called on {:?}",
-                self
-            ),
-        }
-    }
-
     /// Returns number of dimensions/axes (also known as "rank") on a
     /// [`ScalarType::List`].
     ///
     /// # Panics
     ///
     /// Panics if called on anything other than a [`ScalarType::List`].
-    pub fn unwrap_list_n_layers(&self) -> usize {
+    pub fn unwrap_list_n_dims(&self) -> usize {
         let mut descender = self.unwrap_list_element_type();
-        let mut layers = 1;
+        let mut dims = 1;
 
         while let ScalarType::List { element_type, .. } = descender {
-            layers += 1;
+            dims += 1;
             descender = element_type;
         }
 
-        layers
+        dims
     }
 
-    /// Returns `self` with any type modifiers removed.
-    ///
-    /// Namely, this should set optional scales or limits to `None`.
-    pub fn without_modifiers(&self) -> ScalarType {
+    /// Returns `self` with any embedded values set to a value appropriate for a
+    /// collection of the type. Namely, this should set optional scales or
+    /// limits to `None`.
+    pub fn default_embedded_value(&self) -> ScalarType {
         use ScalarType::*;
         match self {
             List {
                 element_type,
                 custom_oid: None,
             } => List {
-                element_type: Box::new(element_type.without_modifiers()),
+                element_type: Box::new(element_type.default_embedded_value()),
                 custom_oid: None,
             },
             Map {
                 value_type,
                 custom_oid: None,
             } => Map {
-                value_type: Box::new(value_type.without_modifiers()),
+                value_type: Box::new(value_type.default_embedded_value()),
                 custom_oid: None,
             },
-            Record {
-                fields,
-                custom_oid: None,
-                custom_name: None,
-            } => {
-                let fields = fields
-                    .iter()
-                    .map(|(column_name, column_type)| {
-                        (
-                            column_name.clone(),
-                            ColumnType {
-                                scalar_type: column_type.scalar_type.without_modifiers(),
-                                nullable: column_type.nullable,
-                            },
-                        )
-                    })
-                    .collect_vec();
-                Record {
-                    fields,
-                    custom_name: None,
-                    custom_oid: None,
-                }
-            }
-            Array(a) => Array(Box::new(a.without_modifiers())),
-            Numeric { .. } => Numeric { max_scale: None },
+            Array(a) => Array(Box::new(a.default_embedded_value())),
+            Numeric { .. } => Numeric { scale: None },
             // Char's default length should not be `Some(1)`, but instead `None`
             // to support Char values of different lengths in e.g. lists.
             Char { .. } => Char { length: None },
-            VarChar { .. } => VarChar { max_length: None },
+            VarChar { .. } => VarChar { length: None },
             v => v.clone(),
         }
     }
 
-    /// Returns the [`ScalarType`] of elements in a [`ScalarType::Array`] or the
-    /// elements of a vector type, e.g. [`ScalarType::Int16`] for
-    /// [`ScalarType::Int2Vector`].
+    /// Returns the [`ScalarType`] of elements in a [`ScalarType::Array`].
     ///
     /// # Panics
     ///
-    /// Panics if called on anything other than a [`ScalarType::Array`] or
-    /// [`ScalarType::Int2Vector`].
+    /// Panics if called on anything other than a [`ScalarType::Array`].
     pub fn unwrap_array_element_type(&self) -> &ScalarType {
         match self {
             ScalarType::Array(s) => &**s,
-            ScalarType::Int2Vector => &ScalarType::Int16,
             _ => panic!("ScalarType::unwrap_array_element_type called on {:?}", self),
-        }
-    }
-
-    /// Returns the [`ScalarType`] of elements in a [`ScalarType::Array`],
-    /// [`ScalarType::Int2Vector`], or [`ScalarType::List`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if called on anything other than a [`ScalarType::Array`],
-    /// [`ScalarType::Int2Vector`], or [`ScalarType::List`].
-    pub fn unwrap_collection_element_type(&self) -> &ScalarType {
-        match self {
-            ScalarType::Array(element_type) => element_type,
-            ScalarType::Int2Vector => &ScalarType::Int16,
-            ScalarType::List { element_type, .. } => element_type,
-            _ => panic!(
-                "ScalarType::unwrap_collection_element_type called on {:?}",
-                self
-            ),
         }
     }
 
@@ -1603,27 +1455,18 @@ impl<'a> ScalarType {
         }
     }
 
-    /// Returns the length of a [`ScalarType::Char`].
+    /// Returns the length of a [`ScalarType::Char`] or [`ScalarType::VarChar`].
     ///
     /// # Panics
     ///
-    /// Panics if called on anything other than a [`ScalarType::Char`].
-    pub fn unwrap_char_length(&self) -> Option<CharLength> {
+    /// Panics if called on anything other than a [`ScalarType::Char`] or [`ScalarType::VarChar`].
+    pub fn unwrap_char_varchar_length(&self) -> Option<usize> {
         match self {
-            ScalarType::Char { length, .. } => *length,
-            _ => panic!("ScalarType::unwrap_char_length called on {:?}", self),
-        }
-    }
-
-    /// Returns the max length of a [`ScalarType::VarChar`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if called on anything other than a [`ScalarType::VarChar`].
-    pub fn unwrap_varchar_max_length(&self) -> Option<VarCharMaxLength> {
-        match self {
-            ScalarType::VarChar { max_length, .. } => *max_length,
-            _ => panic!("ScalarType::unwrap_varchar_max_length called on {:?}", self),
+            ScalarType::Char { length, .. } | ScalarType::VarChar { length } => *length,
+            _ => panic!(
+                "ScalarType::unwrap_char_varchar_length called on {:?}",
+                self
+            ),
         }
     }
 
@@ -1637,13 +1480,10 @@ impl<'a> ScalarType {
     }
 
     /// Returns whether or not `self` is a vector-like type, i.e.
-    /// [`ScalarType::Array`], [`ScalarType::Int2Vector`], or
-    /// [`ScalarType::List`], irrespective of its element type.
+    /// [`ScalarType::List`] or [`ScalarType::Array`], irrespective of its
+    /// element type.
     pub fn is_vec(&self) -> bool {
-        matches!(
-            self,
-            ScalarType::Array(_) | ScalarType::Int2Vector | ScalarType::List { .. }
-        )
+        matches!(self, ScalarType::List { .. } | ScalarType::Array(_))
     }
 
     pub fn is_custom_type(&self) -> bool {
@@ -1657,15 +1497,6 @@ impl<'a> ScalarType {
                 value_type: t,
                 custom_oid,
             } => custom_oid.is_some() || t.is_custom_type(),
-            Record {
-                fields, custom_oid, ..
-            } => {
-                custom_oid.is_some()
-                    || fields
-                        .iter()
-                        .map(|(_, t)| t)
-                        .any(|t| t.scalar_type.is_custom_type())
-            }
             _ => false,
         }
     }
@@ -1683,16 +1514,6 @@ impl<'a> ScalarType {
     /// contrast, two `Numeric` values with different scales are never `Eq` to
     /// one another.
     pub fn base_eq(&self, other: &ScalarType) -> bool {
-        self.eq_inner(other, false)
-    }
-
-    // Determines equality among scalar types that ignores any custom OIDs or
-    // embedded values.
-    pub fn structural_eq(&self, other: &ScalarType) -> bool {
-        self.eq_inner(other, true)
-    }
-
-    pub fn eq_inner(&self, other: &ScalarType, structure_only: bool) -> bool {
         use ScalarType::*;
         match (self, other) {
             (
@@ -1714,8 +1535,9 @@ impl<'a> ScalarType {
                     value_type: r,
                     custom_oid: oid_r,
                 },
-            ) => l.eq_inner(r, structure_only) && (oid_l == oid_r || structure_only),
-            (Array(a), Array(b)) => a.eq_inner(b, structure_only),
+            ) => l.base_eq(r) && oid_l == oid_r,
+
+            (Array(a), Array(b)) => a.base_eq(b),
             (
                 Record {
                     fields: fields_a,
@@ -1727,78 +1549,71 @@ impl<'a> ScalarType {
                     custom_oid: oid_b,
                     custom_name: name_b,
                 },
-            ) => {
-                (oid_a == oid_b || structure_only)
-                    && (name_a == name_b || structure_only)
-                    && fields_a.len() == fields_b.len()
-                    && fields_a
-                        .iter()
-                        .zip(fields_b)
-                        // Ignore nullability.
-                        .all(|(a, b)| {
-                            (a.0 == b.0 || structure_only)
-                                && a.1.scalar_type.eq_inner(&b.1.scalar_type, structure_only)
-                        })
-            }
+            ) => fields_a.eq(fields_b) && oid_a == oid_b && name_a == name_b,
             (s, o) => ScalarBaseType::from(s) == ScalarBaseType::from(o),
+        }
+    }
+
+    pub fn is_string_like(&self) -> bool {
+        match self {
+            ScalarType::String | ScalarType::Char { .. } | ScalarType::VarChar { .. } => true,
+            _ => false,
         }
     }
 }
 
 lazy_static! {
-    static ref EMPTY_ARRAY_ROW: Row = {
-        let mut row = Row::default();
-        row.packer()
-            .push_array(&[], iter::empty::<Datum>())
-            .expect("array known to be valid");
-        row
+    static ref EMPTY_ARRAY_ROW: Row = unsafe {
+        Row::from_bytes_unchecked(vec![
+            22, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
     };
-    static ref EMPTY_LIST_ROW: Row = {
-        let mut row = Row::default();
-        row.packer().push_list(iter::empty::<Datum>());
-        row
-    };
+    static ref EMPTY_LIST_ROW: Row =
+        unsafe { Row::from_bytes_unchecked(vec![23, 0, 0, 0, 0, 0, 0, 0, 0]) };
 }
 
-impl Datum<'_> {
+impl Datum<'static> {
     pub fn empty_array() -> Datum<'static> {
         EMPTY_ARRAY_ROW.unpack_first()
     }
-
     pub fn empty_list() -> Datum<'static> {
         EMPTY_LIST_ROW.unpack_first()
     }
 }
 
+// Verify that bytes for static datums with manually stuffed bytes are correct.
 #[test]
-fn verify_base_eq_record_nullability() {
-    let s1 = ScalarType::Record {
-        fields: vec![(
-            "c".into(),
-            ColumnType {
-                scalar_type: ScalarType::Bool,
-                nullable: true,
-            },
-        )],
-        custom_oid: None,
-        custom_name: None,
-    };
-    let s2 = ScalarType::Record {
-        fields: vec![(
-            "c".into(),
-            ColumnType {
-                scalar_type: ScalarType::Bool,
-                nullable: false,
-            },
-        )],
-        custom_oid: None,
-        custom_name: None,
-    };
-    let s3 = ScalarType::Record {
-        fields: vec![],
-        custom_oid: None,
-        custom_name: None,
-    };
-    assert!(s1.base_eq(&s2));
-    assert!(!s1.base_eq(&s3));
+fn verify_static_datum_bytes() {
+    let arena = crate::RowArena::new();
+    {
+        let empty_array_datum: Datum = arena.make_datum(|packer| {
+            packer
+                .push_array::<_, Datum<'_>>(
+                    &[crate::adt::array::ArrayDimension {
+                        lower_bound: 1,
+                        length: 0,
+                    }],
+                    std::iter::empty(),
+                )
+                .unwrap();
+        });
+        if EMPTY_ARRAY_ROW.iter().next().is_none() || Datum::empty_array() != empty_array_datum {
+            panic!(
+                "expected EMPTY_ARRAY bytes: {:?}",
+                Row::pack_slice(&[empty_array_datum]).data()
+            );
+        }
+    }
+
+    {
+        let empty_list_datum: Datum = arena.make_datum(|packer| {
+            packer.push_list::<_, Datum<'_>>(std::iter::empty());
+        });
+        if EMPTY_LIST_ROW.iter().next().is_none() || Datum::empty_list() != empty_list_datum {
+            panic!(
+                "expected EMPTY_LIST bytes: {:?}",
+                Row::pack_slice(&[empty_list_datum]).data()
+            );
+        }
+    }
 }

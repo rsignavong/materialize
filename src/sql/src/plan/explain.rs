@@ -8,8 +8,8 @@
 // by the Apache License, Version 2.0.
 
 //! This module houses a pretty printer for [`HirRelationExpr`],
-//! which is the SQL-specific relation expression (as opposed to [`mz_expr::MirRelationExpr`]).
-//! See also [`mz_expr::explain`].
+//! which is the SQL-specific relation expression (as opposed to [`expr::MirRelationExpr`]).
+//! See also [`expr::explain`].
 //!
 //! The format is the same, except for the following extensions:
 //!
@@ -21,12 +21,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use mz_expr::explain::Indices;
-use mz_expr::{ExprHumanizer, Id, LocalId, RowSetFinishing};
-use mz_ore::collections::CollectionExt;
-use mz_ore::id_gen::IdGen;
-use mz_ore::str::{bracketed, separated};
-use mz_repr::{RelationType, ScalarType};
+use expr::explain::Indices;
+use expr::{ExprHumanizer, Id, LocalId, RowSetFinishing};
+use ore::collections::CollectionExt;
+use ore::id_gen::IdGen;
+use ore::str::{bracketed, separated};
+use repr::{RelationType, ScalarType};
 
 use crate::plan::expr::{AggregateExpr, HirRelationExpr, HirScalarExpr, WindowExprType};
 
@@ -142,6 +142,7 @@ impl<'a> Explanation<'a> {
                 | Distinct { input }
                 | TopK { input, .. }
                 | Negate { input, .. }
+                | DeclareKeys { input, .. }
                 | Threshold { input, .. } => walk(input, explanation, id_gen),
                 // For join and union, each input needs to go in its own chain.
                 Join { left, right, .. } => walk_many(
@@ -186,6 +187,7 @@ impl<'a> Explanation<'a> {
                 | Negate { .. }
                 | Threshold { .. }
                 | Union { .. }
+                | DeclareKeys { .. }
                 | TopK { .. } => (),
                 Map { scalars: exprs, .. }
                 | Filter {
@@ -319,6 +321,7 @@ impl<'a> Explanation<'a> {
                         get_info.map_or_else(|| "?".to_owned(), |i| i.1.to_string()),
                     )?
                 }
+                Id::LocalBareSource => writeln!(f, "| Get Local Bare Source")?,
                 Id::Global(id) => writeln!(
                     f,
                     "| Get {} ({})",
@@ -410,6 +413,15 @@ impl<'a> Explanation<'a> {
             }
             Negate { .. } => writeln!(f, "| Negate")?,
             Threshold { .. } => write!(f, "| Threshold")?,
+            DeclareKeys { input: _, keys } => write!(
+                f,
+                "| Declare primary keys {}",
+                separated(
+                    " ",
+                    keys.iter()
+                        .map(|key| bracketed("(", ")", separated(", ", key)))
+                )
+            )?,
             Union { base, inputs } => writeln!(
                 f,
                 "| Union %{} {}",
@@ -461,7 +473,7 @@ impl<'a> Explanation<'a> {
             ),
             Parameter(i) => write!(f, "${}", i),
             Literal(row, _) => write!(f, "{}", row.unpack_first()),
-            CallUnmaterializable(func) => write!(f, "{}()", func),
+            CallNullary(func) => write!(f, "{}()", func),
             CallUnary { func, expr } => {
                 write!(f, "{}(", func)?;
                 self.fmt_scalar_expr(f, expr)?;

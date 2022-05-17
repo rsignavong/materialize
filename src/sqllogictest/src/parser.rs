@@ -13,8 +13,8 @@ use std::borrow::ToOwned;
 
 use anyhow::{anyhow, bail};
 use lazy_static::lazy_static;
-use mz_repr::ColumnName;
 use regex::Regex;
+use repr::ColumnName;
 
 use crate::ast::{Location, Mode, Output, QueryOutput, Record, Sort, Type};
 
@@ -256,7 +256,7 @@ impl<'a> Parser<'a> {
                 split_at(&mut output_str, &LINE_REGEX)?
                     .split(' ')
                     .filter(|s| !s.is_empty())
-                    .map(|s| ColumnName::from(s.replace('␠', " ")))
+                    .map(|s| ColumnName::from(s.replace("␠", " ")))
                     .collect(),
             )
         } else {
@@ -290,7 +290,7 @@ impl<'a> Parser<'a> {
                                     types.len()
                                 );
                             }
-                            rows.push(cols.into_iter().map(|col| col.replace('␠', " ")).collect());
+                            rows.push(cols.into_iter().map(|col| col.replace("␠", " ")).collect());
                         }
                         if sort == Sort::Row {
                             rows.sort();

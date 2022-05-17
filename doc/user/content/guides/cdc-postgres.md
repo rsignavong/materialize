@@ -17,7 +17,7 @@ There are two ways to connect Materialize to a Postgres database for CDC:
 
 ## Direct Postgres source
 
-If Kafka is not part of your stack, you can use the [Postgres source](/sql/create-source/postgres) to connect directly to Materialize (v0.8.2+). This source uses Postgres’ native replication protocol to continually ingest changes resulting from `INSERT`, `UPDATE` and `DELETE` operations in the upstream database.
+If Kafka is not part of your stack, you can use the [Postgres source](/sql/create-source/postgres/#postgresql-source-details) to connect directly to Materialize (v0.8.2+). This source uses Postgres’ native replication protocol to continuously ingest changes resulting from `INSERT`, `UPDATE` and `DELETE` operations in the upstream database.
 
 ### Database setup
 
@@ -73,32 +73,50 @@ As a _superuser_:
 
 ### Create a source
 
-Postgres sources ingest the raw replication stream data for all tables included in a publication to avoid creating multiple replication slots and minimize the required bandwidth. To create a source in Materialize:
+Postgres sources ingest the raw replication stream data for all tables included in a publication to avoid creating multiple replication slots and minimize the required bandwidth, and must therefore be explicitly materialized. To create a source in Materialize:
 
 ```sql
-CREATE SOURCE mz_source
-    FROM POSTGRES
-      CONNECTION 'host=example.com port=5432 user=host dbname=postgres sslmode=require'
-      PUBLICATION 'mz_source';
+CREATE MATERIALIZED SOURCE mz_source
+FROM POSTGRES
+  CONNECTION 'host=example.com port=5432 user=host dbname=postgres sslmode=require'
+  PUBLICATION 'mz_source';
 ```
 
 {{< note >}}
-Materialize performs an initial sync of all tables in the publication before it starts ingesting change events. You should expect increased disk usage during this phase.
+Materialize performs an initial sync of all tables in the publication before it starts ingesting change events. You should ensure that your source tables fit into memory, and also expect increased disk usage. For more information, see [Restrictions on Postgres sources](/sql/create-source/postgres/).
 {{</ note >}}
 
-The next step is to break down this source into views that reproduce the publication’s original tables and can be used as a base for your materialized view.
+In practice, the `mz_source` looks like:
+
+```sql
+SHOW COLUMNS FROM mz_source;
+
+   name   | nullable |  type
+----------+----------+---------
+ oid      | f        | integer
+ row_data | f        | list
+```
+
+Each row of every upstream table is represented as a single row with two columns in the replication stream source:
+
+| Column | Description |
+|--------|-------------|
+| `oid`  | A unique identifier for the tables included in the publication. |
+| `row_data` | A text-encoded, variable length `list`. The number of text elements in a list is always equal to the number of columns in the upstream table. |
+
+The next step is to break down this source into views that reproduce the publication’s original tables and that can be used as a base for your materialized views.
 
 #### Create replication views
 
-Once you've created the Postgres source, you can create views that filter the replication stream and take care of converting its elements to the original data types:
+Once you've created the Postgres source, you can create views that filter the replication stream based on the `oid` identifier and convert the text elements in `row_data` to the original data types:
 
-_Create views for specific tables included in the Postgres publication_
+_Create views for specific tables included in the Postgres publication:_
 
 ```sql
 CREATE VIEWS FROM SOURCE mz_source (table1, table2);
 ```
 
-_Create views for all tables_
+_Create views for all tables:_
 
 ```sql
 CREATE VIEWS FROM SOURCE mz_source;
@@ -112,15 +130,15 @@ Any materialized view defined on top of this source will be incrementally update
 
 ```sql
 CREATE MATERIALIZED VIEW cnt_view1 AS
-    SELECT field1,
-           COUNT(*) AS cnt
-    FROM view1
-    GROUP BY field1;
+SELECT field1,
+       COUNT(*) AS cnt
+FROM view1
+GROUP BY field1;
 ```
 
 ## Kafka + Debezium
 
-If Kafka is part of your stack, you can use [Debezium](https://debezium.io/) and the [Kafka source](/sql/create-source/kafka/#using-debezium) to propagate CDC data from Postgres to Materialize. Debezium captures row-level changes resulting from `INSERT`, `UPDATE` and `DELETE` operations in the upstream database and publishes them as events to Kafka using Kafka Connect-compatible connectors.
+If Kafka is part of your stack, you can use [Debezium](https://debezium.io/) and the [Kafka source](/sql/create-source/avro-kafka/#debezium-envelope-details) to propagate CDC data from Postgres to Materialize. Debezium captures row-level changes resulting from `INSERT`, `UPDATE` and `DELETE` operations in the upstream database and publishes them as events to Kafka using Kafka Connect-compatible connectors.
 
 ### Database setup
 
@@ -156,9 +174,9 @@ As a _superuser_:
 
 Debezium is deployed as a set of Kafka Connect-compatible connectors, so you first need to define a Postgres connector configuration and then start the connector by adding it to Kafka Connect.
 
-{{< warning >}}
-If you deploy the PostgreSQL Debezium connector in [Confluent Cloud](https://docs.confluent.io/cloud/current/connectors/cc-mysql-source-cdc-debezium.html), you **must** override the default value of `After-state only` to `false`.
-{{</ warning >}}
+{{< note >}}
+Currently, Materialize only supports Avro-encoded Debezium records. If you’re interested in JSON support, please reach out in the community Slack or leave a comment on [this GitHub issue](https://github.com/MaterializeInc/materialize/issues/5231).
+{{</ note >}}
 
 1. Create a connector configuration file and save it as `register-postgres.json`:
 
@@ -213,31 +231,28 @@ If you deploy the PostgreSQL Debezium connector in [Confluent Cloud](https://doc
 
 ### Create a source
 
-{{< note >}}
-Currently, Materialize only supports Avro-encoded Debezium records. If you’re interested in JSON support, please reach out in the community Slack or leave a comment on [this GitHub issue](https://github.com/MaterializeInc/materialize/issues/5231).
-{{</ note >}}
-
-Debezium emits change events using an envelope that contains detailed information about upstream database operations, like the `before` and `after` values for each record. To create a source that interprets the [Debezium envelope](/sql/create-source/kafka/#using-debezium) in Materialize:
+Debezium emits change events using an envelope that contains detailed information about upstream database operations, like the `before` and `after` values for each record. To create a source that interprets the [Debezium envelope](/sql/create-source/avro-kafka/#debezium-envelope-details) in Materialize:
 
 ```sql
 CREATE SOURCE kafka_repl
-    FROM KAFKA BROKER 'kafka:9092' TOPIC 'pg_repl.public.table1'
-    FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://schema-registry:8081'
-    ENVELOPE DEBEZIUM UPSERT;
+FROM KAFKA BROKER 'kafka:9092' TOPIC 'pg_repl.public.table1'
+KEY FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://schema-registry:8081'
+VALUE FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://schema-registry:8081'
+ENVELOPE DEBEZIUM UPSERT;
 ```
 
-Enabling `UPSERT` allows you to replicate tables with `REPLICA IDENTITY DEFAULT` or `INDEX`. Although this approach is less resource-intensive for the upstream database, it will require **more memory** in Materialize, as it needs to track state proportional to the number of unique primary keys in the changing data.
+Enabling `UPSERT` allows you to replicate tables with `REPLICA IDENTITY DEFAULT` or `INDEX`. Although this approach is less resource-intensive for the upstream database, it will require **more memory** in Materialize as it needs to track state proportional to the number of unique primary keys in the changing data.
 
 If the original Postgres table uses `REPLICA IDENTITY FULL`:
 
 ```sql
 CREATE SOURCE kafka_repl
-    FROM KAFKA BROKER 'kafka:9092' TOPIC 'pg_repl.public.table1'
-    FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://schema-registry:8081'
-    ENVELOPE DEBEZIUM;
+FROM KAFKA BROKER 'kafka:9092' TOPIC 'pg_repl.public.table1'
+FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://schema-registry:8081'
+ENVELOPE DEBEZIUM;
 ```
 
-When should you use what? `UPSERT` works best when there is a small number of quickly changing rows and is required if log compaction is enabled for your Debezium topic; setting `REPLICA IDENTITY FULL` in the original tables and using the regular Debezium envelope works best for pretty much everything else.
+When should you use what? `UPSERT` works best when there is a small number of quickly changing rows; setting `REPLICA IDENTITY FULL` in the original tables and using the regular Debezium envelope works best for pretty much everything else.
 
 #### Transaction support
 

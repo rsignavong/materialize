@@ -14,20 +14,6 @@
 -- limitations under the License.
 
 {% materialization index, adapter='materialize' %}
-    {{ exceptions.warn(
-        """
-        The custom index materialization is deprecated and will be removed in a future release of dbt-materialize.
-        Please use the `indexes` config instead:
-
-        e.g.
-        {{ config(
-            materialized = 'view',
-            indexes = [ {'columns': ['column_a']} ]
-        )}}
-
-        Documentation for indexes in Materialize can be found in: https://materialize.com/docs/sql/create-index
-        """
-    )}}
   {%- set identifier = model['alias'] -%}
   {%- set target_relation = api.Relation.create(identifier=identifier,
                                                 schema=schema,
@@ -40,16 +26,14 @@
   {{ materialize__drop_index(index_name) }}
 
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
-  {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
-  {% call statement('main') -%}
+  {% call statement('main', auto_begin=False) -%}
     {{ materialize__create_arbitrary_object(sql) }}
   {%- endcall %}
 
   {% do persist_docs(target_relation, model) %}
 
   {{ run_hooks(post_hooks, inside_transaction=False) }}
-  {{ run_hooks(post_hooks, inside_transaction=True) }}
 
   {{ return({'relations': [target_relation]}) }}
 {% endmaterialization %}

@@ -10,27 +10,26 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::time::Instant;
-use tracing::info;
 
 use differential_dataflow::lattice::Lattice;
 use timely::progress::{Antichain, Timestamp};
 
 use crate::error::Error;
-use crate::location::SeqNo;
 use crate::nemesis::validator::uptime::Uptime;
 use crate::nemesis::{
     AllowCompactionReq, ReadOutputEvent, ReadOutputReq, ReadOutputRes, ReadSnapshotReq,
     ReadSnapshotRes, Res, SealReq, SnapshotId, Step, StepMeta, TakeSnapshotReq, WriteReq,
     WriteReqMulti, WriteReqSingle,
 };
+use crate::storage::SeqNo;
 
 #[derive(Debug)]
 pub struct Validator {
     seal_frontier: HashMap<String, u64>,
     since_frontier: HashMap<String, u64>,
-    writes_by_seqno: BTreeMap<(String, SeqNo), Vec<((String, ()), u64, i64)>>,
+    writes_by_seqno: BTreeMap<(String, SeqNo), Vec<((String, ()), u64, isize)>>,
     output_by_stream:
-        HashMap<String, Vec<ReadOutputEvent<(Result<(String, ()), String>, u64, i64)>>>,
+        HashMap<String, Vec<ReadOutputEvent<(Result<(String, ()), String>, u64, isize)>>>,
     available_snapshots: HashMap<SnapshotId, (String, Instant)>,
     errors: Vec<String>,
     uptime: Uptime,
@@ -71,7 +70,7 @@ impl Validator {
     }
 
     fn step(&mut self, s: Step) {
-        info!("step: {:?}", &s);
+        log::info!("step: {:?}", &s);
         match s.res {
             Res::Write(WriteReq::Single(req), res) => self.step_write_single(&s.meta, req, res),
             Res::Write(WriteReq::Multi(req), res) => self.step_write_multi(&s.meta, req, res),
@@ -267,14 +266,6 @@ impl Validator {
                     .unwrap_or_default(),
             );
 
-            if !as_of.less_than(&latest_seal) {
-                // TODO: We cannot currently verify cases where the compaction frontier is beyond
-                // the since, because we cannot determine anymore (based on the latest seal
-                // timestamp) which records (both from the expected writes and the writes we get
-                // from timely) are eligible for verification.
-                return;
-            }
-
             // Verify that the output contains all sent writes less than the
             // latest seal it contains.
             //
@@ -297,7 +288,7 @@ impl Validator {
                     (kv, ts, diff)
                 })
                 .collect();
-            let mut expected: Vec<((String, ()), u64, i64)> = self
+            let mut expected: Vec<((String, ()), u64, isize)> = self
                 .writes_by_seqno
                 .range((req.stream.clone(), SeqNo(0))..(req.stream, SeqNo(u64::MAX)))
                 .flat_map(|(_, v)| v)
@@ -341,7 +332,13 @@ impl Validator {
                 .since_frontier
                 .get(&req.stream)
                 .copied()
-                .unwrap_or_default();
+                .unwrap_or_default()
+            && req.ts
+                < self
+                    .seal_frontier
+                    .get(&req.stream)
+                    .copied()
+                    .unwrap_or_default();
         let require_succeed = self.uptime.storage_available(meta.before, meta.after)
             && self.uptime.runtime_available(meta.before, meta.after)
             && req_ok;
@@ -383,7 +380,7 @@ impl Validator {
                 self.check_success(meta, &res, require_succeed);
                 if let Ok(res) = res {
                     let mut actual = res.contents;
-                    let mut expected: Vec<((String, ()), u64, i64)> = self
+                    let mut expected: Vec<((String, ()), u64, isize)> = self
                         .writes_by_seqno
                         .range((stream.clone(), SeqNo(0))..=(stream, SeqNo(res.seqno)))
                         .flat_map(|(_, v)| v)
@@ -422,8 +419,8 @@ impl Validator {
 }
 
 fn updates_eq(
-    actual: &mut Vec<((String, ()), u64, i64)>,
-    expected: &mut Vec<((String, ()), u64, i64)>,
+    actual: &mut Vec<((String, ()), u64, isize)>,
+    expected: &mut Vec<((String, ()), u64, isize)>,
     since: Antichain<u64>,
 ) -> bool {
     // TODO: This is also used by the implementation. Write a slower but more

@@ -12,12 +12,12 @@
 // WARNING: The code in this module must be tested manually. Please see
 // misc/python/cli/mock_telemetry_server.py for details.
 
+use log::{debug, log, Level};
 use serde::Deserialize;
 use tokio::time::{self, Duration};
-use tracing::{debug, warn};
 use uuid::Uuid;
 
-use mz_ore::retry::Retry;
+use ore::retry::Retry;
 
 use crate::BUILD_INFO;
 
@@ -32,7 +32,7 @@ pub struct Config {
     /// The number of workers the dataflow server is hosting.
     pub workers: usize,
     /// A client for the coordinator to introspect.
-    pub coord_client: mz_coord::Client,
+    pub coord_client: coord::Client,
 }
 
 /// Runs the telemetry reporting loop.
@@ -59,23 +59,15 @@ pub async fn report_loop(config: Config) {
             // We assume users running development builds are sophisticated, and
             // may be intentionally not running the latest release, so downgrade
             // the message from warn to info level.
-            //
-            // TODO: avoid duplicating the message if tokio-rs/tracing#372
-            // is resolved.
-            match BUILD_INFO.semver_version().pre.as_str() {
-                "dev" => {
-                    debug!(
-                        "a new version of materialized is available: {}",
-                        latest_version
-                    );
-                }
-                _ => {
-                    warn!(
-                        "a new version of materialized is available: {}",
-                        latest_version
-                    );
-                }
+            let level = match BUILD_INFO.semver_version().pre.as_str() {
+                "dev" => Level::Info,
+                _ => Level::Warn,
             };
+            log!(
+                level,
+                "a new version of materialized is available: {}",
+                latest_version
+            );
             reported_version = latest_version;
         }
     }
@@ -87,8 +79,6 @@ pub async fn report_loop(config: Config) {
 // telemetry docs in doc/user/cli/_index.md#telemetry accordingly, and be sure
 // the data is not identifiable.
 fn make_telemetry_query(config: &Config) -> String {
-    let architecture = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
     format!("
         SELECT jsonb_build_object(
             'version', mz_version(),
@@ -96,8 +86,6 @@ fn make_telemetry_query(config: &Config) -> String {
                 'session_id', mz_internal.mz_session_id(),
                 'uptime_seconds', extract(epoch FROM mz_uptime()),
                 'num_workers', {workers},
-                'architecture', '{architecture}',
-                'os', '{os}',
                 'sources', (
                     SELECT jsonb_object_agg(connector_type, jsonb_build_object('count', count))
                     FROM (SELECT connector_type, count(*) FROM mz_sources WHERE id LIKE 'u%' GROUP BY connector_type)

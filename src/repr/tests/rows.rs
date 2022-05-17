@@ -13,9 +13,9 @@ use chrono::TimeZone;
 use proptest::prelude::*;
 use uuid::Uuid;
 
-use mz_repr::adt::numeric::Numeric as AdtNumeric;
-use mz_repr::adt::{array::ArrayDimension, interval::Interval};
-use mz_repr::{Datum, Row};
+use repr::adt::numeric::Numeric as AdtNumeric;
+use repr::adt::{array::ArrayDimension, interval::Interval};
+use repr::{Datum, Row};
 
 /// A type similar to [`Datum`] that can be proptest-generated.
 #[derive(Debug, PartialEq, Clone)]
@@ -95,7 +95,7 @@ struct PropertizedArray(Row, Vec<PropertizedDatum>);
 fn arb_array(element_strategy: BoxedStrategy<PropertizedDatum>) -> BoxedStrategy<PropertizedArray> {
     prop::collection::vec(
         arb_array_dimension(),
-        1..(mz_repr::adt::array::MAX_ARRAY_DIMENSIONS as usize),
+        1..(repr::adt::array::MAX_ARRAY_DIMENSIONS as usize),
     )
     .prop_flat_map(move |dimensions| {
         let n_elts: usize = dimensions.iter().map(|d| d.length).product();
@@ -107,9 +107,7 @@ fn arb_array(element_strategy: BoxedStrategy<PropertizedDatum>) -> BoxedStrategy
     .prop_map(|(dimensions, elements)| {
         let element_datums: Vec<Datum<'_>> = elements.iter().map(|pd| pd.into()).collect();
         let mut row = Row::default();
-        row.packer()
-            .push_array(&dimensions, element_datums)
-            .unwrap();
+        row.push_array(&dimensions, element_datums).unwrap();
         PropertizedArray(row, elements)
     })
     .boxed()
@@ -123,7 +121,7 @@ fn arb_list(element_strategy: BoxedStrategy<PropertizedDatum>) -> BoxedStrategy<
         .prop_map(|elements| {
             let element_datums: Vec<Datum<'_>> = elements.iter().map(|pd| pd.into()).collect();
             let mut row = Row::default();
-            row.packer().push_list(element_datums.iter());
+            row.push_list(element_datums.iter());
             PropertizedList(row, elements)
         })
         .boxed()
@@ -142,7 +140,7 @@ fn arb_dict(element_strategy: BoxedStrategy<PropertizedDatum>) -> BoxedStrategy<
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.into()))
                 .collect();
-            row.packer().push_dict(entry_iter.into_iter());
+            row.push_dict(entry_iter.into_iter());
             PropertizedDict(row, entries)
         })
         .boxed()
@@ -151,15 +149,9 @@ fn arb_dict(element_strategy: BoxedStrategy<PropertizedDatum>) -> BoxedStrategy<
 fn arb_interval() -> BoxedStrategy<Interval> {
     (
         any::<i32>(),
-        any::<i32>(),
-        ((((i64::from(i32::MIN) * 60) - 59) * 60) * 1_000_000 - 59_999_999
-            ..(((i64::from(i32::MAX) * 60) + 59) * 60) * 1_000_000 + 59_999_999),
+        (-193_273_528_233_599_999_999_000_i128..193_273_528_233_599_999_999_000_i128),
     )
-        .prop_map(|(months, days, micros)| Interval {
-            months,
-            days,
-            micros,
-        })
+        .prop_map(|(months, duration)| Interval { months, duration })
         .boxed()
 }
 
@@ -245,8 +237,12 @@ proptest! {
 
     #[test]
     fn row_packing_roundtrips_single_valued(prop_datums in prop::collection::vec(arb_datum(), 1..100)) {
+        let mut row = Row::default();
         let datums: Vec<Datum<'_>> = prop_datums.iter().map(|pd| pd.into()).collect();
-        let row = Row::pack(&datums);
+        for d in datums.iter() {
+            row.push(d.clone());
+        }
+        let row = row;
         let unpacked = row.unpack();
         assert_eq!(datums, unpacked);
     }

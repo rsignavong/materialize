@@ -10,9 +10,9 @@
 import os
 import subprocess
 from tempfile import NamedTemporaryFile
-from typing import Any, Callable, List
+from typing import Any, Callable
 
-from materialize.mzcompose import Composition
+from materialize.mzcompose import Materialized, Testdrive, Workflow
 
 
 class Executor:
@@ -50,38 +50,42 @@ class Local(Executor):
 class Docker(Executor):
     def __init__(
         self,
-        composition: Composition,
+        workflow: Workflow,
+        mz_service: Materialized,
+        td_service: Testdrive,
         seed: int,
     ) -> None:
-        self._composition = composition
+        self._workflow = workflow
+        self._mz_service = mz_service
+        self._td_service = td_service
         self._seed = seed
 
-    def RestartMz(self) -> None:
-        self._composition.kill("materialized")
-        self._composition.up("materialized")
-        return None
+    def RestartMz(self) -> Any:
+        w = self._workflow
+        w.kill_services(services=[self._mz_service.name])  # type: ignore
+        w.start_services(services=[self._mz_service.name])  # type: ignore
+        return 0.0
 
     def Td(self, input: str) -> Any:
         with NamedTemporaryFile(
             mode="w",
-            dir=self._composition.path / "tmp",
+            dir=self._workflow.composition.path / "tmp",
             prefix="tmp-",
             suffix=".td",
         ) as td_file:
             td_file.write(input)
             td_file.flush()
             dirname, basename = os.path.split(td_file.name)
-            return self._composition.run(
-                "testdrive",
-                "--no-reset",
-                f"--seed={self._seed}",
-                "--initial-backoff=10ms",
-                "--backoff-factor=0",
-                f"tmp/{basename}",
+            return self._workflow.run_service(  # type: ignore
+                service=self._td_service.name,
+                command=" ".join(
+                    [
+                        "--no-reset",
+                        f"--seed={self._seed}",
+                        "--initial-backoff=0ms",
+                        "--backoff-factor=0",
+                        f"tmp/{basename}",
+                    ]
+                ),
                 capture=True,
-            ).stdout
-
-    def Kgen(self, topic: str, args: List[str]) -> Any:
-        return self._composition.run(
-            "kgen", f"--topic=testdrive-{topic}-{self._seed}", *args
-        )
+            )

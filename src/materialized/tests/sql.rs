@@ -20,22 +20,16 @@ use std::io::Write;
 use std::net::Shutdown;
 use std::net::TcpListener;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use mz_ore::now::NowFn;
-use mz_ore::now::NOW_ZERO;
-use mz_ore::now::SYSTEM_TIME;
+use log::info;
 use postgres::Row;
-use regex::Regex;
 use tempfile::NamedTempFile;
-use tracing::info;
 
-use mz_ore::assert_contains;
+use ore::assert_contains;
 
 use crate::util::{MzTimestamp, PostgresErrorExt, KAFKA_ADDRS};
 
@@ -43,11 +37,11 @@ pub mod util;
 
 #[test]
 fn test_no_block() -> Result<(), anyhow::Error> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     // This is better than relying on CI to time out, because an actual failure
     // (as opposed to a CI timeout) causes `services.log` to be uploaded.
-    mz_ore::test::timeout(Duration::from_secs(30), || {
+    ore::test::timeout(Duration::from_secs(30), || {
         // Create a listener that will simulate a slow Confluent Schema Registry.
         info!("test_no_block: creating listener");
         let listener = TcpListener::bind("localhost:0")?;
@@ -118,7 +112,7 @@ fn test_no_block() -> Result<(), anyhow::Error> {
 
 #[test]
 fn test_time() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default())?;
     let mut client = server.connect(postgres::NoTls)?;
@@ -157,7 +151,7 @@ fn test_time() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_tail_consolidation() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default().workers(2);
     let server = util::start_server(config)?;
@@ -185,7 +179,7 @@ fn test_tail_consolidation() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_tail_negative_diffs() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default().workers(2);
     let server = util::start_server(config)?;
@@ -233,26 +227,14 @@ fn test_tail_negative_diffs() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_tail_basic() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
-    // Set the timestamp to zero for deterministic initial timestamps.
-    let nowfn = Arc::new(Mutex::new(NOW_ZERO.clone()));
-    let now = {
-        let nowfn = Arc::clone(&nowfn);
-        NowFn::from(move || (nowfn.lock().unwrap())())
-    };
-    let config = util::Config::default().workers(2).with_now(now);
+    let config = util::Config::default().workers(2);
     let server = util::start_server(config)?;
     let mut client_writes = server.connect(postgres::NoTls)?;
     let mut client_reads = server.connect(postgres::NoTls)?;
 
     client_writes.batch_execute("CREATE TABLE t (data text)")?;
-    client_writes.batch_execute("CREATE DEFAULT INDEX t_primary_idx ON t")?;
-    // Now that the index (and its since) are initialized to 0, we can resume using
-    // system time. Do a read to bump the oracle's state so it will read from the
-    // system clock during inserts below.
-    *nowfn.lock().unwrap() = SYSTEM_TIME.clone();
-    client_writes.batch_execute("SELECT * FROM t")?;
     client_reads.batch_execute(
         "BEGIN;
          DECLARE c CURSOR FOR TAIL t;",
@@ -347,7 +329,7 @@ fn test_tail_basic() -> Result<(), Box<dyn Error>> {
 /// data row we will also see one progressed message.
 #[test]
 fn test_tail_progress() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default().workers(2);
     let server = util::start_server(config)?;
@@ -429,7 +411,7 @@ fn test_tail_progress() -> Result<(), Box<dyn Error>> {
 // turns them into nullable columns. See #6304.
 #[test]
 fn test_tail_progress_non_nullable_columns() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default().workers(2);
     let server = util::start_server(config)?;
@@ -478,7 +460,7 @@ fn test_tail_progress_non_nullable_columns() -> Result<(), Box<dyn Error>> {
 /// receive data or not.
 #[test]
 fn test_tail_continuous_progress() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default().workers(2);
     let server = util::start_server(config)?;
@@ -561,7 +543,7 @@ fn test_tail_continuous_progress() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_tail_fetch_timeout() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default().workers(2);
     let server = util::start_server(config)?;
@@ -650,7 +632,7 @@ fn test_tail_fetch_timeout() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_tail_fetch_wait() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default().workers(2);
     let server = util::start_server(config)?;
@@ -709,7 +691,7 @@ fn test_tail_fetch_wait() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_tail_empty_upper_frontier() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default();
     let server = util::start_server(config)?;
@@ -731,7 +713,7 @@ fn test_tail_empty_upper_frontier() -> Result<(), Box<dyn Error>> {
 /// and into the user's SQL console.
 #[test]
 fn test_tail_unmaterialized_file() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default();
     let server = util::start_server(config)?;
@@ -782,7 +764,7 @@ fn test_tail_unmaterialized_file() -> Result<(), Box<dyn Error>> {
 // does not keep the server alive forever.
 #[test]
 fn test_tail_shutdown() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default())?;
 
@@ -803,7 +785,7 @@ fn test_tail_shutdown() -> Result<(), Box<dyn Error>> {
         conn_task.abort();
 
         // Need to await `conn_task` to actually deliver the `abort`. We don't
-        // care about the result though (it's probably `JoinError` with `is_cancelled` being true).
+        // care about the result though (it's probably `JoinError::Cancelled`).
         let _ = conn_task.await;
 
         Ok::<_, Box<dyn Error>>(())
@@ -820,29 +802,19 @@ fn test_tail_shutdown() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_tail_table_rw_timestamps() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let config = util::Config::default().workers(3);
     let server = util::start_server(config)?;
     let mut client_interactive = server.connect(postgres::NoTls)?;
     let mut client_tail = server.connect(postgres::NoTls)?;
 
-    let verify_rw_pair = move |mut rows: &[Row], expected_data: &str| -> bool {
-        // Clear progress rows that may appear after row 2.
-        for i in (2..rows.len()).rev() {
-            if rows[i].get::<_, bool>("mz_progressed") {
-                rows = &rows[..i];
-            }
-        }
-
+    let verify_rw_pair = move |rows: &[Row], expected_data: &str| -> bool {
         for (i, row) in rows.iter().enumerate() {
             match row.get::<_, Option<String>>("data") {
-                // Only verify if all rows have expected data
-                Some(inner) => {
-                    if &inner != expected_data {
-                        return false;
-                    }
-                }
+                // Ensure all rows with data have the expected data, and that rows
+                // without data are only ever the last row.
+                Some(inner) => assert_eq!(inner, expected_data.to_owned()),
                 // Only verify if row without data is last row
                 None => {
                     if i + 1 != rows.len() {
@@ -925,7 +897,7 @@ fn test_tail_table_rw_timestamps() -> Result<(), Box<dyn Error>> {
 // by another connection.
 #[test]
 fn test_temporary_views() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
 
     let server = util::start_server(util::Config::default())?;
     let mut client_a = server.connect(postgres::NoTls)?;
@@ -968,7 +940,7 @@ fn test_temporary_views() -> Result<(), Box<dyn Error>> {
 #[test]
 #[ignore]
 fn test_linearizable() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
+    ore::test::init_logging();
     let config = util::Config::default();
     config.logical_compaction_window(Duration::from_secs(60));
     let server = util::start_server(util::Config::default())?;
@@ -1045,41 +1017,6 @@ fn test_linearizable() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-
-    Ok(())
-}
-
-// Test EXPLAIN TIMESTAMP with tables. Mock time to verify initial table since
-// is now(), not 0.
-#[test]
-fn test_explain_timestamp_table() -> Result<(), Box<dyn Error>> {
-    mz_ore::test::init_logging();
-    let timestamp = Arc::new(Mutex::new(1_000));
-    let now = {
-        let timestamp = Arc::clone(&timestamp);
-        NowFn::from(move || *timestamp.lock().unwrap())
-    };
-    let config = util::Config::default().with_now(now);
-    let server = util::start_server(config)?;
-    let mut client = server.connect(postgres::NoTls)?;
-    let timestamp_re = Regex::new(r"\d{13}").unwrap();
-
-    client.batch_execute("CREATE TABLE t1 (i1 INT)")?;
-    let row = client.query_one("EXPLAIN TIMESTAMP FOR SELECT * FROM t1;", &[])?;
-    let explain: String = row.get(0);
-    let explain = timestamp_re.replace_all(&explain, "<TIMESTAMP>");
-    assert_eq!(
-        explain,
-        "     timestamp:          1000
-         since:[         1000]
-         upper:[            0]
-     has table: true
- table read ts:          1000
-
-source materialize.public.t1 (u1, storage):
- read frontier:[         1000]
-write frontier:[            0]\n",
-    );
 
     Ok(())
 }

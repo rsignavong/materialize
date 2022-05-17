@@ -8,46 +8,25 @@
 // by the Apache License, Version 2.0.
 
 //! Generates a graphviz graph from a Query Graph Model.
-//!
-//! The public interface consists of the [`Model::as_dot`] method.
 
-use crate::query_model::model::{
-    BoxId, BoxType, ColumnReference, Quantifier, QuantifierId, QueryBox,
-};
-use crate::query_model::Model;
+#![cfg(test)]
+
+use crate::query_model::{BoxType, Model, Quantifier, QuantifierId, QueryBox};
 use itertools::Itertools;
-use mz_expr::ExprHumanizer;
-use mz_ore::str::separated;
-use std::collections::{BTreeMap, HashSet};
+use ore::str::separated;
+use std::collections::BTreeMap;
 use std::fmt::{self, Write};
-
-use super::attribute::core::{Attribute, RequiredAttributes};
-use super::attribute::relation_type::RelationType;
-
-impl Model {
-    pub fn as_dot<'a>(
-        &mut self,
-        label: &str,
-        expr_humanizer: &'a dyn ExprHumanizer,
-        with_types: bool,
-    ) -> Result<String, anyhow::Error> {
-        DotGenerator::new(expr_humanizer, with_types).generate(self, label)
-    }
-}
 
 /// Generates a graphviz graph from a Query Graph Model, defined in the DOT language.
 /// See <https://graphviz.org/doc/info/lang.html>.
-#[derive(Debug)]
-struct DotGenerator<'a> {
+pub(crate) struct DotGenerator {
     output: String,
     indent: u32,
-    expr_humanizer: &'a dyn ExprHumanizer,
-    with_types: bool,
 }
 
 /// Generates a label for a graphviz graph.
 #[derive(Debug)]
-enum DotLabel<'a> {
+pub enum DotLabel<'a> {
     /// Plain label
     SingleRow(&'a str),
     /// A single-column table that has a row for each string in the array.
@@ -59,41 +38,16 @@ enum DotLabel<'a> {
 /// The set of escaped characters is "|{}.
 struct DotLabelEscapedString<'a>(&'a str);
 
-impl<'a> DotGenerator<'a> {
-    fn new(expr_humanizer: &'a dyn ExprHumanizer, with_types: bool) -> Self {
+impl DotGenerator {
+    pub fn new() -> Self {
         Self {
             output: String::new(),
             indent: 0,
-            expr_humanizer,
-            with_types,
         }
-    }
-
-    /// Derive attributes required for rendering the given [`Model`].
-    fn derive_required_attributes(&self, model: &mut Model, start_box: BoxId) {
-        // collect a set of required attributes for rendering
-        let mut attributes = HashSet::new();
-        if self.with_types {
-            attributes.insert(Box::new(RelationType) as Box<dyn Attribute>);
-        }
-        // derive the required derived attributes
-        RequiredAttributes::from(attributes).derive(model, start_box);
     }
 
     /// Generates a graphviz graph for the given model, labeled with `label`.
-    fn generate(self, model: &mut Model, label: &str) -> Result<String, anyhow::Error> {
-        self.generate_subgraph(model, model.top_box, label)
-    }
-
-    /// Generates a graphviz graph for the given subgraph of the model, labeled with `label`.
-    fn generate_subgraph(
-        mut self,
-        model: &mut Model,
-        start_box: BoxId,
-        label: &str,
-    ) -> Result<String, anyhow::Error> {
-        self.derive_required_attributes(model, start_box);
-
+    pub fn generate(mut self, model: &Model, label: &str) -> Result<String, anyhow::Error> {
         self.new_line("digraph G {");
         self.inc();
         self.new_line("compound = true");
@@ -106,56 +60,54 @@ impl<'a> DotGenerator<'a> {
         let mut quantifiers = Vec::new();
 
         model
-            .try_visit_pre_post_descendants(
-                &mut |m, box_id| -> Result<(), ()> {
-                    let b = m.get_box(*box_id);
-                    self.new_line(&format!("subgraph cluster{} {{", box_id));
-                    self.inc();
-                    self.new_line(
-                        &DotLabel::SingleRow(&format!("Box{}:{}", box_id, Self::get_box_title(&b)))
-                            .to_string(),
-                    );
+            .visit_pre_boxes(&mut |b| -> Result<(), ()> {
+                let box_id = b.id;
+
+                self.new_line(&format!("subgraph cluster{} {{", box_id));
+                self.inc();
+                self.new_line(
+                    &DotLabel::SingleRow(&format!("Box{}:{}", box_id, Self::get_box_title(&b)))
+                        .to_string(),
+                );
+                self.new_line(&format!(
+                    "boxhead{} [ shape = record, {} ]",
+                    box_id,
+                    Self::get_box_head(&b)
+                ));
+
+                self.new_line("{");
+                self.inc();
+                self.new_line("rank = same");
+
+                if b.quantifiers.len() > 0 {
+                    self.new_line("node [ shape = circle ]");
+                }
+
+                for q_id in b.quantifiers.iter() {
+                    quantifiers.push(*q_id);
+
+                    let q = model.get_quantifier(*q_id);
                     self.new_line(&format!(
-                        "boxhead{} [ shape = record, {} ]",
-                        box_id,
-                        self.get_box_head(&b)
+                        "Q{0} [ {1} ]",
+                        q_id,
+                        DotLabel::SingleRow(&format!(
+                            "Q{0}({1}){2}",
+                            q_id,
+                            q.quantifier_type,
+                            Self::get_quantifier_alias(&q)
+                        ))
                     ));
+                }
 
-                    self.new_line("{");
-                    self.inc();
-                    self.new_line("rank = same");
+                self.add_correlation_info(model, &b);
 
-                    if b.input_quantifiers().count() > 0 {
-                        self.new_line("node [ shape = circle ]");
-                    }
+                self.dec();
+                self.new_line("}");
+                self.dec();
+                self.new_line("}");
 
-                    for q in b.input_quantifiers() {
-                        quantifiers.push(q.id);
-
-                        self.new_line(&format!(
-                            "Q{0} [ {1} ]",
-                            q.id,
-                            DotLabel::SingleRow(&format!(
-                                "Q{0}({1}){2}",
-                                q.id,
-                                q.quantifier_type,
-                                Self::get_quantifier_alias(&q)
-                            ))
-                        ));
-                    }
-
-                    self.add_correlation_info(b.correlation_info());
-
-                    self.dec();
-                    self.new_line("}");
-                    self.dec();
-                    self.new_line("}");
-
-                    Ok(())
-                },
-                &mut |_, _| Ok(()),
-                start_box,
-            )
+                Ok(())
+            })
             .unwrap();
 
         if quantifiers.len() > 0 {
@@ -179,30 +131,17 @@ impl<'a> DotGenerator<'a> {
         b.box_type.get_box_type_str()
     }
 
-    fn get_box_head(&self, b: &QueryBox) -> String {
+    fn get_box_head(b: &QueryBox) -> String {
         let mut rows = Vec::new();
 
         rows.push(format!("Distinct: {:?}", b.distinct));
 
         // The projection of the box
-        if self.with_types {
-            let relation_type = b.attributes.get::<RelationType>();
-            for (i, c) in b.columns.iter().enumerate() {
-                let typ = self.expr_humanizer.humanize_column_type(&relation_type[i]);
-                if let Some(alias) = &c.alias {
-                    rows.push(format!("{}: {} ({}) as {}", i, c.expr, typ, alias.as_str()));
-                } else {
-                    rows.push(format!("{}: {} ({})", i, c.expr, typ));
-                }
-            }
-        } else {
-            // The projection of the box
-            for (i, c) in b.columns.iter().enumerate() {
-                if let Some(alias) = &c.alias {
-                    rows.push(format!("{}: {} as {}", i, c.expr, alias.as_str()));
-                } else {
-                    rows.push(format!("{}: {}", i, c.expr));
-                }
+        for (i, c) in b.columns.iter().enumerate() {
+            if let Some(alias) = &c.alias {
+                rows.push(format!("{}: {} as {}", i, c.expr, alias.as_str()));
+            } else {
+                rows.push(format!("{}: {}", i, c.expr));
             }
         }
 
@@ -226,12 +165,6 @@ impl<'a> DotGenerator<'a> {
                     rows.push(format!("ROW: {}", separated(", ", row.iter())))
                 }
             }
-            BoxType::CallTable(call_table) => {
-                // display function call
-                let func = &call_table.func;
-                let args = &call_table.exprs;
-                rows.push(format!("CALL: {}({})", func, separated(", ", args)));
-            }
             _ => {}
         }
 
@@ -244,11 +177,17 @@ impl<'a> DotGenerator<'a> {
             rows.extend(predicates.iter().map(|p| p.to_string()));
         }
 
-        if let Some(unique_keys) = get_unique_keys(b) {
-            for key in unique_keys {
-                let key = key.iter().map(|column| format!("C{}", column));
-                rows.push(format!("UNIQUE KEY: {}", separated(", ", key)));
-            }
+        if !b.unique_keys.is_empty() {
+            rows.push(format!(
+                "UNIQUE KEY {}",
+                separated(
+                    " ",
+                    b.unique_keys.iter().map(|key_set| format!(
+                        "[{}]",
+                        separated(", ", key_set.iter().map(|k| k.to_string()))
+                    ))
+                )
+            ));
         }
 
         DotLabel::MultiRow(&rows).to_string()
@@ -256,23 +195,24 @@ impl<'a> DotGenerator<'a> {
 
     /// Adds red arrows from correlated quantifiers to the sibling quantifiers they
     /// are correlated with.
-    fn add_correlation_info(
-        &mut self,
-        correlation_info: BTreeMap<QuantifierId, HashSet<ColumnReference>>,
-    ) {
-        let q_correlation_info = correlation_info.into_iter().map(|(id, column_refs)| {
-            (
-                id,
-                column_refs
-                    .iter()
-                    .map(|c| c.quantifier_id)
-                    .sorted()
-                    .unique()
-                    .collect::<Vec<_>>(),
-            )
-        });
+    fn add_correlation_info(&mut self, model: &Model, b: &QueryBox) {
+        let correlation_info: BTreeMap<QuantifierId, Vec<QuantifierId>> = b
+            .correlation_info(model)
+            .into_iter()
+            .map(|(id, column_refs)| {
+                (
+                    id,
+                    column_refs
+                        .iter()
+                        .map(|c| c.quantifier_id)
+                        .sorted()
+                        .unique()
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
 
-        for (correlated_q, quantifiers) in q_correlation_info {
+        for (correlated_q, quantifiers) in correlation_info.iter() {
             for q in quantifiers.iter() {
                 self.new_line(&format!(
                     "Q{0} -> Q{1} [ {2}, style = filled, color = red ]",
@@ -312,17 +252,6 @@ impl<'a> DotGenerator<'a> {
 
     fn end_line(&mut self) {
         self.output.push('\n');
-    }
-}
-
-fn get_unique_keys(b: &QueryBox) -> Option<Vec<Vec<usize>>> {
-    // TODO: return value of UniqueKeys attribute if present and
-    // fallback to the Get and CallTable base cases otherwise
-    // (TBD once the attribute has been added to the codebase)
-    match &b.box_type {
-        BoxType::CallTable(call_table) => Some(call_table.func.output_type().keys),
-        BoxType::Get(get) => Some(get.unique_keys.clone()),
-        _ => None,
     }
 }
 

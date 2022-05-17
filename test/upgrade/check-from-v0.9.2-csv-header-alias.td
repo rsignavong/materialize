@@ -18,7 +18,7 @@ definitely,different
   SELECT * FROM csv_upgrade_with_header_alias_missing_file
 
 ! SELECT * FROM breaker
-contains:source file contains incorrect columns
+source file contains incorrect columns
 
 $ file-append path=changer.csv
 no,body
@@ -28,4 +28,4 @@ no,body
   SELECT * FROM csv_upgrade_with_file_change
 
 ! SELECT * FROM breaker_file_change
-contains:source file contains incorrect columns
+source file contains incorrect columns

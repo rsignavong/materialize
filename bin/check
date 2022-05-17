@@ -61,10 +61,6 @@ extra_lints=(
     # `!x`.
     clippy::bool_comparison
 
-    # x.clone() -> Arc::clone(&x)
-    # This clarifies a significant amount of code.
-    clippy::clone_on_ref_ptr
-
     # These can catch real bugs, because something that is expected (a cast, a
     # conversion, a statement) is not happening.
     clippy::no_effect
@@ -160,11 +156,6 @@ extra_lints=(
 
     # Needless async
     clippy::unused_async
-
-    # suggest better alternatives
-    # See `clippy.toml` for more info
-    # TODO(guswynn): renamed this to `disallowed_methods` when we upgrade
-    clippy::disallowed_methods
 )
 
 # NOTE(benesch): we ignore some ShellCheck complaints about sloppy word

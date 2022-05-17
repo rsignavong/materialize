@@ -31,13 +31,6 @@ INSERT INTO t3 VALUES (2, 3), (5, 5), (5, 5), (6, 1)
 query T multiline
 EXPLAIN (SELECT * FROM t1 UNION ALL SELECT * FROM t1) UNION ALL (SELECT * FROM t2 UNION ALL SELECT * FROM t2);
 ----
-Source materialize.public.t1 (u1):
-| Project (#0, #1)
-
-Source materialize.public.t2 (u2):
-| Project (#0, #1)
-
-Query:
 %0 =
 | Get materialize.public.t1 (u1)
 
@@ -45,10 +38,10 @@ Query:
 | Get materialize.public.t1 (u1)
 
 %2 =
-| Get materialize.public.t2 (u2)
+| Get materialize.public.t2 (u3)
 
 %3 =
-| Get materialize.public.t2 (u2)
+| Get materialize.public.t2 (u3)
 
 %4 =
 | Union %0 %1 %2 %3
@@ -73,15 +66,8 @@ query II
 query T multiline
 EXPLAIN (SELECT * FROM t1 UNION ALL SELECT * FROM t1) EXCEPT ALL (SELECT * FROM t2 UNION ALL SELECT * FROM t2);
 ----
-Source materialize.public.t1 (u1):
-| Project (#0, #1)
-
-Source materialize.public.t2 (u2):
-| Project (#0, #1)
-
-Query:
 %0 = Let l0 =
-| Get materialize.public.t2 (u2)
+| Get materialize.public.t2 (u3)
 | Negate
 
 %1 =
@@ -107,18 +93,8 @@ query II
 query T multiline
 EXPLAIN PLAN FOR SELECT * FROM t2  EXCEPT ALL SELECT * FROM t1 INTERSECT ALL SELECT * FROM t3;
 ----
-Source materialize.public.t1 (u1):
-| Project (#0, #1)
-
-Source materialize.public.t2 (u2):
-| Project (#0, #1)
-
-Source materialize.public.t3 (u3):
-| Project (#0, #1)
-
-Query:
 %0 =
-| Get materialize.public.t2 (u2)
+| Get materialize.public.t2 (u3)
 
 %1 =
 | Get materialize.public.t1 (u1)
@@ -128,7 +104,7 @@ Query:
 | Get materialize.public.t1 (u1)
 
 %3 =
-| Get materialize.public.t3 (u3)
+| Get materialize.public.t3 (u5)
 | Negate
 
 %4 =
@@ -149,18 +125,8 @@ SELECT * FROM t2  EXCEPT ALL SELECT * FROM t1 INTERSECT ALL SELECT * FROM t3;
 query T multiline
 EXPLAIN PLAN FOR SELECT * FROM t2 EXCEPT ALL (SELECT * FROM t1 INTERSECT ALL SELECT f1, null::int FROM t3);
 ----
-Source materialize.public.t1 (u1):
-| Project (#0, #1)
-
-Source materialize.public.t2 (u2):
-| Project (#0, #1)
-
-Source materialize.public.t3 (u3):
-| Project (#0)
-
-Query:
 %0 =
-| Get materialize.public.t2 (u2)
+| Get materialize.public.t2 (u3)
 
 %1 =
 | Get materialize.public.t1 (u1)
@@ -170,7 +136,7 @@ Query:
 | Get materialize.public.t1 (u1)
 
 %3 =
-| Get materialize.public.t3 (u3)
+| Get materialize.public.t3 (u5)
 | Project (#0)
 | Negate
 | Map null
@@ -194,21 +160,13 @@ SELECT * FROM t2 EXCEPT ALL (SELECT * FROM t1 INTERSECT ALL SELECT f1, null::int
 query T multiline
 EXPLAIN SELECT a1.* FROM t3 AS a1 LEFT JOIN t2 AS a2 ON (a1.f1 = a2.nokey);
 ----
-Source materialize.public.t2 (u2):
-| Filter !(isnull(#1))
-| Project (#1)
-
-Source materialize.public.t3 (u3):
-| Project (#0, #1)
-
-Query:
 %0 =
-| Get materialize.public.t3 (u3)
+| Get materialize.public.t3 (u5)
 | Filter !(isnull(#0))
 | ArrangeBy (#0)
 
 %1 =
-| Get materialize.public.t2 (u2)
+| Get materialize.public.t2 (u3)
 | Filter !(isnull(#1))
 | Project (#1)
 
@@ -218,7 +176,7 @@ Query:
 | Project (#0, #1)
 
 %3 =
-| Get materialize.public.t3 (u3)
+| Get materialize.public.t3 (u5)
 
 %4 =
 | Get %2 (l0)
@@ -233,7 +191,7 @@ Query:
 | Negate
 
 %6 =
-| Get materialize.public.t3 (u3)
+| Get materialize.public.t3 (u5)
 
 %7 =
 | Union %5 %6 %2

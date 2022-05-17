@@ -24,11 +24,11 @@
 //! or if we are not certain that the input is non-empty (e.g. join).
 //!
 //! ```rust
-//! use mz_expr::{BinaryFunc, MirRelationExpr, MirScalarExpr};
-//! use mz_ore::id_gen::IdGen;
-//! use mz_repr::{ColumnType, Datum, RelationType, ScalarType};
+//! use expr::{BinaryFunc, MirRelationExpr, MirScalarExpr};
+//! use ore::id_gen::IdGen;
+//! use repr::{ColumnType, Datum, RelationType, ScalarType};
 //!
-//! use mz_transform::predicate_pushdown::PredicatePushdown;
+//! use transform::predicate_pushdown::PredicatePushdown;
 //!
 //! let input1 = MirRelationExpr::constant(vec![], RelationType::new(vec![
 //!     ScalarType::Bool.nullable(false),
@@ -57,10 +57,10 @@
 //!        predicate012.clone(),
 //!    ]);
 //!
-//! use mz_transform::{Transform, TransformArgs};
+//! use transform::{Transform, TransformArgs};
 //! PredicatePushdown::default().transform(&mut expr, TransformArgs {
 //!   id_gen: &mut Default::default(),
-//!   indexes: &mz_transform::EmptyIndexOracle,
+//!   indexes: &std::collections::HashMap::new(),
 //! });
 //!
 //! let predicate00 = MirScalarExpr::column(0).call_binary(MirScalarExpr::column(0), BinaryFunc::AddInt64);
@@ -78,10 +78,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::TransformArgs;
+use expr::{func, AggregateFunc, Id, MirRelationExpr, MirScalarExpr, RECURSION_LIMIT};
 use itertools::Itertools;
-use mz_expr::{func, AggregateFunc, Id, MirRelationExpr, MirScalarExpr, RECURSION_LIMIT};
-use mz_ore::stack::{CheckedRecursion, RecursionGuard};
-use mz_repr::{Datum, ScalarType};
+use ore::stack::{CheckedRecursion, RecursionGuard};
+use repr::{Datum, ScalarType};
 
 /// Pushes predicates down through other operators.
 #[derive(Debug)]
@@ -183,7 +183,7 @@ impl PredicatePushdown {
                             //    to see which ones can become individual elements of
                             //    `inputs`.
 
-                            let input_mapper = mz_expr::JoinInputMapper::new(inputs);
+                            let input_mapper = expr::JoinInputMapper::new(inputs);
 
                             // Predicates not translated into join variable
                             // constraints. We will attempt to push them at all
@@ -191,8 +191,8 @@ impl PredicatePushdown {
                             let mut pred_not_translated = Vec::new();
 
                             for mut predicate in predicates.drain(..) {
-                                use mz_expr::BinaryFunc;
-                                use mz_expr::UnaryFunc;
+                                use expr::BinaryFunc;
+                                use expr::UnaryFunc;
                                 if let MirScalarExpr::CallBinary {
                                     func: BinaryFunc::Eq,
                                     expr1,
@@ -247,7 +247,7 @@ impl PredicatePushdown {
                                 pred_not_translated.push(predicate)
                             }
 
-                            mz_expr::canonicalize::canonicalize_equivalences(
+                            expr::canonicalize::canonicalize_equivalences(
                                 equivalences,
                                 &[input_type],
                             );
@@ -479,7 +479,7 @@ impl PredicatePushdown {
                             // Apply the predicates in `list` to value. Canonicalize
                             // `list` so that plans are always deterministic.
                             let mut list = list.into_iter().collect::<Vec<_>>();
-                            mz_expr::canonicalize::canonicalize_predicates(&mut list, &value.typ());
+                            expr::canonicalize::canonicalize_predicates(&mut list, &value.typ());
                             **value = value.take_dangerous().filter(list);
                         }
                     }
@@ -498,9 +498,9 @@ impl PredicatePushdown {
                     //   2) equivalences of the form `expr1 = expr2`, where both
                     //      expressions come from the same single input.
                     let input_types = inputs.iter().map(|i| i.typ()).collect::<Vec<_>>();
-                    mz_expr::canonicalize::canonicalize_equivalences(equivalences, &input_types);
+                    expr::canonicalize::canonicalize_equivalences(equivalences, &input_types);
 
-                    let input_mapper = mz_expr::JoinInputMapper::new_from_input_types(&input_types);
+                    let input_mapper = expr::JoinInputMapper::new_from_input_types(&input_types);
                     // Predicates to push at each input, and to lift out the join.
                     let mut push_downs = vec![Vec::new(); inputs.len()];
 
@@ -532,12 +532,12 @@ impl PredicatePushdown {
                                 for constant in runtime_constants.iter() {
                                     let pred = if constant.is_literal_null() {
                                         MirScalarExpr::CallUnary {
-                                            func: mz_expr::UnaryFunc::IsNull(func::IsNull),
+                                            func: expr::UnaryFunc::IsNull(func::IsNull),
                                             expr: Box::new(expr.clone()),
                                         }
                                     } else {
                                         MirScalarExpr::CallBinary {
-                                            func: mz_expr::BinaryFunc::Eq,
+                                            func: expr::BinaryFunc::Eq,
                                             expr1: Box::new(expr.clone()),
                                             expr2: Box::new(constant.clone()),
                                         }
@@ -653,8 +653,8 @@ impl PredicatePushdown {
                                         let expr1 = pair.pop().unwrap();
                                         let expr2 = pair.pop().unwrap();
 
-                                        use mz_expr::BinaryFunc;
-                                        use mz_expr::UnaryFunc;
+                                        use expr::BinaryFunc;
+                                        use expr::UnaryFunc;
                                         push_downs[input].push(MirScalarExpr::CallBinary {
                                             func: BinaryFunc::Or,
                                             expr1: Box::new(MirScalarExpr::CallBinary {
@@ -700,7 +700,7 @@ impl PredicatePushdown {
                         };
                     }
 
-                    mz_expr::canonicalize::canonicalize_equivalences(equivalences, &input_types);
+                    expr::canonicalize::canonicalize_equivalences(equivalences, &input_types);
 
                     let new_inputs = inputs
                         .drain(..)
@@ -814,14 +814,14 @@ impl PredicatePushdown {
     /// extract `expr1` and `expr2`.
     fn extract_equal_or_both_null(
         s: &mut MirScalarExpr,
-        relation_type: &mz_repr::RelationType,
+        relation_type: &repr::RelationType,
     ) -> Option<(MirScalarExpr, MirScalarExpr)> {
         // Or, And, and Eq are all commutative functions. For each of these
         // functions, order expr1 and expr2 so you only need to check
         // `condition1(expr1) && condition2(expr2)`, and you do
         // not need to also check for `condition2(expr1) && condition1(expr2)`.
-        use mz_expr::BinaryFunc;
-        use mz_expr::UnaryFunc;
+        use expr::BinaryFunc;
+        use expr::UnaryFunc;
         if let MirScalarExpr::CallBinary {
             func: BinaryFunc::Or,
             expr1,
@@ -855,7 +855,7 @@ impl PredicatePushdown {
     /// Reduces the given expression and returns its AND-ed terms.
     fn extract_reduced_conjunction_terms(
         mut s: MirScalarExpr,
-        relation_type: &mz_repr::RelationType,
+        relation_type: &repr::RelationType,
     ) -> Vec<MirScalarExpr> {
         s.reduce(relation_type);
 
@@ -864,7 +864,7 @@ impl PredicatePushdown {
 
         while let Some(expr) = pending.pop() {
             if let MirScalarExpr::CallBinary {
-                func: mz_expr::BinaryFunc::And,
+                func: expr::BinaryFunc::And,
                 expr1,
                 expr2,
             } = expr
